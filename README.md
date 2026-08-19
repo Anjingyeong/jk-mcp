@@ -4,320 +4,314 @@
 
 # JK
 
-**Local coding hands for ChatGPT, with project-scoped safety and verifiable execution.**
+**ChatGPT가 내 PC의 프로젝트를 읽고, 수정하고, 테스트하고, Git 작업까지 할 수 있게 연결하는 로컬 코딩 브리지입니다.**
 
-[English](README.md) | [한국어](README.ko.md)
+[English](README.en.md) | [한국어](README.md)
 
-JK is an independent, unofficial modified fork of [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex). It connects ChatGPT to a local MCP / Actions runtime so ChatGPT can inspect a selected project, edit files, run tests, operate Git, launch E2E checks, and return execution evidence without uploading an entire repository to a separate coding-agent service.
+> JK는 OpenAI 공식 제품이 아닌 비공식 프로젝트입니다. `ezBuilder/chatgpt2codex`를 기반으로 수정한 포크이며, 원본 코드의 라이선스/재배포 조건은 [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 먼저 확인하세요.
 
-This fork focuses on making the local coding loop more durable and practical on Windows: persistent work sessions, fast resume, hash-checked patches, JK-native orchestration, optional OMO delegation, Windows browser E2E, and explicit development/portable runtime modes.
+## 가장 먼저 알아둘 것
 
-> **Unofficial project:** JK is not affiliated with, endorsed by, sponsored by, or partnered with OpenAI. ChatGPT, GPT, Codex, and other OpenAI marks belong to OpenAI.
->
-> **Licensing notice:** the upstream repository currently does not expose a root software `LICENSE` and its package metadata states `Copyright 2026 ezBuilder. All rights reserved.` This repository therefore does **not** claim that the upstream-derived code is MIT, Apache, or otherwise open-source licensed. See [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md) before redistributing derived source or binaries.
-
-## 30-Second Usage
-
-JK is designed around **natural-language goals and completion criteria**, not memorizing internal tool names.
+JK는 두 번째 AI가 아닙니다.
 
 ```text
-@jk Inspect this project and explain how it works. Do not edit anything.
-@jk Find the cause of this bug, fix it, and run the relevant tests.
-@jk Continue the previous task and finish it.
-@jk Run E2E and show desktop/mobile screenshots.
-@jk Review the current diff and commit it if everything looks correct.
-@jk If verification passes, commit and push to jk-mcp.
+나
+→ ChatGPT
+→ JK
+→ 내 PC의 프로젝트 / 터미널 / Git / 테스트
 ```
 
-For larger tasks, state **project + goal + constraints + verification/finish condition**. Internal state such as `goal_loop`, `workSessionId`, leases, and file hashes normally does not need to be managed by the user.
+ChatGPT가 판단하고, JK가 내 PC에서 실제 작업을 수행합니다.
 
-See the [JK Usage Guide](docs/USAGE.md) for practical patterns, resume behavior, hierarchical `AGENTS.md` rules, E2E, Git, and when to use OMO.
+그리고 예전 표현인 **“ChatGPT 플러그인”** 대신 현재는 아래 두 방식 중 하나로 연결합니다.
 
-## How It Works
+1. **개인 Plus 사용자에게 권장:** Custom GPT + Actions
+2. **지원되는 Business / Enterprise / Edu 환경:** ChatGPT Apps + MCP
 
-JK is not a second AI model. The current ChatGPT session remains the reasoning layer; JK supplies project-scoped local tools, durable state, safety gates, and execution evidence.
+둘 다 JK의 **Owner Token**으로 소유자 인증을 할 수 있습니다.
 
-```text
-User
-  -> ChatGPT web session (reasoning / planning)
-  -> MCP or GPT Actions
-  -> JK HTTP runtime
-  -> shared tool registry
-  -> project lease + safety guards
-  -> code / state / shell / Git / E2E
-  -> selected local project
-```
+---
 
-`goal_intake` and `goal_loop` coordinate the coding loop inside the current ChatGPT session. OMO is an optional delegation path for users who want a separate local agent runtime; normal JK-native coding does not depend on OMO or a second model-provider credential.
+# 1. 설치
 
-## What JK Adds
+## 준비물
 
-### 1. Persistent work sessions
-
-JK can keep project-scoped and work-session-scoped state so a follow-up request can continue the previous task instead of rediscovering the repository from scratch.
-
-It can retain information such as:
-
-- active artifact and recently touched files
-- current goal and task
-- completed and pending work
-- implementation decisions
-- latest checkpoint and verification result
-- remembered line ranges for fast source hydration
-
-A `workSessionId` isolates multiple workflows inside the same repository.
-
-### 2. Safe resume with CAS-style patching
-
-Resume is validated against the current files on disk.
-
-```text
-resume
-  -> validate the active artifact
-  -> read the current source slice
-  -> return the current full-file SHA-256
-  -> use that hash as a patch precondition
-  -> reject the patch if the file changed in between
-```
-
-This reduces accidental overwrites when the repository changes between turns.
-
-### 3. JK-native orchestration
-
-JK now keeps orchestration inside the current ChatGPT web session by default. It does not need a second model provider, API key, or separate agent runtime for normal coding loops.
-
-`goal_intake` and `goal_loop` route each turn through reasoning roles such as:
-
-- Explorer: inspect/search/read before claims or edits
-- Oracle: challenge assumptions and choose the smallest sound strategy
-- Implementer: apply one coherent scoped change
-- Reviewer: check regressions, security, maintainability, and goal fit
-- Verifier: require targeted test/typecheck/build/E2E evidence
-- Recovery: stop repeating the same failed approach and form a new evidence-backed hypothesis
-
-Verification failures escalate structurally: inspect the first failure, switch approach on the second, and enter recovery after three or more failed attempts.
-
-### 4. Optional OMO delegation
-
-JK can delegate a coding or analysis pass to a locally installed OMO / Oh My OpenAgent CLI.
-
-The runner:
-
-- discovers installed OMO versions
-- probes `omo run --help` for JK-required flags
-- selects the newest compatible version
-- falls back to an older compatible version if a newer CLI breaks the contract
-- passes prompts as argv rather than shell text
-- defaults to the `general` agent when no agent is specified
-- preserves OMO session IDs for resumable agent runs
-
-The current JK runner expects OMO to expose:
-
-```text
---json
---directory
---agent
---model
---session-id
---verbose
-```
-
-OMO still uses whichever model provider/authentication is configured for OMO itself. A provider outage can therefore fail an OMO run even when JK and the local OMO CLI are healthy.
-
-### 5. Local MCP / Actions execution bridge
-
-Once connected, ChatGPT can use JK to:
-
-- discover and select local projects
-- read repository rules
-- search source code
-- read narrow file slices
-- create files and apply guarded patches
-- run allowlisted project commands
-- run guarded local shell commands
-- inspect Git status and diffs
-- commit and push when explicitly requested
-- start development servers
-- run E2E checks
-- capture browser / app screenshots where supported
-- save generated image assets into a project
-
-The execution model is intentionally simple:
-
-```text
-User
-  -> ChatGPT
-  -> MCP / Actions
-  -> JK local runtime
-  -> files / shell / Git / E2E / OMO
-```
-
-ChatGPT remains the main reasoning surface. JK is the local execution harness.
-
-### 6. Windows-first development workflow
-
-This fork contains significant Windows work, including:
-
-- JK-branded Windows launcher and installer paths
-- project folder selection
-- Owner Token approval flow
-- ChatGPT web connector support
-- stale process cleanup
-- Edge / Chrome based local-web E2E capture
-- desktop and mobile viewport screenshot proof
-- browser console / failed-network capture in the E2E path
-- development-runtime auto-sync back to the source checkout
-
-For an exact implementation history, see [docs/HARNESS_DEVLOG.md](docs/HARNESS_DEVLOG.md).
-
-## Local Performance Snapshot
-
-The following numbers were measured on the maintainer's Windows development machine on **2026-08-13**, with the JK runtime already running locally. They are implementation measurements, not a cross-machine SLA.
-
-| Operation | Result |
-| --- | ---: |
-| `goal_intake` direct handler | 1.35 ms avg |
-| `goal_loop` first-turn handler | 1.43 ms avg |
-| 50-turn `goal_loop` continuation | 2.11 ms early avg -> 2.74 ms late avg |
-| `file_read_slice` (100 lines + hashes) | 2.32 ms avg / 3.39 ms p95 |
-| persisted session read + validation | 0.634 ms avg / 1.045 ms p95 |
-| `code_search` via ripgrep | 48.62 ms avg / 60.15 ms p95 |
-| local `gitRepositoryStatus` | 182.18 ms avg / 191.03 ms p95 |
-| localhost `/healthz` | 14.20 ms avg |
-| localhost Actions OpenAPI | 15.13 ms avg |
-
-The live Node runtime was approximately **124 MB working set** with 13 threads during the same inspection. The practical latency bottleneck is usually not JK-native orchestration itself; repeated ChatGPT-tool round trips, child-process startup, Git, typecheck/test/build, and browser E2E dominate real task time.
-
-## Safety Model
-
-JK is intended for trusted local development, not arbitrary public automation.
-
-- Project access is scoped to the selected workspace/project.
-- Local-only state, MCP configuration, logs, `.env` files, and generated runtime state are ignored from Git.
-- Secret-looking values are redacted from tool output.
-- Existing-file edits can use hash preconditions.
-- Network, destructive, commit, push, and other sensitive actions require explicit user intent or approval gates.
-- Remote ChatGPT access uses an Owner Token approval model.
-- The connector defaults to local/loopback behavior unless web connector/tunnel mode is enabled.
-
-Treat the Owner Token like a password. Do not publish it in issues, screenshots, logs, or documentation.
-
-## Build From Source
-
-### Requirements
-
-- Node.js 22 or newer
+- Windows 10/11 권장
+- Git
+- Node.js 22 이상
 - npm
-- PowerShell on Windows
-- Optional: an externally managed HTTPS reverse proxy or tunnel when your ChatGPT client cannot reach localhost directly
-- Optional: a compatible OMO installation for `omo_run`
+- ChatGPT 계정
+- **개인 도메인 1개** (예: `example.com` — ChatGPT 웹에서 JK로 접근할 HTTPS 주소를 만들 때 사용)
 
-The public repository is the MCP harness/core. Persistent cloud hosting, provider-specific provisioning, private domains, and automatic deployment are intentionally kept out of the public distribution. Host-specific behavior can be added through the local override boundary documented in `docs/LOCAL_OVERRIDES.md`.
+설치:
 
-### Install and verify
-
-```bash
+```powershell
+git clone https://github.com/Anjingyeong/jk-mcp.git
+cd jk-mcp
 npm ci
-npm run typecheck
-npm test
 npm run build
 ```
 
-### Run on Windows
+## 실행
+
+Windows:
 
 ```powershell
 npm run chatgpt:windows
 ```
 
-### Run on macOS / Linux source environments
+macOS / Linux:
 
 ```bash
 npm run chatgpt
 ```
 
-or:
+첫 실행이 정상이라면 대략 다음 정보가 표시됩니다.
 
-```bash
-npm run chatgpt:linux
+```text
+JK is ready
+MCP URL: http://127.0.0.1:7979/mcp
+Dashboard: http://127.0.0.1:7979/
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) and [windows/README.md](windows/README.md) for the inherited installation/runtime documentation.
+브라우저에서 아래 주소도 열 수 있습니다.
 
-## Useful Verification Commands
+```text
+http://127.0.0.1:7979/
+```
 
-```bash
-npm run typecheck
-npm test
+---
+
+# 2. Owner Token 저장
+
+JK는 첫 실행 시 **Owner Token을 자동 생성하고 터미널에 한 번만 보여줍니다.**
+
+```text
+chatgpt2codex init: generated a new HTTP owner token (shown once, never logged again)
+```
+
+이 토큰은 비밀번호처럼 보관하세요.
+
+- GitHub에 올리지 마세요.
+- 스크린샷에 노출하지 마세요.
+- 다른 사람과 공유하지 마세요.
+- 가능하면 비밀번호 관리자에 저장하세요.
+
+토큰을 잃어버렸다면 새 토큰을 발급할 수 있습니다.
+
+```powershell
+node dist/cli.js owner-token --generate
+```
+
+새 토큰을 만들면 기존 OAuth 연결은 다시 인증해야 할 수 있습니다.
+
+> 예전 JK 개인용 데스크톱판처럼 GUI에서 토큰을 꺼내는 방식이 아닙니다. 현재 공개판 `jk-mcp`에서는 **첫 실행 CLI/launcher가 토큰을 발급**합니다.
+
+---
+
+# 3. ChatGPT와 연결하기
+
+## 중요한 조건: 인터넷에서 접근 가능한 HTTPS 주소가 필요합니다
+
+> **지인용 설치 가이드에서는 개인 도메인 1개를 필수 준비물로 봅니다.** 예를 들어 `example.com`을 가지고 있다면 `jk.example.com` 같은 서브도메인을 JK 연결용으로 사용합니다. JK는 도메인을 구매하거나 DNS/HTTPS를 자동 구성해 주지 않습니다.
+
+기술적으로는 본인이 관리하는 다른 공개 HTTPS hostname을 사용할 수도 있지만, 이 README의 지인 배포 절차는 **본인 소유 도메인을 사용한다는 전제**로 설명합니다.
+
+JK는 기본적으로 아래 로컬 주소에서만 실행됩니다.
+
+```text
+http://127.0.0.1:7979
+```
+
+ChatGPT 웹 서비스는 사용자의 `127.0.0.1`에 직접 접속할 수 없으므로, 실제 ChatGPT 연결에는 예를 들어 아래와 같은 주소가 필요합니다.
+
+```text
+https://내가-관리하는-주소.example.com
+```
+
+공개판 JK는 특정 터널, DNS, 클라우드 서비스를 자동으로 만들지 않습니다. HTTPS reverse proxy 또는 tunnel은 사용자가 별도로 준비해야 합니다.
+
+외부 주소가 준비됐다면 JK 실행 시 hostname을 알려줍니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start-chatgpt.ps1 `
+  -Workspace "C:\workspace" `
+  -PublicHostname "jk.example.com"
+```
+
+그러면 주요 URL은 다음처럼 됩니다.
+
+```text
+MCP:     https://jk.example.com/mcp
+Actions: https://jk.example.com/actions/openapi.json
+```
+
+---
+
+# 4-A. ChatGPT Plus: Custom GPT Actions로 연결
+
+개인 Plus 사용자는 이 방식이 가장 단순합니다.
+
+1. ChatGPT에서 **GPT 만들기**로 들어갑니다.
+2. 새 GPT의 **Actions**에서 `Create new action`을 선택합니다.
+3. Schema에 아래 주소의 OpenAPI를 불러옵니다.
+
+```text
+https://jk.example.com/actions/openapi.json
+```
+
+4. Authentication은 **API Key → Bearer** 방식으로 설정합니다.
+5. API Key 값에 JK 첫 실행 때 받은 **Owner Token**을 입력합니다.
+6. Preview에서 `action_health` 또는 간단한 프로젝트 조회를 테스트합니다.
+
+JK Actions 서버는 다음 두 인증을 모두 받을 수 있습니다.
+
+- Owner Token을 직접 Bearer token으로 사용
+- JK OAuth access token 사용
+
+지인용 개인 설치에서는 **Bearer Owner Token 방식이 설정이 가장 적습니다.**
+
+### 연결 확인용 프롬프트
+
+```text
+JK로 현재 등록된 프로젝트 목록 보여줘.
+```
+
+또는:
+
+```text
+JK로 이 프로젝트 구조만 확인해줘. 파일은 수정하지 마.
+```
+
+정상 연결되면 ChatGPT가 JK Action을 호출해 로컬 프로젝트 정보를 가져옵니다.
+
+---
+
+# 4-B. ChatGPT Apps / MCP로 연결
+
+ChatGPT 계정/워크스페이스에서 custom MCP app과 필요한 write action이 지원되는 경우 사용할 수 있습니다.
+
+1. ChatGPT의 Developer Mode를 활성화합니다.
+2. Apps에서 custom app을 만듭니다.
+3. MCP endpoint에 아래 주소를 입력합니다.
+
+```text
+https://jk.example.com/mcp
+```
+
+4. OAuth 인증을 진행합니다.
+5. JK 승인 페이지가 열리면 **Owner Token**을 입력합니다.
+6. 승인 후 JK 도구를 Scan/Connect 합니다.
+
+JK의 OAuth 승인 화면에서 Owner Token은 로컬에서 해시로 검증되며 평문으로 저장되지 않습니다.
+
+> ChatGPT의 Apps/MCP 기능 범위와 요금제 지원은 바뀔 수 있습니다. 현재 제품 UI에서 기능이 보이지 않으면 Custom GPT Actions 방식을 먼저 확인하세요.
+
+---
+
+# 5. 실제 사용법
+
+연결이 끝난 뒤에는 JK 내부 도구 이름을 외울 필요가 없습니다.
+
+그냥 원하는 결과를 자연어로 말하면 됩니다.
+
+```text
+@JK 이 프로젝트 구조 설명해줘. 수정은 하지 마.
+```
+
+```text
+@JK 이 오류 원인 찾아서 수정하고 관련 테스트까지 돌려줘.
+```
+
+```text
+@JK 지금 diff 리뷰하고 문제 없으면 커밋해줘.
+```
+
+```text
+@JK e2e 테스트하고 화면 확인해줘.
+```
+
+긴 작업은 아래 네 가지를 같이 말하면 안정적입니다.
+
+```text
+프로젝트 + 목표 + 제약 + 완료 조건
+```
+
+예:
+
+```text
+@JK paba 프로젝트에서 급여명세서 출력 오류를 고쳐줘.
+기존 DB 구조는 가능한 건드리지 말고,
+관련 테스트와 build가 통과하면 끝내줘.
+```
+
+---
+
+# 6. 안전장치
+
+JK는 ChatGPT에게 PC 전체 권한을 무제한으로 주는 도구가 아닙니다.
+
+- 선택한 workspace/project 범위 중심으로 접근
+- 기존 파일 수정 시 해시 기반 충돌 보호 가능
+- secret 값 redaction
+- 민감한 shell / 네트워크 / 파괴적 명령에 안전 게이트 적용
+- commit / push는 사용자의 명시적 의도 필요
+- 작업 세션과 최근 검증 결과 저장
+
+그래도 **Owner Token을 가진 사람은 JK에 접근할 수 있으므로 토큰은 반드시 비밀로 관리해야 합니다.**
+
+---
+
+# 7. 문제가 생겼을 때
+
+## JK가 안 켜짐
+
+```powershell
+npm ci
 npm run build
+npm run chatgpt:windows
 ```
 
-Targeted OMO runner tests:
+## Owner Token을 잃어버림
 
-```bash
-npx vitest run src/exec/omo-runner.test.ts
+```powershell
+node dist/cli.js owner-token --generate
 ```
 
-MCP / Actions catalog tests:
+## ChatGPT가 JK에 연결되지 않음
 
-```bash
-npx vitest run src/server/tools-catalog.test.ts src/server/http-actions.test.ts
-```
-
-## Repository Layout
+먼저 로컬에서 확인합니다.
 
 ```text
-src/
-  auth/       OAuth / Owner Token support
-  code/       search, read and patch operations
-  control/    optional desktop-control safety path
-  e2e/        local E2E automation and screenshot proof
-  exec/       command, shell and OMO runners
-  server/     MCP tools and Actions bridge
-  state/      persistent project/work-session state
-  workspace/  project registry and lease handling
-
-windows/      Windows launcher / tray / installer code
-macos/        macOS status-bar application
-linux/        Linux launch/install path
-scripts/      build, packaging and verification scripts
-docs/         install, engineering log and compliance notes
-assets/       public UI / README assets
+http://127.0.0.1:7979/
 ```
 
-## Recommended First Prompts
+로컬은 열리는데 ChatGPT만 연결되지 않는다면 대부분 **외부 HTTPS endpoint / reverse proxy / tunnel** 쪽을 확인해야 합니다.
 
-Basic repository check:
+## Actions schema 확인
 
 ```text
-@jk Select my project, inspect its status and rules, run the safest relevant check,
-and summarize the result with exact evidence.
+https://내주소/actions/openapi.json
 ```
 
-OMO delegation:
+## MCP endpoint
 
 ```text
-@jk Use OMO to analyze this project and return the highest-priority issues.
+https://내주소/mcp
 ```
 
-Visual verification:
+---
 
-```text
-@jk Run E2E, capture the passing screenshots, and show me the proof.
-```
+# 더 자세한 문서
 
-## Attribution and Licensing
+- [설치 가이드](docs/INSTALL.md)
+- [사용 가이드](docs/USAGE.ko.md)
+- [실행/권한 정책](docs/EXECUTION_POLICY.md)
+- [로컬 확장 설정](docs/LOCAL_OVERRIDES.md)
+- [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md)
 
-The original project and base runtime were created by **ezBuilder**:
+## Attribution
 
-- Upstream: [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)
-- Original package metadata: `Copyright 2026 ezBuilder. All rights reserved.`
+JK는 [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)를 기반으로 수정한 독립·비공식 포크입니다.
 
-This fork is maintained as **Anjingyeong/jk-mcp** and contains substantial follow-on harness engineering, including persistent work sessions, fast resume, CAS patch handoff, Windows E2E work, JK branding, explicit development/portable runtime separation, and optional OMO integration.
-
-As of the latest review, the upstream GitHub repository does not expose a root software license. Public source visibility or GitHub forkability should not be interpreted as an independent redistribution/relicensing grant. This repository does not publish a new license over the combined upstream-derived work.
-
-For details, read [docs/ATTRIBUTION_AND_COMPLIANCE.md](docs/ATTRIBUTION_AND_COMPLIANCE.md).
-
-## Status
-
-JK is an active engineering fork. Source-level workflows are the primary focus. Modified binary redistribution should be treated separately from source development because of the upstream licensing uncertainty described above.
+OpenAI, ChatGPT, GPT, Codex는 각 권리자의 상표입니다. JK는 OpenAI의 공식 제품, 공식 플러그인 또는 공식 파트너 프로젝트가 아닙니다.

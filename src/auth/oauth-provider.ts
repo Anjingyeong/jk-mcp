@@ -180,7 +180,7 @@ const OAUTH_PAGE_TEXT: Record<OAuthPageLocale, OAuthPageCopy> = {
   en: {
     title: "Connect JK",
     badge: "Local approval",
-    intro: "Paste the owner token from the desktop app to approve this connection.",
+    intro: "Paste the owner token shown during JK's first launch/setup to approve this connection.",
     client: "Client",
     scope: "Scope",
     resource: "Connector URL",
@@ -195,7 +195,7 @@ const OAUTH_PAGE_TEXT: Record<OAuthPageLocale, OAuthPageCopy> = {
   ko: {
     title: "JK 연결",
     badge: "로컬 승인",
-    intro: "데스크톱 앱의 소유자 토큰을 붙여넣어 이 연결을 승인하세요.",
+    intro: "JK 첫 실행/설정 때 표시된 소유자 토큰을 붙여넣어 이 연결을 승인하세요.",
     client: "클라이언트",
     scope: "권한",
     resource: "커넥터 URL",
