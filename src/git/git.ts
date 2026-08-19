@@ -1,0 +1,443 @@
+import { execFile } from "node:child_process";
+import path from "node:path";
+import { promisify } from "node:util";
+import { DomainError, ErrorCode } from "../types.js";
+import { isSecretPath, redact } from "../policy/secrets.js";
+
+const execFileAsync = promisify(execFile);
+
+/** Options threaded to execFile for every git invocation in this module. */
+const EXEC_OPTS = {
+  // Never shell:true — args are passed as an argv array, not interpolated.
+  windowsHide: true,
+  maxBuffer: 10 * 1024 * 1024,
+} as const;
+
+/**
+ * Run `git <args>` in `cwd` via execFile (array argv, never shell:true).
+ * Returns stdout on success. Callers decide how to interpret failures.
+ */
+async function runGit(
+  cwd: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync("git", args, { ...EXEC_OPTS, cwd });
+}
+
+/** True if `err` looks like "not a git repository" / git missing, vs a real failure. */
+function isNonGitError(err: unknown): boolean {
+  const e = err as { code?: string; stderr?: string; message?: string } | undefined;
+  if (!e) return false;
+  if (e.code === "ENOENT") return true; // git binary not found
+  const text = `${e.stderr ?? ""} ${e.message ?? ""}`.toLowerCase();
+  return (
+    text.includes("not a git repository") ||
+    text.includes("not a git repo") ||
+    text.includes("no such file or directory")
+  );
+}
+
+/** Git status summary for a project (PRD §8.6 git_status). */
+export async function gitStatus(
+  root: string,
+): Promise<{ branch: string; dirtyFiles: string[]; staged: string[] }> {
+  try {
+    let branch = "";
+    let hasHead = true;
+    try {
+      const branchResult = await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+      branch = branchResult.stdout.trim();
+    } catch (branchErr) {
+      const e = branchErr as { stderr?: string; message?: string };
+      const text = `${e.stderr ?? ""} ${e.message ?? ""}`.toLowerCase();
+      if (text.includes("ambiguous argument") || text.includes("unknown revision") || text.includes("bad revision") || text.includes("needed a single revision")) {
+        hasHead = false;
+        branch = (await runGit(root, ["branch", "--show-current"]).catch(() => ({ stdout: "", stderr: "" }))).stdout.trim();
+      } else {
+        throw branchErr;
+      }
+    }
+
+    const statusResult = await runGit(root, ["status", "--porcelain=v1"]);
+    const dirtyFiles: string[] = [];
+    const staged: string[] = [];
+
+    for (const rawLine of statusResult.stdout.split("\n")) {
+      if (rawLine.length === 0) continue;
+      // Porcelain v1 format: XY PATH  (XY = 2 status chars, then space, then path)
+      // For renames the path is "old -> new"; take the destination path.
+      const indexStatus = rawLine[0] ?? " ";
+      const worktreeStatus = rawLine[1] ?? " ";
+      let path = rawLine.slice(3);
+      const arrow = path.indexOf(" -> ");
+      if (arrow !== -1) {
+        path = path.slice(arrow + 4);
+      }
+
+      if (indexStatus === "?" && worktreeStatus === "?") {
+        // Untracked file: counts as dirty, not staged.
+        dirtyFiles.push(path);
+        continue;
+      }
+      if (indexStatus !== " " && indexStatus !== "?") {
+        staged.push(path);
+      }
+      if (worktreeStatus !== " " && worktreeStatus !== "?") {
+        dirtyFiles.push(path);
+      }
+    }
+
+    return { branch, dirtyFiles, staged };
+  } catch (err) {
+    if (isNonGitError(err)) {
+      return { branch: "", dirtyFiles: [], staged: [] };
+    }
+    throw new DomainError(
+      ErrorCode.NOT_IMPLEMENTED,
+      `gitStatus failed: ${(err as Error).message ?? String(err)}`,
+    );
+  }
+}
+
+export interface GitRepositoryStatus {
+  branch: string;
+  dirtyFiles: string[];
+  staged: string[];
+  remotes: Array<{ name: string; url: string }>;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  syncState: "unknown" | "up-to-date" | "ahead" | "behind" | "diverged";
+}
+
+export interface GitSyncStartResult {
+  branch: string;
+  upstream: string;
+  remote: string;
+  before: GitRepositoryStatus;
+  after: GitRepositoryStatus;
+  fastForwarded: boolean;
+}
+
+export interface GitSyncFinishResult {
+  commit: string;
+  branch: string;
+  remote: string;
+  stagedFiles: string[];
+  after: GitRepositoryStatus;
+}
+
+/** Read-only repository state plus already-known upstream relation; never fetches. */
+export async function gitRepositoryStatus(root: string): Promise<GitRepositoryStatus> {
+  const status = await gitStatus(root);
+  const [remotes, upstream, counts] = await Promise.all([
+    listGitRemotes(root),
+    readGitUpstream(root),
+    readGitAheadBehind(root),
+  ]);
+  return {
+    ...status,
+    remotes,
+    upstream,
+    ahead: counts.ahead,
+    behind: counts.behind,
+    syncState: syncState(upstream, counts.ahead, counts.behind),
+  };
+}
+
+function upstreamRemote(upstream: string): string {
+  const slash = upstream.indexOf("/");
+  return slash > 0 ? upstream.slice(0, slash) : "origin";
+}
+
+/**
+ * Prepare a remote-worker checkout from its configured upstream without ever
+ * stashing, resetting, rebasing, or merging divergent history. The caller
+ * gets a clean fast-forwarded checkout or a hard refusal.
+ */
+export async function gitSyncStart(root: string): Promise<GitSyncStartResult> {
+  const before = await gitRepositoryStatus(root);
+  if (!before.branch) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Remote-work sync requires a git branch");
+  }
+  if (!before.upstream) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Remote-work sync requires a configured upstream branch");
+  }
+  if (before.dirtyFiles.length > 0 || before.staged.length > 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Refusing remote-work sync because the checkout is not clean", {
+      dirtyFiles: before.dirtyFiles,
+      staged: before.staged,
+    });
+  }
+
+  const remote = upstreamRemote(before.upstream);
+  await runGit(root, ["fetch", "--prune", remote]);
+  const fetched = await gitRepositoryStatus(root);
+  if (fetched.ahead > 0 && fetched.behind > 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Refusing remote-work sync because local and upstream histories diverged", {
+      ahead: fetched.ahead,
+      behind: fetched.behind,
+      upstream: fetched.upstream,
+    });
+  }
+  if (fetched.ahead > 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Refusing remote-work sync because the remote worker has commits that are not on upstream", {
+      ahead: fetched.ahead,
+      upstream: fetched.upstream,
+    });
+  }
+
+  let fastForwarded = false;
+  if (fetched.behind > 0) {
+    await runGit(root, ["merge", "--ff-only", fetched.upstream ?? before.upstream]);
+    fastForwarded = true;
+  }
+  const after = await gitRepositoryStatus(root);
+  if (after.ahead !== 0 || after.behind !== 0 || after.dirtyFiles.length > 0 || after.staged.length > 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Remote-work sync did not finish in a clean upstream-aligned state", {
+      syncState: after.syncState,
+      ahead: after.ahead,
+      behind: after.behind,
+    });
+  }
+  return { branch: after.branch, upstream: after.upstream ?? before.upstream, remote, before, after, fastForwarded };
+}
+
+/** Commit only the explicitly supplied task paths and push the current branch. */
+export async function gitSyncFinish(
+  root: string,
+  message: string,
+  paths: string[],
+  remote?: string,
+): Promise<GitSyncFinishResult> {
+  if (paths.length === 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Remote-work finish requires explicit changed paths");
+  }
+  const before = await gitRepositoryStatus(root);
+  if (!before.branch) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Remote-work finish requires a git branch");
+  }
+  if (before.staged.length > 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Refusing remote-work finish because unrelated staged changes already exist", {
+      staged: before.staged,
+    });
+  }
+  const committed = await gitStageAndCommit(root, message, paths);
+  const pushed = await gitPush(root, remote, committed.branch);
+  const after = await gitRepositoryStatus(root);
+  return {
+    commit: committed.commit,
+    branch: pushed.branch,
+    remote: pushed.remote,
+    stagedFiles: committed.stagedFiles,
+    after,
+  };
+}
+
+async function listGitRemotes(root: string): Promise<Array<{ name: string; url: string }>> {
+  try {
+    const result = await runGit(root, ["remote", "-v"]);
+    const remotes = new Map<string, string>();
+    for (const line of result.stdout.split("\n")) {
+      const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
+      if (!match || match[3] !== "fetch") continue;
+      remotes.set(match[1] ?? "", redact(match[2] ?? ""));
+    }
+    return Array.from(remotes, ([name, url]) => ({ name, url })).filter((remote) => remote.name.length > 0);
+  } catch (err) {
+    if (isNonGitError(err)) return [];
+    return [];
+  }
+}
+
+async function readGitUpstream(root: string): Promise<string | null> {
+  try {
+    const result = await runGit(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    return result.stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function readGitAheadBehind(root: string): Promise<{ ahead: number; behind: number }> {
+  try {
+    const result = await runGit(root, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
+    const [aheadRaw, behindRaw] = result.stdout.trim().split(/\s+/);
+    return {
+      ahead: Number.parseInt(aheadRaw ?? "0", 10) || 0,
+      behind: Number.parseInt(behindRaw ?? "0", 10) || 0,
+    };
+  } catch {
+    return { ahead: 0, behind: 0 };
+  }
+}
+
+function syncState(
+  upstream: string | null,
+  ahead: number,
+  behind: number,
+): GitRepositoryStatus["syncState"] {
+  if (!upstream) return "unknown";
+  if (ahead > 0 && behind > 0) return "diverged";
+  if (ahead > 0) return "ahead";
+  if (behind > 0) return "behind";
+  return "up-to-date";
+}
+
+/**
+ * Git diff summary with secret redaction applied (PRD §8.6
+ * git_diff_summary, §9.4 outputGuard).
+ */
+export async function gitDiffSummary(
+  root: string,
+): Promise<{ files: { path: string; added: number; removed: number }[]; summary: string }> {
+  let files: { path: string; added: number; removed: number }[];
+  try {
+    const result = await runGit(root, ["diff", "--numstat"]);
+    files = parseNumstat(result.stdout);
+  } catch (err) {
+    if (isNonGitError(err)) {
+      // Non-git repos have no diff to summarize; nothing textual to redact.
+      return { files: [], summary: "No changes." };
+    }
+    throw new DomainError(
+      ErrorCode.NOT_IMPLEMENTED,
+      `gitDiffSummary failed: ${(err as Error).message ?? String(err)}`,
+    );
+  }
+  const summary = redact(buildSummary(files));
+  return { files, summary };
+}
+
+export async function gitStageAndCommit(
+  root: string,
+  message: string,
+  paths?: string[],
+): Promise<{ commit: string; branch: string; stagedFiles: string[]; stdout: string; stderr: string }> {
+  const addArgs = paths && paths.length > 0 ? ["add", "--", ...paths] : ["add", "-A"];
+  await runGit(root, addArgs);
+
+  const stagedResult = await runGit(root, ["diff", "--cached", "--name-only"]);
+  const stagedFiles = stagedResult.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const secretFiles = stagedFiles.filter((file) => isSecretPath(path.resolve(root, file)));
+  if (secretFiles.length > 0) {
+    await runGit(root, ["reset", "--", ...secretFiles]).catch(() => ({ stdout: "", stderr: "" }));
+    throw new DomainError(ErrorCode.SECRET_BLOCKED, "Refusing to commit secret-classified paths", {
+      paths: secretFiles,
+    });
+  }
+
+  if (stagedFiles.length === 0) {
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "No staged changes to commit");
+  }
+
+  const commitResult = await runGit(root, ["commit", "-m", message]);
+  const head = await runGit(root, ["rev-parse", "--short", "HEAD"]);
+  const branch = await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  return {
+    commit: head.stdout.trim(),
+    branch: branch.stdout.trim(),
+    stagedFiles,
+    stdout: redact(commitResult.stdout),
+    stderr: redact(commitResult.stderr),
+  };
+}
+
+export async function gitPush(
+  root: string,
+  remote?: string,
+  branch?: string,
+): Promise<{ remote: string; branch: string; stdout: string; stderr: string }> {
+  const status = await gitRepositoryStatus(root);
+  const currentBranch = status.branch || (await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+  let targetRemote = remote ?? "origin";
+  let targetBranch = branch ?? currentBranch;
+  if (status.upstream) {
+    const slash = status.upstream.indexOf("/");
+    const upstreamRemote = slash > 0 ? status.upstream.slice(0, slash) : "";
+    const upstreamBranch = slash > 0 ? status.upstream.slice(slash + 1) : "";
+    if (!upstreamRemote || upstreamBranch !== currentBranch) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Autonomous push requires the current branch to match its configured upstream", {
+        branch: currentBranch,
+        upstream: status.upstream,
+      });
+    }
+    if ((remote && remote !== upstreamRemote) || (branch && branch !== currentBranch)) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Refusing to push outside the configured upstream", {
+        branch: currentBranch,
+        upstream: status.upstream,
+      });
+    }
+    targetRemote = upstreamRemote;
+    targetBranch = currentBranch;
+  }
+  const result = await runGit(root, ["push", "-u", targetRemote, targetBranch]);
+  return {
+    remote: targetRemote,
+    branch: targetBranch,
+    stdout: redact(result.stdout),
+    stderr: redact(result.stderr),
+  };
+}
+
+/**
+ * Parse `git diff --numstat` output into structured file entries.
+ * Format per line: "<added>\t<removed>\t<path>" (binary files use "-\t-\tpath").
+ * Exported for testing.
+ */
+export function parseNumstat(
+  numstat: string,
+): { path: string; added: number; removed: number }[] {
+  const files: { path: string; added: number; removed: number }[] = [];
+  for (const rawLine of numstat.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    const addedRaw = parts[0] ?? "0";
+    const removedRaw = parts[1] ?? "0";
+    // path may contain tabs in exotic cases; rejoin remainder defensively.
+    let path = parts.slice(2).join("\t");
+    const arrow = path.indexOf(" => ");
+    if (arrow !== -1) {
+      // Rename/copy with common-prefix compression, e.g. "src/{old => new}.ts"
+      // or plain "old => new". Prefer the destination side.
+      path = resolveRenamePath(path);
+    }
+    const added = addedRaw === "-" ? 0 : Number.parseInt(addedRaw, 10) || 0;
+    const removed = removedRaw === "-" ? 0 : Number.parseInt(removedRaw, 10) || 0;
+    files.push({ path, added, removed });
+  }
+  return files;
+}
+
+/** Resolve a numstat rename path like "a/{b => c}/d" or "a/b => a/c" to the destination. */
+function resolveRenamePath(path: string): string {
+  const braceMatch = path.match(/^(.*)\{(.*) => (.*)\}(.*)$/);
+  if (braceMatch) {
+    const [, prefix, , to, suffix] = braceMatch;
+    return `${prefix ?? ""}${to ?? ""}${suffix ?? ""}`;
+  }
+  const plainArrow = path.split(" => ");
+  if (plainArrow.length === 2) {
+    return plainArrow[1] ?? path;
+  }
+  return path;
+}
+
+/** Build a short human-readable diff summary line, pre-redaction. */
+function buildSummary(
+  files: { path: string; added: number; removed: number }[],
+): string {
+  if (files.length === 0) return "No changes.";
+  const totalAdded = files.reduce((sum, f) => sum + f.added, 0);
+  const totalRemoved = files.reduce((sum, f) => sum + f.removed, 0);
+  const fileList = files
+    .map((f) => `${f.path} (+${f.added}/-${f.removed})`)
+    .join(", ");
+  return `${files.length} file(s) changed, +${totalAdded}/-${totalRemoved}: ${fileList}`;
+}

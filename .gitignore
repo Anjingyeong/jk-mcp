@@ -1,0 +1,32 @@
+/AGENTS.md
+.ai/
+.agents/
+.claude/
+.codex/
+.githooks/
+node_modules/
+dist/
+.mcp.json
+.env
+.env.*
+*.log
+.chatgpt2codex/
+.gpt2codex/
+.omo/
+/.local-tools/
+/build/
+/bin/
+/release/
+/projects/
+*.pkg
+.DS_Store
+
+# Release binaries belong in GitHub Releases, not Git history.
+/JK.exe
+
+# Local migration / backup artifacts (keep on the maintainer machine, not in public source)
+/WINDOWS-E2E-PATCH-README.txt
+/apply-windows-e2e-patch.cmd
+/restore-windows-e2e-patch.cmd
+/patch-chatgpt2codex-windows-e2e.mjs
+*.before-windows-e2e
