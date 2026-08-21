@@ -2,13 +2,81 @@
   <img src="assets/readme-hero.png" alt="JK local coding bridge" width="100%" />
 </p>
 
-# JK
+<div align="center">
+
+# 🎛️ JK
+
+### ChatGPT ↔ Local Development Bridge
 
 **ChatGPT가 내 PC의 프로젝트를 읽고, 수정하고, 테스트하고, Git 작업까지 할 수 있게 연결하는 로컬 코딩 브리지입니다.**
 
+![Node.js](https://img.shields.io/badge/Node.js-22+-339933?style=flat-square&logo=nodedotjs&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-Tool_Bridge-111827?style=flat-square)
+![Git](https://img.shields.io/badge/Git-Workspace_Automation-F05032?style=flat-square&logo=git&logoColor=white)
+![Security](https://img.shields.io/badge/Security-Approval_Gates-2563EB?style=flat-square)
+
+`Workspace · Terminal · Test · Git · Approval · Dashboard · Automation`
+
 [English](README.en.md) | [한국어](README.md)
 
+</div>
+
 > JK는 OpenAI 공식 제품이 아닌 비공식 프로젝트입니다. `ezBuilder/chatgpt2codex`를 기반으로 수정한 포크이며, 원본 코드의 라이선스/재배포 조건은 [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 먼저 확인하세요.
+
+---
+
+## Why I built it
+
+AI Coding Agent를 사용하면서 코드 생성 자체보다 더 반복적으로 불편했던 부분은 **AI와 실제 개발 환경 사이의 연결**이었습니다.
+
+```text
+AI가 수정안을 만든다
+      ↓
+사람이 파일을 옮긴다
+      ↓
+터미널에서 명령을 실행한다
+      ↓
+결과를 다시 AI에게 전달한다
+      ↓
+Git / 테스트 / 배포 상태를 또 확인한다
+```
+
+그래서 이 사이클을 줄이기 위해 JK를 만들었습니다.
+
+JK의 목표는 새로운 AI 모델을 만드는 것이 아니라,
+**ChatGPT가 내가 허용한 실제 개발 환경에서 안전하게 작업할 수 있도록 연결하는 실행 계층**을 제공하는 것입니다.
+
+> **ChatGPT가 판단하고, JK가 실행한다.**
+
+---
+
+## Architecture
+
+```text
+┌──────────────┐
+│   ChatGPT    │
+└──────┬───────┘
+       │ Actions / MCP
+       ▼
+┌──────────────────────┐
+│          JK          │
+│                      │
+│  Auth / Permission   │
+│  Workspace Registry  │
+│  Approval Gate       │
+│  Task State          │
+└──────┬───────────────┘
+       │
+       ├── Project Files
+       ├── Terminal / Tests
+       ├── Git
+       ├── Dashboard
+       └── Automation
+```
+
+백엔드 관점에서는 **외부 ChatGPT와 로컬 실행 환경 사이의 API/MCP bridge**, Owner Token 인증, 권한 게이트, 작업 상태 및 실행 결과 전달을 다루는 개발 도구입니다.
+
+---
 
 ## 가장 먼저 알아둘 것
 
