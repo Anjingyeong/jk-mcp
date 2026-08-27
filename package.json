@@ -1,6 +1,6 @@
 {
   "name": "chatgpt2codex",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local MCP coding runtime that lets GPT/ChatGPT act as a Codex-like coding agent over a multi-project workspace.",
   "author": "ezBuilder",
   "copyright": "Original work Copyright 2026 ezBuilder. All rights reserved.",

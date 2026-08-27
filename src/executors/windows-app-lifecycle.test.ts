@@ -47,6 +47,9 @@ describe("Windows executor app lifecycle", () => {
     expect(offlineBuilder).toContain('Write-Host "[chatgpt2codex] using existing offline dependencies..."');
     expect(offlineBuilder).not.toContain("throw Offline node_modules is missing");
     expect(launcher).toContain("$isSameExecutor");
+    expect(launcher).toContain("using externally managed public tunnel");
+    expect(launcher).toContain("if ($cfProc -and $cfProc.HasExited)");
+    expect(launcher).not.toContain("--hostname");
     expect(launcher).toContain('Join-Path $startup "JK Executor.cmd"');
     expect(launcher).toContain('"executor-supervisor.js"');
     expect(launcher).toContain('"executor-worker.js"');
@@ -58,6 +61,7 @@ describe("Windows executor app lifecycle", () => {
     expect(windowsApp).toContain("startMcpOnOpen = true;");
     expect(windowsApp).toContain("disableTunnelForLaunch");
     expect(windowsApp).toContain("IsPublicTunnelEnabledForLaunch()");
+    expect(windowsApp).toContain("publicTunnelEnabled || !string.IsNullOrWhiteSpace(configuredPublicHost)");
     expect(windowsApp).toContain('new System.Threading.Mutex(true, @"Local\\JK.ChatGPTToCodexLauncher"');
     expect(windowsApp).toContain('githubRepoUrl = "https://github.com/Anjingyeong/jk-mcp"');
     expect(windowsApp).toContain('Environment.GetEnvironmentVariable("JK_HUB_URL")');

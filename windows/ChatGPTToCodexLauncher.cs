@@ -787,7 +787,7 @@ internal sealed class LauncherForm : Form
 
     private bool IsPublicTunnelEnabledForLaunch()
     {
-        return publicTunnelEnabled && !disableTunnelForLaunch;
+        return (publicTunnelEnabled || !string.IsNullOrWhiteSpace(configuredPublicHost)) && !disableTunnelForLaunch;
     }
 
     private string[] BuildLauncherArgs()
@@ -2141,8 +2141,8 @@ internal sealed class LauncherForm : Form
             launchAtStartup = launchCheck.Checked;
             startMcpOnOpen = startCheck.Checked;
             autoCheckUpdates = updatesCheck.Checked;
-            publicTunnelEnabled = tunnelCheck.Checked;
             configuredPublicHost = string.IsNullOrWhiteSpace(hostBox.Text) ? null : hostBox.Text.Trim();
+            publicTunnelEnabled = tunnelCheck.Checked || !string.IsNullOrWhiteSpace(configuredPublicHost);
             port = (int)portBox.Value;
             githubRepoUrl = string.IsNullOrWhiteSpace(repoBox.Text) ? "https://github.com/ezBuilder/chatgpt2codex" : repoBox.Text.Trim();
             preferredLanguage = LanguageOptionCodes[Math.Max(0, languageBox.SelectedIndex)];

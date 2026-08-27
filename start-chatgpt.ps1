@@ -567,29 +567,31 @@ $executorProc = $null
 $executorQuickFailureCount = 0
 $executorStartedAt = $null
 try {
-    $useTunnel = $ExposeWeb -or $env:CHATGPT2CODEX_EXPOSE_WEB -eq "1" -or $PublicHostname -or $cloudflaredToken -or $cloudflaredName
+    $managedTunnelRequested = [bool]($cloudflaredToken -or $cloudflaredName)
+    $quickTunnelRequested = [bool](($ExposeWeb -or $env:CHATGPT2CODEX_EXPOSE_WEB -eq "1") -and -not $PublicHostname -and -not $managedTunnelRequested)
+    $usePublicEndpoint = [bool]($PublicHostname -or $managedTunnelRequested -or $quickTunnelRequested)
     $idleShutdownMinutes = $env:CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES
-    if ($useTunnel) {
+    if ($managedTunnelRequested) {
         Need-Command cloudflared
         Write-Host "[chatgpt2codex] 1/3 starting public tunnel..."
-        if ($cloudflaredToken -or $cloudflaredName) {
-            if (-not $PublicHostname) {
-                throw "PUBLIC_HOSTNAME is required with CLOUDFLARED_TUNNEL_TOKEN or CLOUDFLARED_TUNNEL_NAME."
-            }
-            $publicUrl = "https://$PublicHostname"
-            if ($cloudflaredToken) {
-                $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--token", $cloudflaredToken) $cfOut $cfErr
-            } else {
-                $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--url", "http://127.0.0.1:$Port", $cloudflaredName) $cfOut $cfErr
-            }
-        } elseif ($PublicHostname) {
-            $publicUrl = "https://$PublicHostname"
-            $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--hostname", $PublicHostname, "--url", "http://127.0.0.1:$Port", "--no-autoupdate") $cfOut $cfErr
-        } else {
-            $quickTunnel = Start-QuickTunnelWithRetry 4
-            $cfProc = $quickTunnel.Process
-            $publicUrl = $quickTunnel.Url
+        if (-not $PublicHostname) {
+            throw "PUBLIC_HOSTNAME is required with CLOUDFLARED_TUNNEL_TOKEN or CLOUDFLARED_TUNNEL_NAME."
         }
+        $publicUrl = "https://$PublicHostname"
+        if ($cloudflaredToken) {
+            $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--token", $cloudflaredToken) $cfOut $cfErr
+        } else {
+            $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--url", "http://127.0.0.1:$Port", $cloudflaredName) $cfOut $cfErr
+        }
+    } elseif ($PublicHostname) {
+        $publicUrl = "https://$PublicHostname"
+        Write-Host "[chatgpt2codex] 1/2 using externally managed public tunnel: $PublicHostname"
+    } elseif ($quickTunnelRequested) {
+        Need-Command cloudflared
+        Write-Host "[chatgpt2codex] 1/3 starting temporary Quick Tunnel..."
+        $quickTunnel = Start-QuickTunnelWithRetry 4
+        $cfProc = $quickTunnel.Process
+        $publicUrl = $quickTunnel.Url
     } else {
         $publicUrl = "http://127.0.0.1:$Port"
         Write-Host "[chatgpt2codex] 1/2 loopback-only mode; no public tunnel."
@@ -630,7 +632,7 @@ try {
     Write-Host ""
 
     $endpointAvailable = $false
-    if ($useTunnel) {
+    if ($usePublicEndpoint) {
         Write-Host "[chatgpt2codex] 3/3 checking public health..."
         $publicHealthAvailable = $false
         try {
@@ -672,9 +674,11 @@ try {
     }
     Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
     Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
-    if ($useTunnel -and -not $PublicHostname -and -not $cloudflaredToken -and -not $cloudflaredName) {
+    if ($quickTunnelRequested) {
         Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
         Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
+    } elseif ($PublicHostname -and -not $managedTunnelRequested) {
+        Write-Host "   - PUBLIC_HOSTNAME is using an externally managed tunnel/service; JK will not start a second cloudflared process."
     }
     Write-Host "   - If the owner token appeared in a chat/screenshot, rotate it."
     Write-Host "============================================================"
@@ -684,7 +688,7 @@ try {
             Write-Warning "outbound executor exited; local MCP server remains available."
             $worker = $null
         }
-        if ($useTunnel -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
+        if ($cfProc -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
         if ($executorProc -and $executorProc.HasExited) {
             $executorExitCode = $executorProc.ExitCode
             $executorUptimeSeconds = if ($executorStartedAt) { ((Get-Date) - $executorStartedAt).TotalSeconds } else { 0 }

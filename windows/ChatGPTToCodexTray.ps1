@@ -175,6 +175,7 @@ function Get-ActiveProjectRoot {
 function Get-EnablePublicTunnel {
     if ($env:CHATGPT2CODEX_EXPOSE_WEB -eq "1") { return $true }
     if ($env:PUBLIC_HOSTNAME) { return $true }
+    if ($script:Settings.PublicHostname) { return $true }
     return [bool]$script:Settings.EnablePublicTunnel
 }
 
@@ -501,7 +502,7 @@ function Show-Settings {
         $script:Settings.Language = $LanguageOptions[$languageBox.SelectedIndex].Code
         $script:Settings.StartMcpOnLaunch = $start.Checked
         $script:Settings.AutoCheckUpdates = $updates.Checked
-        $script:Settings.EnablePublicTunnel = $publicTunnel.Checked
+        $script:Settings.EnablePublicTunnel = $publicTunnel.Checked -or [bool]$script:Settings.PublicHostname
         Save-Settings $script:Settings
         Set-LaunchAtLogin $launch.Checked
         if ($wasRunning) { Restart-Service }
