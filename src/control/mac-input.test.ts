@@ -110,6 +110,25 @@ describe("control/mac-input (non-darwin)", () => {
  * silently doing nothing or crashing.
  */
 describe("control/mac-input AX targeting (darwin fallback path)", () => {
+  let restorePlatform: (() => void) | undefined;
+
+  beforeEach(() => {
+    // These tests exercise the real osascript/System Events code path, which
+    // is darwin-only in production (assertDarwin throws elsewhere). The
+    // assertions only require the *shape* of that path — found:false previews,
+    // typed errors, role validation — and never a real Mac app, so stubbing
+    // the platform lets them run on Windows/Linux CI hosts too. osascript
+    // itself will simply fail to spawn and every primitive must still honor
+    // its contract (no throw for resolve/preflight, typed error for actuation).
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    restorePlatform = () => Object.defineProperty(process, "platform", original);
+  });
+
+  afterEach(() => {
+    restorePlatform?.();
+  });
+
   it("resolveAxElement returns a found:false preview (no throw) when the target can't be resolved", async () => {
     const result = await resolveAxElement("Chatgpt2CodexNoSuchApp", { role: "button", title: "Nonexistent" });
     expect(result.found).toBe(false);

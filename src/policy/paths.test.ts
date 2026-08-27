@@ -9,6 +9,7 @@ describe("resolveInProject", () => {
   let tmpRoot: string;
   let projectRoot: string;
   let outside: string;
+  let canSymlink: boolean | undefined;
 
   beforeEach(async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-paths-"));
@@ -25,6 +26,23 @@ describe("resolveInProject", () => {
   afterEach(async () => {
     await fs.rm(tmpRoot, { recursive: true, force: true });
   });
+
+  /** Symlink creation needs developer mode / admin on Windows and is
+   * unsupported on some filesystems; probe once and skip the symlink tests
+   * where the OS refuses to create them (the production code path itself is
+   * still covered by the non-symlink traversal tests above). */
+  async function supportsSymlinks(): Promise<boolean> {
+    if (canSymlink !== undefined) return canSymlink;
+    const probe = path.join(tmpRoot, "symlink-probe");
+    try {
+      await fs.symlink(projectRoot, probe, "dir");
+      await fs.rm(probe, { force: true });
+      canSymlink = true;
+    } catch {
+      canSymlink = false;
+    }
+    return canSymlink;
+  }
 
   it("resolves a plain nested relative path inside the project", async () => {
     const resolved = await resolveInProject(projectRoot, "src/a.ts");
@@ -51,6 +69,7 @@ describe("resolveInProject", () => {
   });
 
   it("rejects a symlinked directory component that escapes the project root", async () => {
+    if (!(await supportsSymlinks())) return;
     // Create a symlink inside the project that points outside it, then try
     // to resolve a path that traverses through the symlink.
     const linkPath = path.join(projectRoot, "escape-link");
@@ -65,6 +84,7 @@ describe("resolveInProject", () => {
   });
 
   it("rejects a symlinked leaf file that escapes the project root by default", async () => {
+    if (!(await supportsSymlinks())) return;
     const linkPath = path.join(projectRoot, "leaf-link.txt");
     await fs.symlink(path.join(outside, "secret.txt"), linkPath, "file");
 
@@ -74,6 +94,7 @@ describe("resolveInProject", () => {
   });
 
   it("allows an explicitly trusted leaf symlink when the target stays inside the project", async () => {
+    if (!(await supportsSymlinks())) return;
     const actual = path.join(projectRoot, "src", "AGENTS.actual.md");
     const linkPath = path.join(projectRoot, "AGENTS.md");
     await fs.writeFile(actual, "rules");
@@ -85,6 +106,7 @@ describe("resolveInProject", () => {
   });
 
   it("rejects an explicitly trusted leaf symlink when the target escapes the project", async () => {
+    if (!(await supportsSymlinks())) return;
     const linkPath = path.join(projectRoot, "AGENTS.md");
     await fs.symlink(path.join(outside, "secret.txt"), linkPath, "file");
 

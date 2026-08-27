@@ -99,15 +99,15 @@ describe("scanWorkspace", () => {
   });
 
   it("keeps the folder id stable while exposing package.json name as a logical alias", async () => {
-    const projDir = path.join(root, "workspace-root");
+    const projDir = path.join(root, "shakw");
     await mkdir(projDir, { recursive: true });
-    await writeFile(path.join(projDir, "package.json"), JSON.stringify({ name: "example-service" }));
+    await writeFile(path.join(projDir, "package.json"), JSON.stringify({ name: "songsong" }));
 
     const entries = await scanWorkspace(root);
-    const project = entries.find((entry) => entry.projectId === "workspace-root");
+    const project = entries.find((entry) => entry.projectId === "shakw");
 
-    expect(project?.projectId).toBe("workspace-root");
-    expect(project?.aliases).toContain("example-service");
+    expect(project?.projectId).toBe("shakw");
+    expect(project?.aliases).toContain("songsong");
   });
 
   it("excludes plain folders with no project markers", async () => {
@@ -150,7 +150,7 @@ describe("scanWorkspace", () => {
     const child: ProjectRegistryEntry = { projectId: "child", name: "child", root: childRoot, aliases: ["child"] };
     const grandchild: ProjectRegistryEntry = { projectId: "deep", name: "deep", root: grandchildRoot, aliases: ["deep"] };
     const remote: ProjectRegistryEntry = {
-      projectId: "windows-main::child", name: "child", root: "C:\\workspace\\child", aliases: ["child"],
+      projectId: "windows-main::child", name: "child", root: "C:\\shakw\\child", aliases: ["child"],
       executorKind: "remote", executorId: "windows-main", sourceProjectId: "child",
     };
 
@@ -164,11 +164,11 @@ describe("scanWorkspace", () => {
   });
 
   it("keeps the development JK runtime registered when the selected workspace is another project", async () => {
-    const selectedProject = path.join(root, "ExampleApp");
+    const selectedProject = path.join(root, "CleanTube");
     const runtimeRoot = path.join(root, "chatgpt2codex-source");
     await mkdir(selectedProject, { recursive: true });
     await mkdir(runtimeRoot, { recursive: true });
-    await writeFile(path.join(selectedProject, "package.json"), JSON.stringify({ name: "example-app" }));
+    await writeFile(path.join(selectedProject, "package.json"), JSON.stringify({ name: "cleantube" }));
     await writeFile(path.join(runtimeRoot, "package.json"), JSON.stringify({ name: "chatgpt2codex" }));
 
     const entries = await scanWorkspaceWithRuntimeSelf(selectedProject, runtimeRoot, "development");
@@ -182,7 +182,7 @@ describe("scanWorkspace", () => {
   });
 
   it("does not widen the registry with the runtime root outside development mode", async () => {
-    const selectedProject = path.join(root, "ExampleApp");
+    const selectedProject = path.join(root, "CleanTube");
     const runtimeRoot = path.join(root, "portable-runtime");
     await mkdir(selectedProject, { recursive: true });
     await mkdir(runtimeRoot, { recursive: true });

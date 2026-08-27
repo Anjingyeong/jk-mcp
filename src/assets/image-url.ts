@@ -50,7 +50,12 @@ export interface PinnedAddress {
  * never re-resolve the hostname itself. */
 export type FetchLike = (
   url: string,
-  init?: { signal?: AbortSignal; redirect?: "manual"; pinnedAddresses?: PinnedAddress[] },
+  init?: {
+    signal?: AbortSignal;
+    redirect?: "manual";
+    pinnedAddresses?: PinnedAddress[];
+    headers?: Record<string, string>;
+  },
 ) => Promise<{
   status: number;
   headers: { get(name: string): string | null };
@@ -167,9 +172,9 @@ export function isBlockedAddress(ip: string): boolean {
 // Host validation
 // ---------------------------------------------------------------------------
 
-type LookupFn = (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+export type LookupFn = (hostname: string) => Promise<Array<{ address: string; family: number }>>;
 
-const defaultLookup: LookupFn = (hostname) => dnsLookup(hostname, { all: true, verbatim: true });
+export const defaultLookup: LookupFn = (hostname) => dnsLookup(hostname, { all: true, verbatim: true });
 
 /**
  * Resolve `hostname` and reject if it's a literal blocked IP or resolves to
@@ -231,7 +236,7 @@ async function assertHostAllowed(hostname: string, lookupImpl: LookupFn): Promis
  *   the host is/resolves to a blocked address; INVALID_IMAGE_DATA if the
  *   string isn't a parseable URL.
  */
-async function assertUrlAllowed(rawUrl: string, lookupImpl: LookupFn): Promise<{ url: URL; addresses: PinnedAddress[] }> {
+export async function assertUrlAllowed(rawUrl: string, lookupImpl: LookupFn): Promise<{ url: URL; addresses: PinnedAddress[] }> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -312,6 +317,7 @@ export const defaultFetchImpl: FetchLike = (url, init) => {
         method: "GET",
         lookup: pinnedLookup(pinnedAddresses),
         signal: init?.signal,
+        headers: init?.headers,
       },
       (res) => {
         const headerMap = new Map<string, string>();

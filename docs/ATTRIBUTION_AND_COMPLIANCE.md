@@ -1,6 +1,6 @@
 # Attribution, licensing, and OpenAI compliance notes
 
-_Last reviewed: 2026-08-13. This document is a project-maintainer note, not legal advice._
+_Last reviewed: 2026-08-27. This document is a project-maintainer note, not legal advice._
 
 ## 1. Upstream origin
 
@@ -18,7 +18,7 @@ Attribution does **not** transfer ownership of the upstream code and does **not*
 
 ## 2. Upstream licensing status
 
-As of 2026-08-08, the upstream repository does not expose a root `LICENSE` file, and its `package.json` says `All rights reserved`.
+As of 2026-08-27, the upstream repository does not expose a root `LICENSE` file, and its `package.json` says `All rights reserved`.
 
 GitHub's Terms of Service allow users to view and fork public repositories through GitHub's service. However, GitHub's own licensing documentation also states that, without a software license, default copyright law applies and others generally do not receive the usual open-source rights to reproduce, distribute, or prepare derivative works outside the rights granted by GitHub's service.
 
@@ -33,6 +33,8 @@ Relevant sources:
 This repository should **not** describe the upstream code as MIT/Apache/open-source unless ezBuilder publishes an applicable license or grants permission.
 
 A GitHub fork can remain visible as a fork under GitHub's platform terms, but independent redistribution of the upstream-derived code or modified binary installers/releases is not clearly licensed by the upstream repository as currently published. Before treating this fork as an independently redistributable product, publishing new binary releases, relicensing the combined code, or commercializing the derivative work, obtain permission from ezBuilder or confirm an applicable upstream license with qualified legal counsel.
+
+The upstream project currently publishes its own v0.2.0 macOS and Windows binaries. That demonstrates the upstream maintainer's own distribution practice, but it does not by itself grant downstream forks permission to redistribute modified binaries.
 
 ## 3. OpenAI / ChatGPT / MCP usage
 

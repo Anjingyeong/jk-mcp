@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from "express";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
@@ -7,6 +7,20 @@ import { CONTROL_TOOL_NAMES, isControlChatGptExposed } from "../control/policy.j
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
 import { normalizeObjectSchema, safeParseAsync, getParseErrorMessage } from "@modelcontextprotocol/sdk/server/zod-compat.js";
+import {
+  MASS_ULW_ACTION_ROUTE,
+  MASS_ULW_ACTION_TOOL_NAME,
+  MASS_ULW_EXECUTE_INPUT_SCHEMA,
+} from "./mass-ulw-actions.js";
+
+const ACTION_BRIDGE_VERSION = (() => {
+  try {
+    const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version?: unknown };
+    return typeof packageJson.version === "string" && packageJson.version.trim() ? packageJson.version.trim() : "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 interface CallToolResultLike {
   content?: Array<{ type?: string; text?: string }>;
@@ -60,6 +74,7 @@ const ACTION_ROUTES: ActionRoute[] = [
       "Use this for a Codex-style inspect/edit/verify loop driven through ChatGPT Actions. It keeps the loop state local, can persist structured current-task/completed/pending/decision progress, returns the next concrete action batch quickly, and tells ChatGPT to call it again after each inspect/edit/verify batch until done or blocked. It is not intended to bypass product rate limits, usage limits, or safety restrictions.",
     schema: "GoalLoopInput",
   },
+  MASS_ULW_ACTION_ROUTE,
   {
     path: "/actions/project-select",
     tool: "project_select",
@@ -109,6 +124,15 @@ const ACTION_ROUTES: ActionRoute[] = [
     summary: "Get project status",
     description: "Read branch, dirty files, rule files, commands, and Code Brain availability for a project.",
     schema: "ProjectOnlyInput",
+  },
+  {
+    path: "/actions/seo-geo-audit",
+    tool: "seo_geo_audit",
+    operationId: "seo_geo_audit",
+    summary: "Audit a public URL for SEO and GEO readiness",
+    description:
+      "Safely fetch a public http(s) URL and return evidence-backed SEO/GEO readiness signals, scores, and prioritized improvements. Public-only SSRF/DNS-rebinding guards apply; the score is heuristic and does not guarantee ranking or AI citation.",
+    schema: "SeoGeoAuditInput",
   },
   {
     path: "/actions/project-rules",
@@ -179,7 +203,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "local_shell_run",
     operationId: "local_shell_run",
     summary: "Run local project shell",
-    description: "Run a guarded local shell command inside the project through chatgpt2codex. Network/destructive intents remain approval-gated. Approval-required calls are queued and automatically execute after the owner approves them, so callers must not retry the same command just to consume approval. For known multi-step risky work, intent.approvalBundle can predeclare exact follow-up commands for one bounded owner approval.",
+    description: "Run a guarded local shell command inside the project through chatgpt2codex. Network/destructive intents remain approval-gated. For known multi-step risky work, intent.approvalBundle can predeclare exact follow-up commands for one bounded owner approval.",
     schema: "LocalShellRunInput",
   },
   {
@@ -188,7 +212,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "omo_run",
     summary: "Run the OMO coding agent",
     description:
-      "Optional adapter used only when the user explicitly asks for OMO; normal JK-native goal_loop work never invokes it. Delegates a coding pass to the locally installed OMO/Oh My OpenAgent CLI, requires a full-write project lease, and keeps remote model-provider use behind the local approval gate.",
+      "Optional adapter used only when the user explicitly asks for OMO; normal JK-native goal_loop work never invokes it. Delegates a coding pass to a compatible legacy or OMO Native CLI, requires a full-write project lease, and keeps remote model-provider and ultrawork use behind the local approval gate.",
     schema: "OmoRunInput",
   },
   {
@@ -232,7 +256,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_screenshot",
     summary: "Capture an E2E screenshot",
     description:
-      "Capture a macOS screenshot into the selected project under .chatgpt2codex/e2e/screenshots and return the file path so the user can inspect it.",
+      "Capture a macOS or Windows screenshot into the selected project under .chatgpt2codex/e2e/screenshots. Remote Windows projects capture on their executor and return visual proof to the hub.",
     schema: "E2eScreenshotInput",
   },
   {
@@ -350,7 +374,7 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "file_create",
   "command_run",
   "local_shell_run",
-  "omo_run",
+  MASS_ULW_ACTION_TOOL_NAME,
   "e2e_start_server",
   "e2e_open_target",
   "e2e_run_command",
@@ -636,9 +660,9 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
     openapi: "3.1.0",
     info: {
       title: "chatgpt2codex Custom GPT Actions",
-      version: "0.1.6",
+      version: ACTION_BRIDGE_VERSION,
       description:
-        "OpenAPI bridge for Custom GPTs. ChatGPT drives local coding actions through chatgpt2codex; the bridge does not embed a separate LLM coding client and is not intended to bypass any OpenAI product rate limit, usage limit, or safety restriction. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
+        "OpenAPI bridge for Custom GPTs. ChatGPT drives local coding actions through chatgpt2codex; the bridge does not embed a separate LLM coding client and is not intended to bypass any OpenAI product rate limit, usage limit, or safety restriction. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, mass_ulw_execute, and e2e_test_and_show_screenshot for source editing, approved MASS ULW fan-out, and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools such as optional omo_run remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes().map((route) => route.tool),
@@ -732,6 +756,41 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               description: "Work-session handle returned by goal_intake/goal_loop. Reuse it for the same isolated task.",
             },
             mode: { type: "string", enum: ["implement", "research", "debug", "review", "plan"] },
+            executionProfile: {
+              type: "string",
+              enum: ["auto", "fast", "max"],
+              description:
+                "Optional JK execution policy. auto is the default and may infer Fast or Max from task shape; fast minimizes coordination overhead; max prioritizes wall-clock speed, verification coverage, and reduced rework while preserving hard safety guards.",
+            },
+            safety: {
+              type: "object",
+              additionalProperties: false,
+              description:
+                "Safety preflight state for live-runtime and release-deploy work. Required before approval can be created for those execution kinds.",
+              properties: {
+                executionKind: { type: "string", enum: ["workspace", "live-runtime", "release-deploy"] },
+                preflightStatus: { type: "string", enum: ["unknown", "pass", "fail", "not-required"] },
+                preflightEvidence: { type: "array", maxItems: 30, items: { type: "string", maxLength: 2000 } },
+                executionTarget: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["machine", "projectRoot", "branch", "dirty", "runtimeTarget"],
+                  properties: {
+                    machine: { type: "string", minLength: 1, maxLength: 200 },
+                    projectRoot: { type: "string", minLength: 1, maxLength: 1000 },
+                    branch: { type: "string", minLength: 1, maxLength: 200 },
+                    dirty: { type: "boolean" },
+                    runtimeTarget: { type: "string", minLength: 1, maxLength: 500 },
+                  },
+                },
+                approvalPlan: { type: "array", maxItems: 20, items: { type: "string", maxLength: 2000 } },
+                rollbackStatus: { type: "string", enum: ["unknown", "pass", "fail", "not-required"] },
+                releaseCollisionStatus: { type: "string", enum: ["unknown", "pass", "fail", "not-required"] },
+                runtimeProofStatus: { type: "string", enum: ["unknown", "pass", "fail", "not-required"] },
+                runtimeProofEvidence: { type: "array", maxItems: 30, items: { type: "string", maxLength: 2000 } },
+                operationalDrift: { type: "array", maxItems: 30, items: { type: "string", maxLength: 2000 } },
+              },
+            },
             maxTurns: { type: "integer", minimum: 1, maximum: 50, description: "Maximum ChatGPT action turns for this loop." },
             lastResult: {
               type: "string",
@@ -770,6 +829,27 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               items: { type: "string", maxLength: 500 },
               description: "Current pending-task snapshot. Replaces the prior pending list when provided.",
             },
+            fanoutCandidates: {
+              type: "array",
+              maxItems: 4,
+              description:
+                "Optional Mass ULW candidate lanes. JK deterministically approves parallel fan-out only when scopes/resources are independent and estimated gain clears the coordination-cost threshold.",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["id", "task"],
+                properties: {
+                  id: { type: "string", maxLength: 80 },
+                  task: { type: "string", maxLength: 500 },
+                  estimatedWeight: { type: "integer", minimum: 1, maximum: 5 },
+                  readScopes: { type: "array", maxItems: 20, items: { type: "string", maxLength: 300 } },
+                  writeScopes: { type: "array", maxItems: 20, items: { type: "string", maxLength: 300 } },
+                  dependsOn: { type: "array", maxItems: 10, items: { type: "string", maxLength: 80 } },
+                  exclusiveResources: { type: "array", maxItems: 10, items: { type: "string", maxLength: 120 } },
+                  latencyBound: { type: "boolean" },
+                },
+              },
+            },
             decisions: {
               type: "array",
               maxItems: 10,
@@ -786,6 +866,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             },
           },
         },
+        MassUlwExecuteInput: MASS_ULW_EXECUTE_INPUT_SCHEMA,
         WorkspaceListProjectsInput: {
           type: "object",
           additionalProperties: false,
@@ -817,6 +898,18 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           required: ["projectId"],
           properties: { projectId: { type: "string" } },
+        },
+        SeoGeoAuditInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["url"],
+          properties: {
+            url: {
+              type: "string",
+              format: "uri",
+              description: "Public http(s) page URL to audit. Private, loopback, link-local, and metadata targets are blocked.",
+            },
+          },
         },
         ProjectRulesInput: {
           type: "object",
@@ -1020,6 +1113,10 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             sessionId: { type: "string" },
             timeoutSec: { type: "integer", minimum: 1, maximum: 3600 },
             verbose: { type: "boolean" },
+            ultrawork: {
+              type: "boolean",
+              description: "Explicitly activate OMO-compatible ultrawork mode; omitted and false keep normal execution.",
+            },
           },
         },
         E2eStartServerInput: {

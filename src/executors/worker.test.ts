@@ -54,6 +54,9 @@ describe("executor worker lifecycle", () => {
 
       const heartbeat = requests.find((request) => request.url.endsWith("/api/executors/heartbeat"));
       expect(heartbeat?.body.capabilities).toContain("executor_restart");
+      expect(heartbeat?.body.capabilities).toContain("git_sync_start");
+      expect(heartbeat?.body.instanceId).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(heartbeat?.body.startedAtMs).toEqual(expect.any(Number));
 
       const result = requests.find((request) => request.url.includes("/jobs/restart-1/result"));
       expect(result?.body).toEqual({ result: { scheduled: true, reason: "reload runtime" } });

@@ -13,6 +13,7 @@ const SESSION_STORE_FILE = "control-owner-sessions.json";
 
 interface RemoteManagementConfig {
   host: string | null;
+  cfAccessRequired: boolean;
 }
 
 interface OwnerSession {
@@ -22,6 +23,11 @@ interface OwnerSession {
 
 const sessionsByStateDir = new Map<string, OwnerSession[]>();
 const loadedStateDirs = new Set<string>();
+
+function envFlag(name: string): boolean {
+  const value = (process.env[name] ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
 
 function normalizeHostname(value: string | undefined): string {
   const raw = (value ?? "").trim().toLowerCase();
@@ -40,7 +46,10 @@ function rawPeerIsLoopback(req: Request): boolean {
 
 export function remoteManagementConfig(): RemoteManagementConfig {
   const host = normalizeHostname(process.env.JK_REMOTE_MANAGEMENT_HOST);
-  return { host: host || null };
+  return {
+    host: host || null,
+    cfAccessRequired: envFlag("JK_REMOTE_MANAGEMENT_CF_ACCESS_REQUIRED"),
+  };
 }
 
 function requestHostname(req: Request): string {
@@ -51,9 +60,17 @@ function requestHostname(req: Request): string {
   return normalizeHostname(req.get("host"));
 }
 
+function passesCloudflareAccessGate(req: Request, config: RemoteManagementConfig): boolean {
+  if (!config.cfAccessRequired) return true;
+  // Defense in depth only: the Cloudflare edge policy must be configured to
+  // issue these headers. JK still independently requires its owner session;
+  // this header signal never grants owner authority by itself.
+  return Boolean(req.get("cf-access-jwt-assertion") || req.get("cf-access-authenticated-user-email"));
+}
+
 function isRemoteManagementRequest(req: Request): boolean {
   const config = remoteManagementConfig();
-  return Boolean(config.host && requestHostname(req) === config.host);
+  return Boolean(config.host && requestHostname(req) === config.host && passesCloudflareAccessGate(req, config));
 }
 
 function parseCookies(req: Request): Record<string, string> {
@@ -231,7 +248,7 @@ export const CONTROL_CENTER_LOGIN_HTML = `<!doctype html>
 <style>
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#0b0d10;color:#f4f4f5}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(420px,100%);border:1px solid #2a2f37;border-radius:20px;background:#12151a;padding:28px;box-shadow:0 22px 70px #0008}.brand{font-size:13px;color:#9aa3af;letter-spacing:.12em;text-transform:uppercase}.title{font-size:26px;font-weight:750;margin:10px 0 8px}.desc{color:#aab1bb;line-height:1.55;margin:0 0 22px}label{display:block;font-size:13px;color:#c8ced7;margin:0 0 8px}input{width:100%;border:1px solid #343b45;background:#0c0f13;color:#fff;border-radius:12px;padding:13px 14px;font:inherit;outline:none}input:focus{border-color:#77808d}button{width:100%;margin-top:14px;border:0;border-radius:12px;padding:13px 14px;font:inherit;font-weight:700;cursor:pointer;background:#f4f4f5;color:#0b0d10}.status{min-height:22px;margin-top:12px;color:#f0a6a6;font-size:13px}.note{margin-top:18px;color:#727b87;font-size:12px;line-height:1.5}</style>
 </head>
-<body><main class="card"><div class="brand">JK Remote Owner</div><div class="title">관리자 로그인</div><p class="desc">관리자 키는 최초 로그인에만 사용합니다. 성공 후에는 30일 HttpOnly 세션을 유지하며 JK가 재시작되어도 세션을 복원합니다.</p><form id="login-form"><label for="owner-token">관리자 키</label><input id="owner-token" name="owner-token" type="password" autocomplete="current-password" autofocus required /><button type="submit">로그인</button><div id="status" class="status" role="status"></div></form><div class="note">JK는 127.0.0.1에만 바인딩됩니다. 원격 관리는 별도로 구성한 reverse proxy 또는 tunnel과 owner 인증을 함께 사용하세요.</div></main><script>
+<body><main class="card"><div class="brand">JK Remote Owner</div><div class="title">관리자 로그인</div><p class="desc">관리자 키는 최초 로그인에만 사용합니다. 성공 후에는 30일 HttpOnly 세션을 유지하며 JK가 재시작되어도 세션을 복원합니다.</p><form id="login-form"><label for="owner-token">관리자 키</label><input id="owner-token" name="owner-token" type="password" autocomplete="current-password" autofocus required /><button type="submit">로그인</button><div id="status" class="status" role="status"></div></form><div class="note">JK는 계속 127.0.0.1에만 바인딩되고 Cloudflare Tunnel을 통해서만 원격 관리합니다.</div></main><script>
 const form=document.getElementById('login-form');const input=document.getElementById('owner-token');const status=document.getElementById('status');
 form.addEventListener('submit',async(e)=>{e.preventDefault();status.textContent='';const ownerToken=input.value;try{const res=await fetch('/api/jk/control/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ownerToken})});const body=await res.json();if(!res.ok)throw new Error(body.error||'로그인 실패');input.value='';const requested=new URLSearchParams(location.search).get('return')||'/';location.href=requested.startsWith('/')&&!requested.startsWith('//')?requested:'/';}catch(err){status.textContent=err.message||'로그인 실패';}});
 </script></body></html>`;

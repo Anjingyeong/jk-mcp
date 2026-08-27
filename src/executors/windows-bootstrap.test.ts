@@ -15,8 +15,8 @@ describe("standalone Windows executor bootstrap", () => {
   it("discovers a project, heartbeats, executes code_search, and returns the result", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "jk-bootstrap-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
-    await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "example-service" }));
-    const project = path.join(root, "example-app");
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "songsong" }));
+    const project = path.join(root, "cleantube");
     await mkdir(path.join(project, "src"), { recursive: true });
     const nestedAndroid = path.join(project, "mobile", "android");
     await mkdir(nestedAndroid, { recursive: true });
@@ -52,7 +52,7 @@ describe("standalone Windows executor bootstrap", () => {
             jobId: "job-1",
             executorId: "windows-main",
             tool: "code_search",
-            payload: { sourceProjectId: "example-app", query: "seekGuard", maxResults: 10 },
+            payload: { sourceProjectId: "cleantube", query: "seekGuard", maxResults: 10 },
             createdAt: Date.now(),
           } : null }));
           return;
@@ -94,11 +94,14 @@ describe("standalone Windows executor bootstrap", () => {
     ]);
 
     expect(heartbeat?.executorId).toBe("windows-main");
-    expect(heartbeat?.projects?.find((item: any) => path.resolve(item.root) === path.resolve(root))?.aliases).toContain("example-service");
-    expect(heartbeat?.projects?.some((item: any) => item.projectId === "example-app")).toBe(true);
+    expect(heartbeat?.projects?.find((item: any) => path.resolve(item.root) === path.resolve(root))?.aliases).toContain("songsong");
+    expect(heartbeat?.projects?.some((item: any) => item.projectId === "cleantube")).toBe(true);
     expect(heartbeat?.projects?.some((item: any) => path.resolve(item.root) === path.resolve(nestedAndroid))).toBe(false);
     expect(heartbeat?.capabilities).toContain("local_shell_run");
     expect(heartbeat?.capabilities).toContain("executor_restart");
+    expect(heartbeat?.capabilities).toContain("git_sync_start");
+    expect(heartbeat?.instanceId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(heartbeat?.startedAtMs).toEqual(expect.any(Number));
     expect(result?.error).toBeUndefined();
     expect(result?.result?.matches?.[0]).toMatchObject({ path: "src/player.ts", line: 1 });
   }, 10_000);

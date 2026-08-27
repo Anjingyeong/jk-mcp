@@ -98,6 +98,13 @@ describe("control/auto", () => {
   });
 
   it("stores the AUTO flag file under stateDir/control with 0600 permissions", async () => {
+    if (process.platform === "win32") {
+      // POSIX mode bits don't survive ntfs.stat() on Windows (returns the
+      // platform default, e.g. 0o666/0o444 mapping); the write path still
+      // requests mode 0600 and chmods best-effort, which is verified on
+      // POSIX hosts.
+      return;
+    }
     await setAuto(stateDir, { apps: ["TextEdit"], minutes: 10 });
     const file = path.join(stateDir, "control", "AUTO");
     const stat = await fs.stat(file);

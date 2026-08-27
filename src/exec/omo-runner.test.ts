@@ -11,6 +11,8 @@ describe("omo-runner", () => {
   let previousCodexHome: string | undefined;
   let previousBin: string | undefined;
   let previousNodeCli: string | undefined;
+  let previousAppData: string | undefined;
+  let previousPath: string | undefined;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "chatgpt2codex-omo-root-"));
@@ -18,6 +20,8 @@ describe("omo-runner", () => {
     previousCodexHome = process.env.CODEX_HOME;
     previousBin = process.env.CHATGPT2CODEX_OMO_BIN;
     previousNodeCli = process.env.CHATGPT2CODEX_OMO_NODE_CLI;
+    previousAppData = process.env.APPDATA;
+    previousPath = process.env.PATH;
     process.env.CODEX_HOME = codexHome;
     delete process.env.CHATGPT2CODEX_OMO_BIN;
     delete process.env.CHATGPT2CODEX_OMO_NODE_CLI;
@@ -30,6 +34,10 @@ describe("omo-runner", () => {
     else process.env.CHATGPT2CODEX_OMO_BIN = previousBin;
     if (previousNodeCli === undefined) delete process.env.CHATGPT2CODEX_OMO_NODE_CLI;
     else process.env.CHATGPT2CODEX_OMO_NODE_CLI = previousNodeCli;
+    if (previousAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = previousAppData;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
   });
@@ -52,6 +60,34 @@ describe("omo-runner", () => {
     return cli;
   }
 
+  async function installFakeNativeCli(version = "5.0.0-beta.12"): Promise<string> {
+    const cli = join(codexHome, "native", version, "omo.js");
+    return await writeFakeNativeCli(cli);
+  }
+
+  async function installFakeGlobalNativeCli(appData: string): Promise<string> {
+    const cli = join(appData, "npm", "node_modules", "omo-ai", "bin", "omo.js");
+    return await writeFakeNativeCli(cli);
+  }
+
+  async function writeFakeNativeCli(cli: string): Promise<string> {
+    await mkdir(join(cli, ".."), { recursive: true });
+    await writeFile(
+      cli,
+      [
+        "const argv = process.argv.slice(2);",
+        "if (argv.includes('--help')) {",
+        "  console.log('Usage: omo [options] [message] --mode --print --model --session-id --verbose --omo-senpi-ultrawork-disabled');",
+        "  process.exit(0);",
+        "}",
+        "console.log(JSON.stringify({ type: 'session', id: 'ses_native' }));",
+        "console.log(JSON.stringify({ argv }));",
+      ].join("\n"),
+      "utf8",
+    );
+    return cli;
+  }
+
   it("prefers the newest compatible Codex OMO node CLI without invoking a shell", async () => {
     await installFakeCli("4.9.0");
     const newest = await installFakeCli("4.19.4");
@@ -63,6 +99,7 @@ describe("omo-runner", () => {
       argsPrefix: [newest],
       source: "codex-cache",
       compatibilityStatus: "compatible",
+      cliContract: "legacy-run",
       detectedVersion: "4.19.4",
       selectedVersion: "4.19.4",
       fallbackFromVersion: undefined,
@@ -90,6 +127,12 @@ describe("omo-runner", () => {
     await installFakeCli("4.19.4", false);
 
     await expect(resolveOmoInvocation()).rejects.toThrow(/none expose the required run CLI flags/i);
+  });
+
+  it.skipIf(process.platform === "win32")("reports a missing PATH OMO as unavailable instead of incompatible", async () => {
+    process.env.PATH = root;
+
+    await expect(resolveOmoInvocation()).rejects.toThrow(/could not find an OMO CLI on PATH/i);
   });
 
   it("passes prompt metacharacters as a literal argv value, extracts session id, and reports version status", async () => {
@@ -135,5 +178,123 @@ describe("omo-runner", () => {
     const parsed = JSON.parse(result.stdoutSummary.trim()) as { argv: string[] };
     expect(parsed.argv).toContain("--agent");
     expect(parsed.argv).toContain("general");
+  });
+
+  it("activates ultrawork once through the OMO Native hook", async () => {
+    process.env.CHATGPT2CODEX_OMO_NODE_CLI = await installFakeNativeCli();
+
+    const result = await runOmo(root, {
+      message: "ship the verified change",
+      model: "openai/gpt-test",
+      sessionId: "ses_old",
+      timeoutSec: 10,
+      verbose: true,
+      ultrawork: true,
+    });
+
+    expect(result.cliContract).toBe("native-print");
+    expect(result.ultraworkRequested).toBe(true);
+    expect(result.ultraworkTransport).toBe("native-hook-trigger");
+    expect(result.sessionId).toBe("ses_native");
+    const lastLine = result.stdoutSummary.trim().split(/\r?\n/u).at(-1);
+    expect(lastLine).toBeDefined();
+    const parsed = JSON.parse(lastLine ?? "{}") as { argv?: string[] };
+    expect(parsed.argv).toEqual([
+      "--mode",
+      "json",
+      "--print",
+      "--model",
+      "openai/gpt-test",
+      "--session-id",
+      "ses_old",
+      "--verbose",
+      "ship the verified change\n\nulw",
+    ]);
+    expect(parsed.argv?.at(-1)?.match(/(?:ultrawork|ulw(?!-))/giu)).toHaveLength(1);
+    expect(parsed.argv?.at(-1)).not.toContain("<ultrawork-mode>");
+  });
+
+  it.each(["ulw-plan only", "mass-ulw audit", "ultraworking", "bulwark", "ulw_notes", "ulw-loop"])(
+    "disables incidental native activation and preserves %s byte-for-byte",
+    async (message) => {
+      process.env.CHATGPT2CODEX_OMO_NODE_CLI = await installFakeNativeCli();
+
+      const result = await runOmo(root, {
+        message,
+        timeoutSec: 10,
+        ultrawork: false,
+      });
+
+      expect(result.ultraworkRequested).toBe(false);
+      expect(result.ultraworkTransport).toBe("native-hook-disabled");
+      const lastLine = result.stdoutSummary.trim().split(/\r?\n/u).at(-1);
+      const parsed = JSON.parse(lastLine ?? "{}") as { argv?: string[] };
+      expect(parsed.argv).toContain("--omo-senpi-ultrawork-disabled");
+      expect(parsed.argv?.at(-1)).toBe(message);
+    },
+  );
+
+  it.each([
+    ["mass-ulw audit", "mass-ulw audit"],
+    ["ulw-plan only", "ulw-plan only\n\nulw"],
+  ])("adds no second native trigger to %s", async (message, expectedMessage) => {
+    process.env.CHATGPT2CODEX_OMO_NODE_CLI = await installFakeNativeCli();
+
+    const result = await runOmo(root, {
+      message,
+      timeoutSec: 10,
+      ultrawork: true,
+    });
+
+    const lastLine = result.stdoutSummary.trim().split(/\r?\n/u).at(-1);
+    const parsed = JSON.parse(lastLine ?? "{}") as { argv?: string[] };
+    expect(parsed.argv?.at(-1)).toBe(expectedMessage);
+    expect(parsed.argv?.at(-1)?.match(/(?:ultrawork|ulw(?!-))/giu)).toHaveLength(1);
+  });
+
+  it("does not re-arm an already injected ultrawork directive", async () => {
+    process.env.CHATGPT2CODEX_OMO_NODE_CLI = await installFakeNativeCli();
+    const message = "<ultrawork-mode>already armed</ultrawork-mode>\nShip it";
+
+    const result = await runOmo(root, {
+      message,
+      timeoutSec: 10,
+      ultrawork: true,
+    });
+
+    expect(result.ultraworkRequested).toBe(true);
+    expect(result.ultraworkTransport).toBe("native-hook-disabled");
+    const lastLine = result.stdoutSummary.trim().split(/\r?\n/u).at(-1);
+    const parsed = JSON.parse(lastLine ?? "{}") as { argv?: string[] };
+    expect(parsed.argv).toContain("--omo-senpi-ultrawork-disabled");
+    expect(parsed.argv?.at(-1)).toBe(message);
+  });
+
+  it("rejects an agent selection that OMO Native cannot honor", async () => {
+    process.env.CHATGPT2CODEX_OMO_NODE_CLI = await installFakeNativeCli();
+
+    await expect(
+      runOmo(root, {
+        message: "ship it",
+        agent: "Sisyphus",
+        timeoutSec: 10,
+        ultrawork: true,
+      }),
+    ).rejects.toThrow(/native print mode does not support selecting an agent/i);
+  });
+
+  it("discovers the shell-free global OMO Native node entry", async () => {
+    process.env.APPDATA = codexHome;
+    const nativeCli = await installFakeGlobalNativeCli(codexHome);
+
+    const invocation = await resolveOmoInvocation();
+
+    expect(invocation).toEqual({
+      command: process.execPath,
+      argsPrefix: [nativeCli],
+      source: "native-global",
+      compatibilityStatus: "compatible",
+      cliContract: "native-print",
+    });
   });
 });

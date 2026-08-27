@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "./mcp-server.js";
 import type { Lease, ToolContext } from "../types.js";
+import { requestLocalShellApproval, resolveLocalShellApproval, taskApprovalIdentity } from "../policy/local-approvals.js";
 
 /**
  * e2e_run_command's `screenshotUrl` input reached captureE2eUrlScreenshot
@@ -16,6 +17,11 @@ import type { Lease, ToolContext } from "../types.js";
  * lease + real shell command), not just the shared local-e2e.ts helper.
  */
 
+interface TestTaskContext {
+  workSessionId: string;
+  goalId: string;
+}
+
 interface RegisteredToolLike {
   handler?: (input: Record<string, unknown>) => Promise<{
     structuredContent?: Record<string, unknown>;
@@ -24,7 +30,7 @@ interface RegisteredToolLike {
   }>;
 }
 
-function makeCtx(stateDir: string, projectRoot: string): ToolContext {
+function makeCtx(stateDir: string, projectRoot: string, task?: TestTaskContext): ToolContext {
   const registry = [{ projectId: "proj", name: "proj", root: projectRoot, aliases: [] }];
   const lease: Lease = {
     projectId: "proj",
@@ -42,7 +48,29 @@ function makeCtx(stateDir: string, projectRoot: string): ToolContext {
     store: {
       loadProjects: async () => registry,
       saveProjects: async () => undefined,
-      getSession: async () => ({ activeProjectId: "proj", mode: "read", lease }),
+      getSession: async () => ({
+        activeProjectId: "proj",
+        mode: "read",
+        lease,
+        workContexts: {},
+        workSessions: task
+          ? {
+              proj: {
+                [task.workSessionId]: {
+                  projectId: "proj",
+                  workSessionId: task.workSessionId,
+                  activeArtifact: null,
+                  recentFiles: [],
+                  lastCheckpointId: null,
+                  lastMutation: null,
+                  lastVerification: null,
+                  taskState: { goalId: task.goalId, loopId: null },
+                  lastActivityAt: Date.now(),
+                },
+              },
+            }
+          : {},
+      }),
       setSession: async () => undefined,
     },
     config: {
@@ -81,7 +109,7 @@ describe("e2e_run_command screenshotUrl guard", () => {
 
     const result = await tools.e2e_run_command?.handler?.({
       projectId: "proj",
-      command: "true",
+      command: "node -e \"process.exit(0)\"",
       screenshotUrl: "file:///etc/passwd",
     });
 
@@ -92,13 +120,40 @@ describe("e2e_run_command screenshotUrl guard", () => {
     expect(result?.structuredContent?.approvalInstruction).toContain("Do not tell the user");
   }, 15_000);
 
+  it("shares one task approval with external HTTP E2E verification", async () => {
+    const task = { workSessionId: "ws_release", goalId: "goal-release" };
+    const ctx = makeCtx(stateDir, projectRoot, task);
+    const identity = taskApprovalIdentity(task);
+    expect(identity).toBeTruthy();
+    const requested = await requestLocalShellApproval(stateDir, {
+      projectId: "proj",
+      command: "npx wrangler deploy --config worker/wrangler.jsonc",
+      taskIdentity: identity,
+      needsNetwork: true,
+      destructive: true,
+    });
+    await resolveLocalShellApproval(stateDir, requested.id, "approve");
+
+    const tools = await registeredTools(ctx);
+    const result = await tools.e2e_run_command?.handler?.({
+      projectId: "proj",
+      workSessionId: task.workSessionId,
+      command: "node -e \"process.exit(0)\"",
+      captureScreenshot: false,
+      screenshotUrl: "https://example.com/health",
+    });
+
+    expect(result?.isError).toBeFalsy();
+    expect((result?.structuredContent as { exitCode?: number } | undefined)?.exitCode).toBe(0);
+  }, 15_000);
+
   it("still allows a local loopback screenshotUrl to pass validation (no over-blocking)", async () => {
     const ctx = makeCtx(stateDir, projectRoot);
     const tools = await registeredTools(ctx);
 
     const result = await tools.e2e_run_command?.handler?.({
       projectId: "proj",
-      command: "true",
+      command: "node --version",
       captureScreenshot: false, // avoid a real screencapture/Chrome call in CI
       screenshotUrl: "http://127.0.0.1:1/",
     });

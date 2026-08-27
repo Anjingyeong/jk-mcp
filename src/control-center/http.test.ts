@@ -110,6 +110,8 @@ let app: Awaited<ReturnType<typeof startApp>> | null = null;
 
 beforeEach(async () => {
   delete process.env.JK_REMOTE_MANAGEMENT_HOST;
+  delete process.env.JK_REMOTE_MANAGEMENT_CF_ACCESS_REQUIRED;
+  delete process.env.JK_DEPLOYMENT_PROJECT_ROOT;
   tempRoot = await mkdtemp(path.join(os.tmpdir(), "jk-control-center-"));
   stateDir = path.join(tempRoot, "state");
   projectRoot = path.join(tempRoot, "example-service");
@@ -125,6 +127,8 @@ afterEach(async () => {
   app = null;
   if (tempRoot) await rm(tempRoot, { recursive: true, force: true });
   delete process.env.JK_REMOTE_MANAGEMENT_HOST;
+  delete process.env.JK_REMOTE_MANAGEMENT_CF_ACCESS_REQUIRED;
+  delete process.env.JK_DEPLOYMENT_PROJECT_ROOT;
 });
 
 describe("JK Control Center", () => {
@@ -152,6 +156,11 @@ describe("JK Control Center", () => {
     expect(html).toContain("Authenticated remote");
     expect(html).not.toContain("Local admin only");
     expect(html).toContain("workflow-rail-root");
+    expect(html).toContain('aria-label="MASS ULW execution status"');
+    expect(html).toContain('aria-label="Current MASS ULW wave"');
+    expect(html).toContain('aria-label="Running MASS ULW lanes"');
+    expect(html).toContain('aria-label="Blocked MASS ULW dependencies"');
+    expect(html).toContain('aria-label="MASS ULW verification"');
     expect(html).toContain("refreshSignals");
     expect(html).not.toContain("Live Office");
     expect(html).not.toContain("data:image/webp;base64,UklGR");
@@ -301,6 +310,34 @@ describe("JK Control Center", () => {
     expect(apiAfterLogout.status).toBe(401);
   });
 
+  it("can require Cloudflare Access in addition to owner login", async () => {
+    await app!.stop();
+    process.env.JK_REMOTE_MANAGEMENT_HOST = "jk.example.test";
+    process.env.JK_REMOTE_MANAGEMENT_CF_ACCESS_REQUIRED = "1";
+    app = await startApp(makeCtx(stateDir, projectRoot));
+
+    const baseHeaders = {
+      "x-forwarded-host": "jk.example.test",
+      "x-forwarded-for": "203.0.113.9",
+      "x-forwarded-proto": "https",
+      origin: "https://jk.example.test",
+      "content-type": "application/json",
+    };
+    const blocked = await fetch(`${app.baseUrl}/api/jk/control/login`, {
+      method: "POST",
+      headers: baseHeaders,
+      body: JSON.stringify({ ownerToken: OWNER_TOKEN }),
+    });
+    expect(blocked.status).toBe(403);
+
+    const allowed = await fetch(`${app.baseUrl}/api/jk/control/login`, {
+      method: "POST",
+      headers: { ...baseHeaders, "cf-access-jwt-assertion": "unit-test-access-token" },
+      body: JSON.stringify({ ownerToken: OWNER_TOKEN }),
+    });
+    expect(allowed.status).toBe(200);
+  });
+
   it("returns status, persisted goals, and sanitized recent logs", async () => {
     const status = await (await fetch(`${app!.baseUrl}/api/jk/control/status`)).json() as any;
     expect(status.ok).toBe(true);
@@ -310,6 +347,9 @@ describe("JK Control Center", () => {
 
     const goals = await (await fetch(`${app!.baseUrl}/api/jk/control/goals`)).json() as any;
     expect(goals.goals[0]).toMatchObject({ projectId: "proj", currentGoal: "Finish dashboard", loopId: "loop-1" });
+
+    const execution = await (await fetch(`${app!.baseUrl}/api/jk/control/execution`)).json() as any;
+    expect(execution.execution.massUlw).toBeNull();
 
     const logs = await (await fetch(`${app!.baseUrl}/api/jk/control/logs`)).json() as any;
     expect(logs.logs[0]).toMatchObject({ type: "tool.call", projectId: "proj" });
@@ -330,6 +370,40 @@ describe("JK Control Center", () => {
 
     const status = await (await fetch(`${app!.baseUrl}/api/jk/control/status`)).json() as any;
     expect(status.deployment).toMatchObject(deployment);
+  });
+
+  it.skipIf(process.platform === "win32")("queues one fixed JK deployment sync approval and reuses it on repeated dashboard clicks", async () => {
+    process.env.JK_DEPLOYMENT_PROJECT_ROOT = projectRoot;
+    await mkdir(path.join(projectRoot, "src", "server"), { recursive: true });
+    await mkdir(path.join(projectRoot, "scripts"), { recursive: true });
+    await writeFile(path.join(projectRoot, "src", "server", "tools.ts"), "// marker\n");
+    await writeFile(path.join(projectRoot, "scripts", "sync-jk-oci.sh"), "#!/usr/bin/env bash\n");
+    await writeFile(path.join(projectRoot, "scripts", "reload-jk-runtime.sh"), "#!/usr/bin/env bash\n");
+
+    const firstResponse = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "systemctl restart anything" }),
+    });
+    expect(firstResponse.status).toBe(202);
+    const first = await firstResponse.json() as any;
+    expect(first).toMatchObject({ ok: true, status: "pending", reused: false });
+    expect(first.job.commandPreview).toBe("bash scripts/sync-jk-oci.sh --reload-current");
+    expect(first.job.needsNetwork).toBe(true);
+    expect(first.job.destructive).toBe(true);
+
+    const secondResponse = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "rm -rf /" }),
+    });
+    expect(secondResponse.status).toBe(202);
+    const second = await secondResponse.json() as any;
+    expect(second).toMatchObject({ ok: true, status: "pending", reused: true, approvalId: first.approvalId });
+
+    const approvals = await (await fetch(`${app!.baseUrl}/api/jk/control/approvals`)).json() as any;
+    const deploymentApprovals = approvals.approvals.filter((item: any) => item.commandPreview === "bash scripts/sync-jk-oci.sh --reload-current");
+    expect(deploymentApprovals).toHaveLength(1);
   });
 
   it("loads sanitized host-local quick links without hardcoding them in the public UI", async () => {
@@ -408,6 +482,7 @@ describe("JK Control Center", () => {
       command,
       cwd: ".",
       reason: "test exact approval auto resume",
+      taskIdentity: "goal:goal-1",
       needsNetwork: true,
       destructive: false,
     };
@@ -428,8 +503,10 @@ describe("JK Control Center", () => {
     expect((await resolved.json() as any).job.status).toBe("running");
 
     let job = await readLocalShellJob(stateDir, requested.id);
-    for (let i = 0; i < 50 && job?.status === "running"; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
+    // node startup can take seconds under parallel CI load; poll by deadline
+    const jobDeadline = Date.now() + 15_000;
+    while (Date.now() < jobDeadline && job?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 100));
       job = await readLocalShellJob(stateDir, requested.id);
     }
     expect(job).toMatchObject({ status: "succeeded", exitCode: 0 });
@@ -446,13 +523,13 @@ describe("JK Control Center", () => {
     });
   });
 
-  it("rechecks the project lease before starting an approved queued job", async () => {
-    const command = `node -e "require('node:fs').writeFileSync('must-not-run.txt','no')"`;
+  it("resumes an already-authorized queued job even if the active lease changes while approval is pending", async () => {
+    const command = `node -e "require('node:fs').writeFileSync('approved-after-lease-change.txt','ok')"`;
     const approvalInput = {
       projectId: "proj",
       command,
       cwd: ".",
-      reason: "lease must still allow the approved write",
+      reason: "approval should resume the queued write",
       needsNetwork: true,
       destructive: false,
     };
@@ -477,13 +554,21 @@ describe("JK Control Center", () => {
       body: JSON.stringify({ decision: "approve" }),
     });
     expect(resolved.status).toBe(200);
-    expect((await resolved.json() as any).job.status).toBe("failed");
-    await expect(readFile(path.join(projectRoot, "must-not-run.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await resolved.json() as any).job.status).toBe("running");
+
+    let job = await readLocalShellJob(stateDir, requested.id);
+    const jobDeadline = Date.now() + 15_000;
+    while (Date.now() < jobDeadline && job?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      job = await readLocalShellJob(stateDir, requested.id);
+    }
+    expect(job).toMatchObject({ status: "succeeded", exitCode: 0 });
+    expect(await readFile(path.join(projectRoot, "approved-after-lease-change.txt"), "utf8")).toBe("ok");
 
     const goals = await (await fetch(`${app!.baseUrl}/api/jk/control/goals`)).json() as any;
     expect(goals.goals[0].continuation).toMatchObject({
       jobId: requested.id,
-      status: "blocked",
+      status: "ready-to-resume",
     });
   });
 });

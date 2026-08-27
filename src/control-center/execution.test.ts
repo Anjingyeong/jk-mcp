@@ -2,6 +2,8 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { MassUlwStore } from "../orchestration/mass-ulw-store.js";
+import { buildMassUlwPlan, type MassUlwCandidate } from "../orchestration/mass-ulw.js";
 import { readTaskExecutionView, type TaskExecutionSnapshot } from "./execution.js";
 
 const tempDirs: string[] = [];
@@ -20,7 +22,7 @@ async function stateDir(): Promise<string> {
 function snapshot(overrides: Partial<TaskExecutionSnapshot> = {}): TaskExecutionSnapshot {
   return {
     projectId: "p1",
-    projectName: "example-service",
+    projectName: "songsong",
     goalId: "goal-1",
     loopId: "loop-1",
     currentGoal: "기능을 구현한다",
@@ -49,6 +51,7 @@ describe("readTaskExecutionView", () => {
       phase: null,
       primaryStage: null,
       supportingStages: [],
+      massUlw: null,
       recoveryNeeded: false,
     });
   });
@@ -150,6 +153,7 @@ describe("readTaskExecutionView", () => {
     );
     expect(view.mode).toBeNull();
     expect(view.modeSource).toBe("idle");
+    expect(view.massUlw).toBeNull();
     expect(view.phase).toBeNull();
     expect(view.primaryStage).toBeNull();
   });
@@ -168,5 +172,49 @@ describe("readTaskExecutionView", () => {
     expect(view.pendingCount).toBe(1);
     expect(view.lastProgressSummary).toBe("검증 완료");
     expect(view.primaryStage).toBe("reviewer");
+  });
+
+  it("exposes persisted MASS ULW execution status", async () => {
+    const dir = await stateDir();
+    const candidate = (id: string, extra: Partial<MassUlwCandidate> = {}): MassUlwCandidate => ({
+      id,
+      task: `Implement ${id}`,
+      estimatedWeight: 2,
+      writeScopes: [`src/${id.toLowerCase()}`],
+      ...extra,
+    });
+    const plan = buildMassUlwPlan({
+      executionProfile: "max",
+      candidates: [candidate("running"), candidate("failed"), candidate("blocked", { dependsOn: ["failed"] })],
+    });
+    const store = new MassUlwStore(dir, { now: () => 200 });
+    await store.create("loop-1", plan);
+    await store.update("loop-1", (document) => {
+      const running = document.lanes.running;
+      const failed = document.lanes.failed;
+      const blocked = document.lanes.blocked;
+      if (!running || !failed || !blocked) throw new TypeError("MASS ULW projection fixture is incomplete");
+      running.status = "in-flight";
+      failed.status = "failed";
+      blocked.status = "blocked";
+      document.currentWave = 0;
+      document.integrationVerification = {
+        status: "in-flight",
+        attemptId: "verification-1",
+        fingerprint: "integrated-tree",
+        startedAt: 200,
+      };
+    });
+
+    const view = await readTaskExecutionView(dir, snapshot());
+
+    expect(view.massUlw).toStrictEqual({
+      currentWave: 0,
+      runningLanes: ["running"],
+      failedLanes: ["failed"],
+      blockedLanes: ["blocked"],
+      blockedDependencies: ["failed"],
+      verification: "in-flight",
+    });
   });
 });

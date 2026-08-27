@@ -14,6 +14,7 @@ export type ExecutorToolName =
   | "project_rules"
   | "repo_status"
   | "repo_diff_summary"
+  | "git_sync_start"
   | "code_search"
   | "file_read_slice"
   | "file_apply_patch"
@@ -21,6 +22,7 @@ export type ExecutorToolName =
   | "command_list"
   | "command_run"
   | "local_shell_run"
+  | "e2e_screenshot"
   | "executor_restart";
 
 export interface ExecutorProjectSnapshot {
@@ -43,6 +45,8 @@ export interface ExecutorHeartbeat {
   workspaceRoot: string;
   projects: ExecutorProjectSnapshot[];
   capabilities?: ExecutorToolName[];
+  instanceId?: string;
+  startedAtMs?: number;
 }
 
 export interface ExecutorStatus extends ExecutorHeartbeat {
@@ -130,6 +134,8 @@ export async function recordExecutorHeartbeat(stateDir: string, heartbeat: Execu
     workspaceRoot: heartbeat.workspaceRoot,
     projects: heartbeat.projects,
     capabilities: heartbeat.capabilities,
+    instanceId: heartbeat.instanceId,
+    startedAtMs: heartbeat.startedAtMs,
     lastSeenAtMs: now,
   };
   state.executors[executorId] = stored;

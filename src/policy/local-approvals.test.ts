@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -130,36 +130,251 @@ describe("local shell approvals", () => {
     ).toBe(false);
   });
 
-  it("reuses a task bundle only for predeclared exact command and risk hashes", async () => {
+  it("reuses a task bundle only for predeclared command and risk hashes", async () => {
     const dir = await stateDir();
-    const taskIdentity = "goal:example-release";
-    const firstCommand = "gh release upload android-channel app.apk --clobber";
-    const secondCommand = "gh release upload android-channel android-latest.json --clobber";
-    const verifyCommand = "curl -I https://example.com/releases/latest.apk";
-    const first = input({
-      command: firstCommand,
+    const workSessionId = "ws_cleantube_release";
+    const taskIdentity = `goal:cleantube-release:work-session:${workSessionId}`;
+    const releaseUpload = "gh release upload android-channel CleanTube-Android-0.1.12.apk --clobber";
+    const manifestUpload = "gh release upload android-channel android-latest.json --clobber";
+    const verify = "curl -I https://updates.example.com/android/latest.apk";
+    const first = {
+      ...input({
+      command: releaseUpload,
+      reason: "Publish CleanTube Android stable release",
       taskIdentity,
       destructive: true,
       bundle: {
-        label: "Example stable release",
+        label: "CleanTube v0.1.12 stable release",
+        entries: [
+          { command: releaseUpload, needsNetwork: true, destructive: true },
+          { command: manifestUpload, needsNetwork: true, destructive: true },
+          { command: verify, needsNetwork: true, destructive: false },
+        ],
+      },
+      }),
+      workSessionId,
+    } satisfies LocalShellApprovalInput & { workSessionId: string };
+    const requested = await requestLocalShellApproval(dir, first);
+    expect(requested.bundleLabel).toBe("CleanTube v0.1.12 stable release");
+    expect(requested.bundleCommandKeys).toHaveLength(3);
+    expect(requested).toMatchObject({
+      workSessionId,
+      bundleFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    expect(requested.bundlePreviews).toEqual(expect.arrayContaining([
+      expect.stringContaining("[destructive] gh release upload"),
+      expect.stringContaining("[network] curl -I"),
+    ]));
+    await resolveLocalShellApproval(dir, requested.id, "approve");
+
+    const bundleFiles = await readdir(path.join(dir, "approvals", "shell", "task-bundles"));
+    expect(bundleFiles).toHaveLength(1);
+    const bundleRecord = JSON.parse(
+      await readFile(path.join(dir, "approvals", "shell", "task-bundles", bundleFiles[0]!), "utf8"),
+    ) as {
+      approvalId?: string;
+      bundleFingerprint?: string;
+      workSessionId?: string;
+      remainingCommandKeys?: string[];
+    };
+    expect(bundleRecord).toMatchObject({
+      approvalId: requested.id,
+      bundleFingerprint: requested.bundleFingerprint,
+      workSessionId,
+    });
+    expect(bundleRecord.remainingCommandKeys).toHaveLength(3);
+
+    expect(await consumeLocalShellApproval(dir, first)).toBe(true);
+    expect(await consumeLocalShellApproval(dir, first)).toBe(false);
+    const manifest = {
+      ...input({ command: manifestUpload, reason: "Upload manifest", taskIdentity, destructive: true }),
+      workSessionId,
+    };
+    expect(await consumeLocalShellApproval(dir, manifest)).toBe(true);
+    expect(await consumeLocalShellApproval(dir, manifest)).toBe(false);
+    const verification = {
+      ...input({ command: verify, reason: "Verify public endpoint", taskIdentity, destructive: false }),
+      workSessionId,
+    };
+    expect(await consumeLocalShellApproval(dir, verification)).toBe(true);
+    expect(await consumeLocalShellApproval(dir, verification)).toBe(false);
+    expect(await consumeLocalShellApproval(dir, input({ command: "gh release delete android-channel --yes", taskIdentity, destructive: true }))).toBe(false);
+    expect(await consumeLocalShellApproval(dir, input({ command: manifestUpload, taskIdentity: "goal:other-release", destructive: true }))).toBe(false);
+    expect(await consumeLocalShellApproval(dir, input({ command: manifestUpload, taskIdentity, destructive: false }))).toBe(false);
+  });
+
+  it("reuses one pending release bundle for predeclared upload, deploy, and verify commands", async () => {
+    const dir = await stateDir();
+    const taskIdentity = "goal:cleantube-friends-release";
+    const upload = "gh release upload friends-assets YouTube-Music.apk --clobber";
+    const deploy = "npx wrangler deploy --config update-proxy/wrangler.jsonc";
+    const verify = "curl -I https://updates.example.com/android/latest.apk";
+    const musicVerify = "curl -I https://updates.example.com/music/youtube-music.apk";
+    const first = await requestLocalShellApproval(dir, input({
+      command: upload,
+      reason: "Finish CleanTube friends release",
+      taskIdentity,
+      destructive: true,
+      bundle: {
+        label: "CleanTube friends release",
+        entries: [
+          { command: upload, needsNetwork: true, destructive: true },
+          { command: deploy, needsNetwork: true, destructive: true },
+          { command: verify, needsNetwork: true, destructive: false },
+          { command: musicVerify, needsNetwork: true, destructive: false },
+        ],
+      },
+    }));
+
+    const reusedDeploy = await requestLocalShellApproval(dir, input({
+      command: deploy,
+      reason: "Deploy unified worker",
+      taskIdentity,
+      destructive: true,
+    }));
+    const reusedVerify = await requestLocalShellApproval(dir, input({
+      command: verify,
+      reason: "Verify public Android endpoint",
+      taskIdentity,
+      destructive: false,
+    }));
+    expect(reusedDeploy.id).toBe(first.id);
+    expect(reusedVerify.id).toBe(first.id);
+    expect(await listPendingLocalShellApprovals(dir)).toHaveLength(1);
+
+    const otherGoal = await requestLocalShellApproval(dir, input({
+      command: deploy,
+      reason: "Deploy another release",
+      taskIdentity: "goal:another-release",
+      destructive: true,
+    }));
+    expect(otherGoal.id).not.toBe(first.id);
+
+    const changedRisk = await requestLocalShellApproval(dir, input({
+      command: verify,
+      reason: "Verify with changed risk classification",
+      taskIdentity,
+      destructive: true,
+    }));
+    expect(changedRisk.id).not.toBe(first.id);
+    expect(await listPendingLocalShellApprovals(dir)).toHaveLength(3);
+  });
+
+  it("upgrades an exact pending approval to a wider predeclared bundle without creating a second approval", async () => {
+    const dir = await stateDir();
+    const workSessionId = "ws_pending_upgrade";
+    const taskIdentity = `goal:pending-upgrade:work-session:${workSessionId}`;
+    const firstCommand = "npm run release:publish";
+    const deployCommand = "npm run cf:update-proxy:deploy";
+    const verifyCommand = "npm run verify:update-channel";
+
+    const first = await requestLocalShellApproval(dir, input({
+      command: firstCommand,
+      taskIdentity,
+      workSessionId,
+      destructive: true,
+    }));
+    expect(first.bundleCommandKeys).toBeUndefined();
+
+    const upgraded = await requestLocalShellApproval(dir, input({
+      command: firstCommand,
+      taskIdentity,
+      workSessionId,
+      destructive: true,
+      bundle: {
+        label: "Release and verify",
         entries: [
           { command: firstCommand, needsNetwork: true, destructive: true },
-          { command: secondCommand, needsNetwork: true, destructive: true },
+          { command: deployCommand, needsNetwork: true, destructive: true },
           { command: verifyCommand, needsNetwork: true, destructive: false },
         ],
       },
-    });
-    const requested = await requestLocalShellApproval(dir, first);
-    expect(requested.bundleLabel).toBe("Example stable release");
-    expect(requested.bundleCommandKeys).toHaveLength(3);
-    await resolveLocalShellApproval(dir, requested.id, "approve");
+    }));
 
-    expect(await consumeLocalShellApproval(dir, first)).toBe(true);
-    expect(await consumeLocalShellApproval(dir, input({ command: secondCommand, taskIdentity, destructive: true }))).toBe(true);
-    expect(await consumeLocalShellApproval(dir, input({ command: verifyCommand, taskIdentity }))).toBe(true);
-    expect(await consumeLocalShellApproval(dir, input({ command: "gh release delete android-channel --yes", taskIdentity, destructive: true }))).toBe(false);
-    expect(await consumeLocalShellApproval(dir, input({ command: secondCommand, taskIdentity: "goal:other-release", destructive: true }))).toBe(false);
-    expect(await consumeLocalShellApproval(dir, input({ command: secondCommand, taskIdentity, destructive: false }))).toBe(false);
+    expect(upgraded.id).toBe(first.id);
+    expect(upgraded.bundleLabel).toBe("Release and verify");
+    expect(upgraded.bundleCommandKeys).toHaveLength(3);
+    expect(await listPendingLocalShellApprovals(dir)).toHaveLength(1);
+
+    await resolveLocalShellApproval(dir, upgraded.id, "approve");
+    expect(await consumeLocalShellApproval(dir, input({
+      command: firstCommand,
+      taskIdentity,
+      workSessionId,
+      destructive: true,
+    }))).toBe(true);
+    expect(await consumeLocalShellApproval(dir, input({
+      command: deployCommand,
+      taskIdentity,
+      workSessionId,
+      destructive: true,
+    }))).toBe(true);
+    expect(await consumeLocalShellApproval(dir, input({
+      command: verifyCommand,
+      taskIdentity,
+      workSessionId,
+      destructive: false,
+    }))).toBe(true);
+  });
+
+  it("never widens a bundle after the owner has already approved it", async () => {
+    const dir = await stateDir();
+    const taskIdentity = "goal:no-post-approval-widen";
+    const command = "npm run release:publish";
+    const approved = await requestLocalShellApproval(dir, input({ command, taskIdentity, destructive: true }));
+    await resolveLocalShellApproval(dir, approved.id, "approve");
+
+    const repeated = await requestLocalShellApproval(dir, input({
+      command,
+      taskIdentity,
+      destructive: true,
+      bundle: {
+        label: "Too late",
+        entries: [
+          { command, needsNetwork: true, destructive: true },
+          { command: "npm run cf:update-proxy:deploy", needsNetwork: true, destructive: true },
+        ],
+      },
+    }));
+
+    expect(repeated.status).toBe("approved");
+    expect(repeated.bundleCommandKeys).toBeUndefined();
+  });
+
+  it("keeps identical exact commands isolated between task identities", async () => {
+    const dir = await stateDir();
+    const command = "curl -I https://updates.example.com";
+    const first = await requestLocalShellApproval(dir, input({ command, taskIdentity: "goal:first" }));
+    const second = await requestLocalShellApproval(dir, input({ command, taskIdentity: "goal:second" }));
+    expect(second.id).not.toBe(first.id);
+    expect(await listPendingLocalShellApprovals(dir)).toHaveLength(2);
+  });
+
+  it("does not persist a task bundle without a stable task identity or reason", async () => {
+    const dir = await stateDir();
+    const bundled = input({
+      command: "gh release upload android-channel app.apk",
+      reason: undefined,
+      taskIdentity: undefined,
+      destructive: true,
+      bundle: {
+        label: "Unscoped bundle",
+        entries: [
+          { command: "gh release upload android-channel app.apk", needsNetwork: true, destructive: true },
+          { command: "gh release upload android-channel manifest.json", needsNetwork: true, destructive: true },
+        ],
+      },
+    });
+    const requested = await requestLocalShellApproval(dir, bundled);
+    expect(requested.bundleLabel).toBeUndefined();
+    await resolveLocalShellApproval(dir, requested.id, "approve");
+    expect(await consumeLocalShellApproval(dir, bundled)).toBe(true);
+    expect(await consumeLocalShellApproval(dir, input({
+      command: "gh release upload android-channel manifest.json",
+      reason: undefined,
+      taskIdentity: undefined,
+      destructive: true,
+    }))).toBe(false);
   });
 
   it("reuses a supervised grant only for the same non-destructive network task", async () => {
@@ -209,7 +424,7 @@ describe("local shell approvals", () => {
   it("reuses a supervised grant by stable task identity even when the reason text changes", async () => {
     const dir = await stateDir();
     const first = input({
-      command: "npx wrangler pages deploy dist --project-name example-vibe",
+      command: "npx wrangler pages deploy dist --project-name jingyeong-vibe",
       reason: "Deploy the vibe portfolio",
       taskIdentity: "loop:vibe-release",
     });

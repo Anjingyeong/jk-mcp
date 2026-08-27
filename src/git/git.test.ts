@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { gitDiffSummary, gitPush, gitRepositoryStatus, gitStatus, gitSyncFinish, gitSyncStart, parseNumstat } from "./git.js";
+import { gitDiffSummary, gitPush, gitRepositoryStatus, gitStageAndCommit, gitStatus, gitSyncFinish, gitSyncStart, parseNumstat, parsePorcelainStatus } from "./git.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -45,6 +45,17 @@ describe("parseNumstat", () => {
 
   it("returns empty array for empty input", () => {
     expect(parseNumstat("")).toEqual([]);
+  });
+});
+
+describe("parsePorcelainStatus", () => {
+  it("preserves NUL-delimited pathological paths and consumes rename sources", () => {
+    expect(parsePorcelainStatus(
+      "?? left -> right.txt\0 M line\nbreak.txt\0R  renamed.txt\0old.txt\0",
+    )).toEqual({
+      dirtyFiles: ["left -> right.txt", "line\nbreak.txt"],
+      staged: ["renamed.txt"],
+    });
   });
 });
 
@@ -113,6 +124,28 @@ describe("gitStatus — real git repo", () => {
     const status = await gitStatus(dir);
     expect(status.dirtyFiles).toContain("new.txt");
     expect(status.staged).not.toContain("new.txt");
+  });
+
+  it("reports individual untracked paths inside directories", async () => {
+    await mkdir(join(dir, "lanes", "a"), { recursive: true });
+    await writeFile(join(dir, "lanes", "a", "result.txt"), "lane A\n");
+
+    const status = await gitStatus(dir);
+
+    expect(status.dirtyFiles).toContain("lanes/a/result.txt");
+    expect(status.dirtyFiles).not.toContain("lanes/");
+  });
+
+  it("does not execute repository hooks during automated commits", async () => {
+    const marker = join(dir, "hook-ran.txt");
+    const hook = join(dir, ".git", "hooks", "pre-commit");
+    await writeFile(hook, `#!/bin/sh\nprintf hook > "${marker.replaceAll("\\", "/")}"\n`, "utf8");
+    await chmod(hook, 0o755);
+    await writeFile(join(dir, "automated.txt"), "automated\n", "utf8");
+
+    await gitStageAndCommit(dir, "automated commit", ["automated.txt"]);
+
+    await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("reports staged files separately from unstaged modifications", async () => {

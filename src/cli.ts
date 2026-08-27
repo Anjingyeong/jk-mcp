@@ -66,6 +66,10 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 /** Default state dir per PRD §10: `~/.local/share/chatgpt2codex/`. */
 function defaultStateDir(): string {
+  // Portable/override mode: lets sandboxed runs, USB-portable installs, and
+  // multi-instance setups redirect all state without touching $HOME.
+  const override = process.env.CHATGPT2CODEX_STATE_DIR;
+  if (override && override.trim()) return path.resolve(override.trim());
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
 }
 
@@ -579,12 +583,15 @@ async function cmdDoctor(): Promise<void> {
 async function cmdExecutor(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const hubUrl =
-    typeof flags.hub === "string" ? flags.hub : process.env.JK_HUB_URL ?? "http://127.0.0.1:7979";
+    typeof flags.hub === "string" ? flags.hub : process.env.JK_HUB_URL ?? "";
   const executorId =
     typeof flags["executor-id"] === "string" ? flags["executor-id"] : process.env.JK_EXECUTOR_ID ?? "windows-main";
   const tokenFile =
     typeof flags["token-file"] === "string" ? flags["token-file"] : process.env.JK_EXECUTOR_TOKEN_FILE;
   const executorToken = process.env.JK_EXECUTOR_TOKEN ?? (tokenFile ? await readExecutorToken(tokenFile) : "");
+  if (!hubUrl) {
+    throw new Error("Executor hub is not configured. Set JK_HUB_URL or pass --hub <url>.");
+  }
   if (!executorToken) {
     throw new Error(
       "Executor authentication is not configured. Set JK_EXECUTOR_TOKEN or --token-file <path>.",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ErrorCode, type Lease, type ProjectRegistryEntry } from "../types.js";
-import { makeLease, requireLease } from "./project-select.js";
+import { makeLease, renewLease, requireLease } from "./project-select.js";
 
 const alpha: ProjectRegistryEntry = {
   projectId: "alpha-app",
@@ -23,6 +23,38 @@ describe("makeLease", () => {
     const a = makeLease(alpha, "read-only");
     const b = makeLease(alpha, "read-only");
     expect(a.leaseId).not.toBe(b.leaseId);
+  });
+});
+
+describe("renewLease", () => {
+  it("keeps the lease id stable for the same valid project/root/preset while extending its TTL", () => {
+    const current: Lease = {
+      projectId: alpha.projectId,
+      leaseId: "lease_stable",
+      projectRoot: alpha.root,
+      preset: "full-write",
+      issuedAt: Date.now() - 60_000,
+      expiresAt: Date.now() + 60_000,
+    };
+    const renewed = renewLease(alpha, "full-write", current);
+    expect(renewed.leaseId).toBe(current.leaseId);
+    expect(renewed.issuedAt).toBeGreaterThan(current.issuedAt);
+    expect(renewed.expiresAt).toBeGreaterThan(current.expiresAt);
+  });
+
+  it("rotates the lease id when the old lease expired or the preset changes", () => {
+    const expired: Lease = {
+      projectId: alpha.projectId,
+      leaseId: "lease_expired",
+      projectRoot: alpha.root,
+      preset: "full-write",
+      issuedAt: Date.now() - 120_000,
+      expiresAt: Date.now() - 60_000,
+    };
+    expect(renewLease(alpha, "full-write", expired).leaseId).not.toBe(expired.leaseId);
+
+    const valid = { ...expired, leaseId: "lease_wrong_preset", expiresAt: Date.now() + 60_000 };
+    expect(renewLease(alpha, "read-only", valid).leaseId).not.toBe(valid.leaseId);
   });
 });
 

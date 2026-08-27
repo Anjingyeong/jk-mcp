@@ -6,8 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { storeOwnerToken } from "../auth/owner-token.js";
+import { resolveMassUlwExecutionId } from "../orchestration/mass-ulw-identity-index.js";
 import type { Lease, ToolContext } from "../types.js";
 import { createHttpServer, defaultHttpServerConfig } from "./http.js";
+import { completeExecutorJob, pollExecutorJob, recordExecutorHeartbeat, type ExecutorJob } from "../executors/broker.js";
 
 const OWNER_TOKEN = "unit-test-owner-token-123456";
 
@@ -106,6 +108,127 @@ async function postAction(baseUrl: string, pathName: string, body: unknown, toke
     },
     body: JSON.stringify(body),
   });
+}
+
+interface FakeWindowsExecutorHandle {
+  calls: ExecutorJob[];
+  stop(): Promise<void>;
+}
+
+async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsExecutorHandle> {
+  const calls: ExecutorJob[] = [];
+  let active = true;
+  const project = {
+    projectId: "chatgpt2codex",
+    name: "chatgpt2codex",
+    root: "C:\\JK\\chatgpt2codex",
+    aliases: ["chatgpt2codex"],
+    branch: "feat/auto-task-execution-harness",
+    dirty: false,
+    packageHints: ["node"],
+  };
+  const heartbeat = async (upgraded: boolean) => {
+    await recordExecutorHeartbeat(stateDir, {
+      executorId: "windows-main",
+      label: "Windows PC",
+      platform: "win32/x64 · test-host",
+      workspaceRoot: "C:\\JK",
+      projects: [project],
+      capabilities: [
+        "project_status",
+        "project_rules",
+        "repo_status",
+        "repo_diff_summary",
+        ...(upgraded ? (["git_sync_start"] as const) : []),
+        "code_search",
+        "file_read_slice",
+        "file_apply_patch",
+        "file_create",
+        "command_list",
+        "command_run",
+        "local_shell_run",
+        "e2e_screenshot",
+        "executor_restart",
+      ],
+      instanceId: upgraded ? "fake-windows-new" : "fake-windows-old",
+      startedAtMs: upgraded ? 2_000 : 1_000,
+    });
+  };
+  await heartbeat(false);
+
+  const pump = (async () => {
+    while (active) {
+      const job = await pollExecutorJob("windows-main", 50);
+      if (!job) continue;
+      calls.push(job);
+      try {
+        if (job.tool === "file_read_slice") {
+          const rel = String(job.payload.path ?? "unknown.txt");
+          const content = rel === "resume.txt"
+            ? "remote resume content\n"
+            : rel.endsWith("reload-jk-runtime.ps1")
+              ? "param()\n"
+              : "// remote JK source marker\n";
+          const hash = createHash("sha256").update(content).digest("hex");
+          completeExecutorJob(job.jobId, {
+            path: rel,
+            start: 1,
+            end: 1,
+            totalLines: 1,
+            content,
+            lineHashes: [hash],
+            fileHash: hash,
+            workContextFileHash: hash,
+            eol: "lf",
+          }, undefined, "windows-main");
+          continue;
+        }
+        if (job.tool === "project_status") {
+          completeExecutorJob(job.jobId, {
+            branch: "feat/auto-task-execution-harness",
+            dirtyFiles: [],
+            staged: [],
+            packageHints: ["node"],
+            ruleFiles: [],
+            knownCommands: [],
+            hasCodeBrain: false,
+          }, undefined, "windows-main");
+          continue;
+        }
+        if (job.tool === "local_shell_run") {
+          await heartbeat(true);
+          completeExecutorJob(job.jobId, {
+            cwd: "C:\\JK\\chatgpt2codex",
+            exitCode: 0,
+            stdoutSummary: "JK_RUNTIME_SWAP_QUEUED mode=executor-only",
+            stderrSummary: "",
+            durationMs: 5,
+            outputTruncated: false,
+          }, undefined, "windows-main");
+          void (async () => {
+            await new Promise((resolve) => setTimeout(resolve, 650));
+            if (!active) return;
+            await heartbeat(true);
+            await new Promise((resolve) => setTimeout(resolve, 650));
+            if (!active) return;
+            await heartbeat(true);
+          })();
+          continue;
+        }
+        completeExecutorJob(job.jobId, null, `unsupported fake worker tool: ${job.tool}`, "windows-main");
+      } catch (err) {
+        completeExecutorJob(job.jobId, null, err instanceof Error ? err.message : String(err), "windows-main");
+      }
+    }
+  })();
+
+  return {
+    calls,
+    async stop() {
+      active = false;
+      await pump;
+    },
+  };
 }
 
 async function registerOAuthClient(baseUrl: string): Promise<{ clientId: string; redirectUri: string }> {
@@ -228,6 +351,7 @@ describe("Custom GPT action bridge", () => {
           CallToolInput: { properties: Record<string, unknown> };
           GoalIntakeInput: Record<string, unknown>;
           GoalLoopInput: Record<string, unknown>;
+          MassUlwExecuteInput: Record<string, unknown>;
           SessionResumeInput: Record<string, unknown>;
           E2eRunCommandInput: Record<string, unknown>;
           E2eTestAndShowScreenshotInput: Record<string, unknown>;
@@ -244,7 +368,7 @@ describe("Custom GPT action bridge", () => {
 
     expect(res.status).toBe(200);
     expect(body.openapi).toBe("3.1.0");
-    expect(body.info.version).toBe("0.1.6");
+    expect(body.info.version).toBe(JSON.parse(await fs.readFile(path.join(process.cwd(), "package.json"), "utf8")).version);
     expect(body.info.description).toContain("source editing");
     expect(body.info.description).toContain("cannot write /Users/");
     expect(body.info.description).toContain("30 operations");
@@ -268,10 +392,11 @@ describe("Custom GPT action bridge", () => {
     expect(body.paths["/actions/file-create"]).toBeDefined();
     expect(body.paths["/actions/local-shell-run"]).toBeDefined();
     expect((body.paths["/actions/local-shell-run"] as { post: { operationId: string } }).post.operationId).toBe("local_shell_run");
-    expect(body.paths["/actions/omo-run"]).toBeDefined();
-    expect((body.paths["/actions/omo-run"] as { post: { operationId: string } }).post.operationId).toBe("omo_run");
+    expect(body.paths["/actions/omo-run"]).toBeUndefined();
     expect(body.paths["/actions/goal-intake"]).toBeDefined();
     expect(body.paths["/actions/goal-loop"]).toBeDefined();
+    expect(body.paths["/actions/mass-ulw-execute"]).toBeDefined();
+    expect((body.paths["/actions/mass-ulw-execute"] as { post: { operationId: string } }).post.operationId).toBe("mass_ulw_execute");
     expect(body.paths["/actions/e2e-start-server"]).toBeDefined();
     expect(body.paths["/actions/e2e-run-command"]).toBeDefined();
     expect(body.paths["/actions/e2e-test-and-show-screenshot"]).toBeDefined();
@@ -283,6 +408,9 @@ describe("Custom GPT action bridge", () => {
     expect(body.paths["/actions/code-context-pack"]).toBeUndefined();
     expect(body.info.description).toContain("goal_intake");
     expect(body.info.description).toContain("goal_loop");
+    expect(body.info.description).toContain("mass_ulw_execute");
+    expect(body.info["x-chatgpt2codex-tool-names"]).toContain("mass_ulw_execute");
+    expect(body.info["x-chatgpt2codex-tool-names"]).not.toContain("omo_run");
     expect(body.info.description).toContain("code_search followed by narrow file_read_slice");
     expect(body.info.description).toContain("E2E server/app launch plus screenshot capture");
     expect(body.paths["/actions/save-visible-chatgpt-images"]).toBeUndefined();
@@ -296,6 +424,10 @@ describe("Custom GPT action bridge", () => {
     expect((body.paths["/actions/session-resume"] as { post: { operationId: string } }).post.operationId).toBe("session_resume");
     expect(body.components.schemas.GoalIntakeInput).toBeDefined();
     expect(body.components.schemas.GoalLoopInput).toBeDefined();
+    expect(body.components.schemas.MassUlwExecuteInput).toBeDefined();
+    expect((body.components.schemas.MassUlwExecuteInput as { required?: string[] }).required).toEqual(
+      expect.arrayContaining(["projectId", "loopId", "planFingerprint", "workSessionId", "lanePatches", "laneVerificationCommandIds", "finalVerificationCommandId"]),
+    );
     expect(body.components.schemas.SessionResumeInput).toBeDefined();
     expect((body.components.schemas.GoalIntakeInput as { properties?: Record<string, unknown> }).properties?.workSessionId).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.workSessionId).toBeDefined();
@@ -303,6 +435,21 @@ describe("Custom GPT action bridge", () => {
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.phase).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.verificationStatus).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.failureCount).toBeDefined();
+    expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.fanoutCandidates).toBeDefined();
+    expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.executionProfile).toBeDefined();
+    const goalLoopSafety = (
+      (body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.safety as
+        | { properties?: Record<string, unknown> }
+        | undefined
+    );
+    expect(goalLoopSafety).toBeDefined();
+    expect(goalLoopSafety?.properties?.executionKind).toBeDefined();
+    expect(goalLoopSafety?.properties?.preflightStatus).toBeDefined();
+    expect(goalLoopSafety?.properties?.executionTarget).toBeDefined();
+    expect(goalLoopSafety?.properties?.approvalPlan).toBeDefined();
+    expect(goalLoopSafety?.properties?.rollbackStatus).toBeDefined();
+    expect(goalLoopSafety?.properties?.releaseCollisionStatus).toBeDefined();
+    expect(goalLoopSafety?.properties?.runtimeProofStatus).toBeDefined();
     expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.workSessionId).toBeDefined();
     expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.includeActiveSlice).toBeDefined();
     expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.maxActiveSliceLines).toBeDefined();
@@ -318,6 +465,7 @@ describe("Custom GPT action bridge", () => {
       }
     ).properties?.intent;
     expect(localShellIntent?.properties?.approvedByHuman).toBeUndefined();
+    expect(localShellIntent?.properties?.approvalBundle).toBeDefined();
     expect(body.paths["/actions/work-session-list"]).toBeUndefined();
     expect(body.components.schemas.E2eRunCommandInput).toBeDefined();
     expect(body.components.schemas.E2eTestAndShowScreenshotInput).toBeDefined();
@@ -332,6 +480,9 @@ describe("Custom GPT action bridge", () => {
     expect((body.components.schemas.OmoRunInput as { required?: string[] }).required).toEqual(["projectId", "message"]);
     expect((body.components.schemas.OmoRunInput as { properties?: Record<string, unknown> }).properties?.sessionId).toBeDefined();
     expect((body.components.schemas.OmoRunInput as { properties?: Record<string, unknown> }).properties?.timeoutSec).toBeDefined();
+    expect((body.components.schemas.OmoRunInput as { properties?: Record<string, unknown> }).properties?.ultrawork).toMatchObject({
+      type: "boolean",
+    });
     expect(body.components.schemas.CallToolInput.properties.toolName).toBeDefined();
     expect(body.components.schemas.FileApplyPatchInput.properties.patch).toBeDefined();
     expect(body.components.schemas.FileCreateInput.properties.content).toBeDefined();
@@ -371,7 +522,8 @@ describe("Custom GPT action bridge", () => {
     expect(body.openApiToolNames).toContain("session_resume");
     expect(body.openApiToolNames).toContain("file_apply_patch");
     expect(body.openApiToolNames).toContain("local_shell_run");
-    expect(body.openApiToolNames).toContain("omo_run");
+    expect(body.openApiToolNames).toContain("mass_ulw_execute");
+    expect(body.openApiToolNames).not.toContain("omo_run");
     expect(body.openApiToolNames).toContain("e2e_test_and_show_screenshot");
     expect(body.openApiToolNames).not.toContain("code_context_pack");
     expect(body.toolAvailabilityGate?.namespace).toBe("ChatGPT_To_Codex");
@@ -1516,6 +1668,17 @@ describe("Custom GPT action bridge", () => {
       primaryStage: "recovery",
       failureCount: 3,
     });
+    expect(second.structuredContent.intentContext).toMatchObject({
+      goalContract: "/goal implement and verify a focused change",
+      currentTask: "run focused tests",
+      decisions: [
+        {
+          summary: "Use structured progress fields",
+          rationale: "Avoid parsing arbitrary lastResult prose",
+        },
+      ],
+    });
+    expect(second.structuredContent.nextActions?.join(" ")).toContain("persisted goal contract");
     expect(second.structuredContent.nextActions?.join(" ")).toContain("Do not apply another patch");
     const loopFile = path.join(stateDir, "goals", `${first.structuredContent.loopId}.loop.json`);
     const loopState = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[] };
@@ -1592,6 +1755,445 @@ describe("Custom GPT action bridge", () => {
       summary: "Use structured progress fields",
       rationale: "Avoid parsing arbitrary lastResult prose",
     });
+  });
+
+  it("does not finish live/release work until runtime proof passes and operational drift is cleared", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const blockedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Deploy the app release",
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "deploy the app",
+      phase: "release",
+      verificationStatus: "pass",
+      pending: [],
+      safety: {
+        executionKind: "release-deploy",
+        preflightStatus: "pass",
+        preflightEvidence: ["CLI/auth/version preflight passed"],
+        executionTarget: {
+          machine: "oci",
+          projectRoot: projectRoot,
+          branch: "main",
+          dirty: true,
+          runtimeTarget: "example.invalid",
+        },
+        approvalPlan: ["npx wrangler deploy", "curl -I https://example.invalid"],
+        rollbackStatus: "pass",
+        releaseCollisionStatus: "pass",
+        runtimeProofStatus: "unknown",
+        operationalDrift: ["NeedDaemonReload=yes"],
+      },
+    });
+    const blocked = (await blockedRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        loopId?: string;
+        terminal?: boolean;
+        terminalBlockedBySafety?: boolean;
+        continueRequired?: boolean;
+        safetyGate?: { terminalReady?: boolean; terminalBlockers?: string[] };
+        intentContext?: { pending?: string[] };
+      };
+    };
+    expect(blockedRes.status).toBe(200);
+    expect(blocked.ok).toBe(true);
+    expect(blocked.structuredContent).toMatchObject({
+      terminal: false,
+      terminalBlockedBySafety: true,
+      continueRequired: true,
+      safetyGate: { terminalReady: false },
+    });
+    expect(blocked.structuredContent.safetyGate?.terminalBlockers).toEqual(
+      expect.arrayContaining(["runtime-proof-status", "runtime-proof-evidence", "operational-drift"]),
+    );
+    expect(blocked.structuredContent.intentContext?.pending).toContain("Operational drift: NeedDaemonReload=yes");
+
+    const finishedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: blocked.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "verify live release",
+      phase: "release",
+      verificationStatus: "pass",
+      pending: [],
+      safety: {
+        runtimeProofStatus: "pass",
+        runtimeProofEvidence: ["PID/start-time marker and endpoint behavior verified"],
+        operationalDrift: [],
+      },
+    });
+    const finished = (await finishedRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        terminal?: boolean;
+        terminalStatus?: string | null;
+        safetyGate?: { terminalReady?: boolean };
+      };
+    };
+    expect(finishedRes.status).toBe(200);
+    expect(finished.ok).toBe(true);
+    expect(finished.structuredContent).toMatchObject({
+      terminal: true,
+      terminalStatus: "succeeded",
+      safetyGate: { terminalReady: true },
+    });
+  });
+
+  it("creates no approval before deploy preflight and requires the complete declared bundle", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "goal loop safety approval test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Deploy the app release",
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "deploy the worker",
+      pending: ["run preflight"],
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { loopId?: string; workSessionId?: string } };
+    const deploy = "npx wrangler deploy --config wrangler.jsonc";
+    const verify = "curl -I https://example.invalid";
+
+    const prematureRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: deploy,
+      intent: { needsNetwork: true, destructive: true, reason: "deploy before preflight" },
+    });
+    const premature = (await prematureRes.json()) as {
+      structuredContent: { code?: string; approvalPending?: boolean; safetyBlockers?: string[] };
+    };
+    expect(premature.structuredContent.code).toBe("COMMAND_NOT_ALLOWED");
+    expect(premature.structuredContent.approvalPending).toBe(false);
+    const before = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as { approvals?: unknown[] };
+    expect(before.approvals ?? []).toHaveLength(0);
+
+    const safetyRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "deploy the worker",
+      pending: ["deploy", "verify"],
+      safety: {
+        executionKind: "release-deploy",
+        preflightStatus: "pass",
+        preflightEvidence: ["wrangler auth, config, cwd, target, and version collision checked"],
+        executionTarget: {
+          machine: "oci",
+          projectRoot: projectRoot,
+          branch: "main",
+          dirty: true,
+          runtimeTarget: "example.invalid",
+        },
+        approvalPlan: [deploy, verify],
+        rollbackStatus: "pass",
+        releaseCollisionStatus: "pass",
+      },
+    });
+    expect(safetyRes.status).toBe(200);
+
+    const incompleteRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: deploy,
+      intent: {
+        needsNetwork: true,
+        destructive: true,
+        reason: "deploy with incomplete bundle",
+        approvalBundle: { label: "release", commands: [deploy] },
+      },
+    });
+    const incomplete = (await incompleteRes.json()) as {
+      structuredContent: { code?: string; approvalPending?: boolean; missingApprovalPlanCommands?: string[] };
+    };
+    expect(incomplete.structuredContent.code).toBe("COMMAND_NOT_ALLOWED");
+    expect(incomplete.structuredContent.approvalPending).toBe(false);
+    const stillNone = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as { approvals?: unknown[] };
+    expect(stillNone.approvals ?? []).toHaveLength(0);
+
+    const bundledRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: deploy,
+      intent: {
+        needsNetwork: true,
+        destructive: true,
+        reason: "deploy using the predeclared safety plan",
+      },
+    });
+    const bundled = (await bundledRes.json()) as {
+      structuredContent: { code?: string; approvalPending?: boolean; bundleCount?: number };
+    };
+    expect(bundled.structuredContent.code).toBe("APPROVAL_REQUIRED");
+    expect(bundled.structuredContent.approvalPending).toBe(true);
+    const after = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ bundleLabel?: string; bundlePreviews?: string[] }>;
+    };
+    expect(after.approvals ?? []).toHaveLength(1);
+    expect(after.approvals?.[0]?.bundleLabel).toContain("release-deploy");
+    expect(after.approvals?.[0]?.bundlePreviews).toHaveLength(2);
+  });
+
+  it("automatically escalates repeated verification failures without requiring the caller to track failureCount", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const firstRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Fix the root cause without losing the parent objective",
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "verify the first hypothesis",
+      verificationStatus: "fail",
+      pending: ["find root cause"],
+    });
+    const first = (await firstRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        loopId?: string;
+        orchestration?: { phase?: string; failureCount?: number };
+      };
+    };
+    expect(first.ok).toBe(true);
+    expect(first.structuredContent.orchestration).toMatchObject({ phase: "verify", failureCount: 1 });
+
+    const secondRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: first.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 4,
+      lastResult: "the same symptom failed again",
+      verificationStatus: "fail",
+    });
+    const second = (await secondRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        orchestration?: { phase?: string; primaryStage?: string; failureCount?: number; recoveryPolicy?: string };
+        intentContext?: { goalContract?: string | null; currentTask?: string | null; pending?: string[] };
+      };
+    };
+    expect(second.ok).toBe(true);
+    expect(second.structuredContent.orchestration).toMatchObject({
+      phase: "recovery",
+      primaryStage: "recovery",
+      failureCount: 2,
+    });
+    expect(second.structuredContent.orchestration?.recoveryPolicy).toContain("root cause");
+    expect(second.structuredContent.intentContext).toMatchObject({
+      goalContract: "Fix the root cause without losing the parent objective",
+      currentTask: "verify the first hypothesis",
+      pending: ["find root cause"],
+    });
+  });
+
+  it("persists executable Mass ULW dependency waves with a stable fingerprint", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement two independent substantial modules and verify them",
+      projectId: "proj",
+      pending: ["backend module", "frontend module", "integration"],
+      fanoutCandidates: [
+        { id: "backend", task: "Implement backend", estimatedWeight: 4, writeScopes: ["src/backend"] },
+        { id: "frontend", task: "Implement frontend", estimatedWeight: 4, writeScopes: ["src/frontend"] },
+        {
+          id: "integration",
+          task: "Integrate and verify both modules",
+          estimatedWeight: 4,
+          readScopes: ["src/backend", "src/frontend"],
+          writeScopes: ["src/integration"],
+          dependsOn: ["backend", "frontend"],
+        },
+      ],
+    });
+    const body = (await res.json()) as {
+      ok: boolean;
+      structuredContent: {
+        loopId?: string;
+        orchestration?: {
+          massUlw?: {
+            state?: string;
+            recommended?: boolean;
+            netGain?: number;
+            hardBlocks?: string[];
+            waves?: string[][];
+            planFingerprint?: string;
+          };
+        };
+      };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.structuredContent.orchestration?.massUlw).toMatchObject({
+      state: "fanout",
+      recommended: true,
+      hardBlocks: [],
+      waves: [["backend", "frontend"], ["integration"]],
+    });
+    expect(body.structuredContent.orchestration?.massUlw?.netGain).toBeGreaterThanOrEqual(1);
+    expect(body.structuredContent.orchestration?.massUlw?.planFingerprint).toMatch(/^[a-f0-9]{64}$/);
+
+    const persistedExecutionId = await resolveMassUlwExecutionId(stateDir, {
+      projectId: "proj",
+      externalLoopId: body.structuredContent.loopId,
+    });
+    expect(persistedExecutionId).toMatch(/^mass-[a-f0-9]{64}$/);
+    const persisted = JSON.parse(
+      await fs.readFile(
+        path.join(stateDir, "orchestration", "mass-ulw", `${persistedExecutionId}.json`),
+        "utf8",
+      ),
+    ) as { plan?: { waves?: string[][]; planFingerprint?: string } };
+    expect(persisted.plan).toMatchObject({
+      waves: [["backend", "frontend"], ["integration"]],
+      planFingerprint: body.structuredContent.orchestration?.massUlw?.planFingerprint,
+    });
+  });
+
+  it("forces Mass ULW sequential execution when lane scopes collide", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement two large changes that touch shared configuration",
+      projectId: "proj",
+      pending: ["writer", "reader"],
+      fanoutCandidates: [
+        { id: "writer", task: "Update shared config", estimatedWeight: 5, writeScopes: ["src/shared"] },
+        { id: "reader", task: "Use shared config", estimatedWeight: 5, readScopes: ["src/shared/config.ts"] },
+      ],
+    });
+    const body = (await res.json()) as {
+      ok: boolean;
+      structuredContent: {
+        orchestration?: {
+          massUlw?: { state?: string; recommended?: boolean; hardBlocks?: string[] };
+        };
+      };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.structuredContent.orchestration?.massUlw).toMatchObject({
+      state: "sequential",
+      recommended: false,
+    });
+    expect(body.structuredContent.orchestration?.massUlw?.hardBlocks?.join(" ")).toContain("scope-collision");
+  });
+
+  it("Auto promotes a tiny narrow task to Fast", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Fix a typo in one button label",
+      projectId: "proj",
+      pending: ["fix label"],
+    });
+    const body = (await res.json()) as {
+      structuredContent: {
+        orchestration?: {
+          executionProfile?: { requested?: string; effective?: string; source?: string };
+          massUlw?: { state?: string; recommended?: boolean };
+        };
+      };
+    };
+    expect(body.structuredContent.orchestration?.executionProfile).toMatchObject({
+      requested: "auto",
+      effective: "fast",
+      source: "auto",
+    });
+    expect(body.structuredContent.orchestration?.massUlw).toMatchObject({ state: "inactive", recommended: false });
+  });
+
+  it("Auto promotes broad QA/release intent to Max", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "전체 QA 세게 돌리고 끝까지 배포",
+      projectId: "proj",
+      pending: ["frontend QA", "backend QA", "release verification"],
+    });
+    const body = (await res.json()) as {
+      structuredContent: {
+        orchestration?: {
+          executionProfile?: { requested?: string; effective?: string; source?: string };
+          massUlw?: { state?: string };
+        };
+      };
+    };
+    expect(body.structuredContent.orchestration?.executionProfile).toMatchObject({
+      requested: "auto",
+      effective: "max",
+      source: "auto",
+    });
+    expect(body.structuredContent.orchestration?.massUlw?.state).toBe("evaluate");
+  });
+
+  it("Fast keeps independent candidate lanes sequential", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement two independent substantial modules",
+      projectId: "proj",
+      executionProfile: "fast",
+      pending: ["backend", "frontend"],
+      fanoutCandidates: [
+        { id: "backend", task: "Implement backend", estimatedWeight: 5, writeScopes: ["src/backend"] },
+        { id: "frontend", task: "Implement frontend", estimatedWeight: 5, writeScopes: ["src/frontend"] },
+      ],
+    });
+    const body = (await res.json()) as {
+      structuredContent: {
+        orchestration?: {
+          executionProfile?: { requested?: string; effective?: string };
+          massUlw?: { state?: string; recommended?: boolean; hardBlocks?: string[]; rationale?: string };
+        };
+      };
+    };
+    expect(body.structuredContent.orchestration?.executionProfile).toMatchObject({ requested: "fast", effective: "fast" });
+    expect(body.structuredContent.orchestration?.massUlw).toMatchObject({
+      state: "sequential",
+      recommended: false,
+      hardBlocks: [],
+      waves: [["backend", "frontend"]],
+    });
+    expect(body.structuredContent.orchestration?.massUlw?.planFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(body.structuredContent.orchestration?.massUlw?.rationale).toContain("Fast profile");
+  });
+
+  it("Max aggressively fans out small independent QA lanes", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Run independent QA checks before integration",
+      projectId: "proj",
+      executionProfile: "max",
+      pending: ["backend QA", "frontend QA"],
+      fanoutCandidates: [
+        { id: "backend-qa", task: "Run backend QA", estimatedWeight: 1, readScopes: ["src/backend"] },
+        { id: "frontend-qa", task: "Run frontend QA", estimatedWeight: 1, readScopes: ["src/frontend"] },
+      ],
+    });
+    const body = (await res.json()) as {
+      structuredContent: {
+        orchestration?: {
+          executionProfile?: { requested?: string; effective?: string };
+          massUlw?: { state?: string; recommended?: boolean; netGain?: number; threshold?: number };
+        };
+      };
+    };
+    expect(body.structuredContent.orchestration?.executionProfile).toMatchObject({ requested: "max", effective: "max" });
+    expect(body.structuredContent.orchestration?.massUlw).toMatchObject({ state: "fanout", recommended: true, threshold: 0.25 });
+    expect(body.structuredContent.orchestration?.massUlw?.netGain).toBeGreaterThan(0.25);
   });
 
   it("isolates same-project work by workSessionId and lists resumable handles", async () => {
@@ -1781,7 +2383,7 @@ describe("Custom GPT action bridge", () => {
     );
   });
 
-  it("attaches an approved job continuation to the next JK response exactly once", async () => {
+  it("keeps an approved job continuation visible until goal_loop consumes it", async () => {
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
 
@@ -1836,12 +2438,12 @@ describe("Custom GPT action bridge", () => {
     expect(approveRes.status).toBe(200);
 
     let finished = false;
-    for (let i = 0; i < 80 && !finished; i += 1) {
+    for (let i = 0; i < 480 && !finished; i += 1) {
       const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
         jobs?: Array<{ id?: string; status?: string }>;
       };
       finished = approvals.jobs?.some((job) => job.id === approvalId && job.status === "succeeded") ?? false;
-      if (!finished) await new Promise((resolve) => setTimeout(resolve, 20));
+      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
     }
     expect(finished).toBe(true);
 
@@ -1867,11 +2469,530 @@ describe("Custom GPT action bridge", () => {
     expect(first.text).toContain("[JK task continuation]");
 
     const secondRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
-    const second = (await secondRes.json()) as { structuredContent: { taskContinuation?: unknown } };
-    expect(second.structuredContent.taskContinuation).toBeUndefined();
+    const second = (await secondRes.json()) as {
+      structuredContent: { taskContinuation?: { jobResult?: { jobId?: string; status?: string } } };
+    };
+    expect(second.structuredContent.taskContinuation?.jobResult).toMatchObject({ status: "succeeded" });
+
+    const resumedLoopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId,
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      maxTurns: 3,
+      currentTask: "inspect approved result",
+      lastResult: "approved job finished; resume the same loop",
+    });
+    const resumedLoop = (await resumedLoopRes.json()) as {
+      structuredContent: { taskContinuation?: { jobResult?: { status?: string; stdoutSummary?: string } } };
+    };
+    expect(resumedLoop.structuredContent.taskContinuation?.jobResult).toMatchObject({ status: "succeeded" });
+    expect(resumedLoop.structuredContent.taskContinuation?.jobResult?.stdoutSummary).toContain("continuation-ok");
+
+    const afterConsumeRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
+    const afterConsume = (await afterConsumeRes.json()) as { structuredContent: { taskContinuation?: unknown } };
+    expect(afterConsume.structuredContent.taskContinuation).toBeUndefined();
+  });
+
+  it("reuses the same approval job before and after approval instead of reissuing the command", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "approval job idempotency test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "run one approved command exactly once",
+      projectId: "proj",
+      maxTurns: 3,
+      currentTask: "verify approval resume idempotency",
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { workSessionId?: string } };
+    expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
+
+    const command = `node -e "const fs=require('node:fs');const p='approval-resume-count.txt';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1));console.log('approval-resume-count='+(n+1))"`;
+    const request = (reason = "same approved resume task") => postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command,
+      intent: {
+        needsNetwork: true,
+        writesWorkspace: true,
+        reason,
+      },
+    });
+
+    const first = (await (await request()).json()) as {
+      structuredContent: { code?: string; approvalId?: string; approvalReused?: string };
+    };
+    expect(first.structuredContent.code).toBe("APPROVAL_REQUIRED");
+
+    const pendingBeforeRetry = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; projectId?: string }>;
+    };
+    const approvalId = pendingBeforeRetry.approvals?.find((item) => item.projectId === "proj")?.id;
+    expect(approvalId).toMatch(/^[a-f0-9]{64}$/u);
+
+    const duplicatePending = (await (await request("same operation before approval, wording changed")).json()) as {
+      structuredContent: { code?: string; approvalId?: string; approvalReused?: string; jobId?: string };
+    };
+    expect(duplicatePending.structuredContent).toMatchObject({
+      code: "APPROVAL_REQUIRED",
+      approvalId,
+      jobId: approvalId,
+      approvalReused: "existing-job",
+    });
+    const pendingAfterRetry = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; projectId?: string }>;
+    };
+    expect(pendingAfterRetry.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(1);
+
+    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${approvalId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(approveRes.status).toBe(200);
+
+    let finished = false;
+    for (let i = 0; i < 240 && !finished; i += 1) {
+      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        jobs?: Array<{ id?: string; status?: string }>;
+      };
+      finished = approvals.jobs?.some((job) => job.id === approvalId && job.status === "succeeded") ?? false;
+      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(finished).toBe(true);
+
+    const resumed = (await (await request("same operation after approval, wording changed again")).json()) as {
+      structuredContent: {
+        code?: string;
+        exitCode?: number;
+        stdoutSummary?: string;
+        reusedJob?: boolean;
+        jobId?: string;
+        taskContinuation?: { jobResult?: { status?: string } };
+      };
+    };
+    expect(resumed.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
+    expect(resumed.structuredContent).toMatchObject({
+      exitCode: 0,
+      reusedJob: true,
+      jobId: approvalId,
+      taskContinuation: { jobResult: { status: "succeeded" } },
+    });
+    expect(resumed.structuredContent.stdoutSummary).toContain("approval-resume-count=1");
+    expect(await fs.readFile(path.join(projectRoot, "approval-resume-count.txt"), "utf8")).toBe("1");
+
+    const repeated = (await (await request()).json()) as {
+      structuredContent: { exitCode?: number; reusedJob?: boolean; stdoutSummary?: string };
+    };
+    expect(repeated.structuredContent).toMatchObject({ exitCode: 0, reusedJob: true });
+    expect(repeated.structuredContent.stdoutSummary).toContain("approval-resume-count=1");
+    expect(await fs.readFile(path.join(projectRoot, "approval-resume-count.txt"), "utf8")).toBe("1");
+  });
+
+  it("queues risky command_run as one resumable approval job", async () => {
+    await fs.writeFile(
+      path.join(projectRoot, "package.json"),
+      JSON.stringify({
+        name: "approval-command-run-fixture",
+        private: true,
+        scripts: { deploy: "echo command-run-approved-once" },
+      }),
+    );
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "command_run approval resume test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "run one risky allowlisted command exactly once",
+      projectId: "proj",
+      maxTurns: 3,
+      currentTask: "verify command_run approval resume idempotency",
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { workSessionId?: string } };
+    expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
+
+    const request = (intent: { needsNetwork?: boolean; writesWorkspace?: boolean; expectedDurationSec?: number } = {
+      needsNetwork: true,
+      writesWorkspace: true,
+      expectedDurationSec: 30,
+    }) => postAction(server.baseUrl, "/actions/command-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      commandId: "npm:deploy",
+      intent,
+    });
+
+    const first = (await (await request()).json()) as {
+      structuredContent: { code?: string; approvalPending?: boolean; approvalId?: string; jobId?: string };
+    };
+    expect(first.structuredContent).toMatchObject({ code: "APPROVAL_REQUIRED", approvalPending: true });
+    expect(first.structuredContent.approvalId).toMatch(/^[a-f0-9]{64}$/u);
+    expect(first.structuredContent.jobId).toBe(first.structuredContent.approvalId);
+
+    const duplicatePending = (await (await request({ expectedDurationSec: 30 })).json()) as {
+      structuredContent: { code?: string; approvalId?: string; jobId?: string; approvalReused?: string };
+    };
+    expect(duplicatePending.structuredContent).toMatchObject({
+      code: "APPROVAL_REQUIRED",
+      approvalId: first.structuredContent.approvalId,
+      jobId: first.structuredContent.approvalId,
+      approvalReused: "existing-job",
+    });
+
+    const pending = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; projectId?: string }>;
+      jobs?: Array<{ id?: string; executionKind?: string; status?: string }>;
+    };
+    expect(pending.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(1);
+    expect(pending.jobs?.find((item) => item.id === first.structuredContent.approvalId)).toMatchObject({
+      executionKind: "command-run",
+      status: "pending",
+    });
+
+    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${first.structuredContent.approvalId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(approveRes.status).toBe(200);
+
+    let finished = false;
+    for (let i = 0; i < 240 && !finished; i += 1) {
+      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        jobs?: Array<{ id?: string; status?: string }>;
+      };
+      finished = approvals.jobs?.some(
+        (job) => job.id === first.structuredContent.approvalId && job.status === "succeeded",
+      ) ?? false;
+      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(finished).toBe(true);
+
+    const resumed = (await (await request({ writesWorkspace: false })).json()) as {
+      structuredContent: { code?: string; exitCode?: number; stdoutSummary?: string; reusedJob?: boolean; jobId?: string };
+    };
+    expect(resumed.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
+    expect(resumed.structuredContent).toMatchObject({
+      exitCode: 0,
+      reusedJob: true,
+      jobId: first.structuredContent.approvalId,
+    });
+    expect(resumed.structuredContent.stdoutSummary).toContain("command-run-approved-once");
+
+    const repeated = (await (await request()).json()) as {
+      structuredContent: { exitCode?: number; reusedJob?: boolean; stdoutSummary?: string; jobId?: string };
+    };
+    expect(repeated.structuredContent).toMatchObject({
+      exitCode: 0,
+      reusedJob: true,
+      jobId: first.structuredContent.approvalId,
+    });
+    expect(repeated.structuredContent.stdoutSummary).toBe(resumed.structuredContent.stdoutSummary);
+  });
+
+  it("reuses a completed risky command_run through the active lease when no workSessionId exists", async () => {
+    await fs.writeFile(
+      path.join(projectRoot, "package.json"),
+      JSON.stringify({
+        name: "approval-command-run-lease-fixture",
+        private: true,
+        scripts: { deploy: "echo command-run-lease-approved-once" },
+      }),
+    );
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "command_run lease fallback test",
+    })).status).toBe(200);
+
+    const request = () => postAction(server.baseUrl, "/actions/command-run", {
+      projectId: "proj",
+      commandId: "npm:deploy",
+      intent: { needsNetwork: true, expectedDurationSec: 30 },
+    });
+
+    const first = (await (await request()).json()) as {
+      structuredContent: { code?: string; approvalId?: string; jobId?: string };
+    };
+    expect(first.structuredContent.code).toBe("APPROVAL_REQUIRED");
+    expect(first.structuredContent.approvalId).toMatch(/^[a-f0-9]{64}$/u);
+    expect(first.structuredContent.jobId).toBe(first.structuredContent.approvalId);
+
+    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${first.structuredContent.approvalId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(approveRes.status).toBe(200);
+
+    let finished = false;
+    for (let i = 0; i < 240 && !finished; i += 1) {
+      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        jobs?: Array<{ id?: string; status?: string }>;
+      };
+      finished = approvals.jobs?.some(
+        (job) => job.id === first.structuredContent.approvalId && job.status === "succeeded",
+      ) ?? false;
+      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(finished).toBe(true);
+
+    const resumed = (await (await request()).json()) as {
+      structuredContent: { code?: string; exitCode?: number; stdoutSummary?: string; reusedJob?: boolean; jobId?: string };
+    };
+    expect(resumed.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
+    expect(resumed.structuredContent).toMatchObject({
+      exitCode: 0,
+      reusedJob: true,
+      jobId: first.structuredContent.approvalId,
+    });
+    expect(resumed.structuredContent.stdoutSummary).toContain("command-run-lease-approved-once");
+
+    const approvalsAfterResume = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; projectId?: string }>;
+    };
+    expect(approvalsAfterResume.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(0);
+  });
+
+  it("widens an existing pending local-shell approval card when the same command is retried with a predeclared bundle", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "pending approval bundle upgrade integration test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "finish one bounded pending approval bundle",
+      projectId: "proj",
+      maxTurns: 3,
+      currentTask: "upgrade the pending command to one approval bundle",
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { workSessionId?: string } };
+    const firstCommand = `node -e "console.log('pending-upgrade-first')"`;
+    const secondCommand = process.platform === "win32"
+      ? `cmd /d /c "if exist pending-upgrade.tmp del /q pending-upgrade.tmp"`
+      : `sh -c "rm -rf pending-upgrade.tmp"`;
+
+    const firstRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: firstCommand,
+      intent: { needsNetwork: true, reason: "pending approval bundle upgrade" },
+    });
+    const first = (await firstRes.json()) as { structuredContent: { code?: string; approvalId?: string } };
+    expect(first.structuredContent.code).toBe("APPROVAL_REQUIRED");
+
+    const widenedRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: firstCommand,
+      intent: {
+        needsNetwork: true,
+        reason: "pending approval bundle upgrade",
+        approvalBundle: {
+          label: "pending upgrade bundle",
+          commands: [secondCommand],
+          ttlMinutes: 10,
+        },
+      },
+    });
+    const widened = (await widenedRes.json()) as {
+      structuredContent: { code?: string; approvalId?: string };
+    };
+    expect(widened.structuredContent.code).toBe("APPROVAL_REQUIRED");
+    expect(widened.structuredContent.approvalId).toBe(first.structuredContent.approvalId);
+
+    const pending = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{
+        id?: string;
+        projectId?: string;
+        bundleLabel?: string;
+        bundlePreviews?: string[];
+        bundleFingerprint?: string;
+      }>;
+    };
+    const approvals = pending.approvals?.filter((item) => item.projectId === "proj") ?? [];
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatchObject({
+      id: first.structuredContent.approvalId,
+      bundleLabel: "pending upgrade bundle",
+    });
+    expect(approvals[0]?.bundlePreviews).toHaveLength(2);
+    expect(approvals[0]?.bundleFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("reuses one approved task bundle for a predeclared destructive follow-up only", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "task bundle integration test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "finish one bounded release bundle",
+      projectId: "proj",
+      maxTurns: 3,
+      currentTask: "run two predeclared risky commands",
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { workSessionId?: string } };
+    expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
+
+    const firstCommand = `node -e "console.log('bundle-first-ok')"`;
+    const secondCommand = process.platform === "win32"
+      ? `node -e "const fs=require('node:fs');const p='bundle-second-count.txt';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1))" & cmd /d /c "if exist bundle-delete.tmp del /q bundle-delete.tmp & echo bundle-second-ok"`
+      : `node -e "const fs=require('node:fs');const p='bundle-second-count.txt';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1))" && sh -c "rm -rf bundle-delete.tmp; echo bundle-second-ok"`;
+    const unseenCommand = process.platform === "win32"
+      ? `cmd /d /c "if exist bundle-unseen.tmp del /q bundle-unseen.tmp"`
+      : `sh -c "rm -rf bundle-unseen.tmp"`;
+
+    const firstRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: firstCommand,
+      intent: {
+        needsNetwork: true,
+        reason: "bounded task bundle integration",
+        approvalBundle: {
+          label: "integration release bundle",
+          commands: [secondCommand],
+          ttlMinutes: 10,
+        },
+      },
+    });
+    const first = (await firstRes.json()) as { structuredContent: { code?: string } };
+    expect(first.structuredContent.code).toBe("APPROVAL_REQUIRED");
+
+    const coveredBeforeApprovalRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: secondCommand,
+      intent: { reason: "same bundled task" },
+    });
+    const coveredBeforeApproval = (await coveredBeforeApprovalRes.json()) as {
+      structuredContent: { code?: string };
+    };
+    expect(coveredBeforeApproval.structuredContent.code).toBe("APPROVAL_REQUIRED");
+
+    const pending = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{
+        id?: string;
+        projectId?: string;
+        workSessionId?: string;
+        bundleFingerprint?: string;
+        bundleLabel?: string;
+        bundlePreviews?: string[];
+      }>;
+    };
+    const approval = pending.approvals?.find((item) => item.projectId === "proj");
+    expect(approval).toMatchObject({ bundleLabel: "integration release bundle" });
+    expect(approval?.bundlePreviews).toHaveLength(2);
+    expect(approval?.id).toMatch(/^[a-f0-9]{64}$/u);
+    expect(approval?.workSessionId).toBe(loop.structuredContent.workSessionId);
+    expect(approval?.bundleFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+    expect(pending.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(1);
+
+    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${approval?.id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(approveRes.status).toBe(200);
+
+    let firstFinished = false;
+    for (let i = 0; i < 240 && !firstFinished; i += 1) {
+      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        jobs?: Array<{ id?: string; status?: string }>;
+      };
+      firstFinished = approvals.jobs?.some((job) => job.id === approval?.id && job.status === "succeeded") ?? false;
+      if (!firstFinished) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(firstFinished).toBe(true);
+
+    const secondRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: secondCommand,
+      intent: { reason: "same bundled task" },
+    });
+    const second = (await secondRes.json()) as {
+      structuredContent: { code?: string; exitCode?: number; jobId?: string; reusedJob?: boolean };
+    };
+    expect(second.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
+    expect(second.structuredContent.exitCode).toBe(0);
+    expect(second.structuredContent.jobId).toMatch(/^[a-f0-9]{64}$/u);
+    expect(second.structuredContent.jobId).not.toBe(approval?.id);
+    expect(await fs.readFile(path.join(projectRoot, "bundle-second-count.txt"), "utf8")).toBe("1");
+
+    const repeatedSecondRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: secondCommand,
+      intent: { reason: "same bundled task, resumed again" },
+    });
+    const repeatedSecond = (await repeatedSecondRes.json()) as {
+      structuredContent: { code?: string; exitCode?: number; jobId?: string; reusedJob?: boolean };
+    };
+    expect(repeatedSecond.structuredContent).toMatchObject({
+      exitCode: 0,
+      jobId: second.structuredContent.jobId,
+      reusedJob: true,
+    });
+    expect(await fs.readFile(path.join(projectRoot, "bundle-second-count.txt"), "utf8")).toBe("1");
+
+    const afterSecond = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ projectId?: string }>;
+      jobs?: Array<{
+        id?: string;
+        approvalId?: string;
+        bundleFingerprint?: string;
+        workSessionId?: string;
+        status?: string;
+      }>;
+    };
+    expect(afterSecond.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(0);
+    expect(afterSecond.jobs?.find((item) => item.id === second.structuredContent.jobId)).toMatchObject({
+      approvalId: approval?.id,
+      bundleFingerprint: approval?.bundleFingerprint,
+      workSessionId: loop.structuredContent.workSessionId,
+      status: "succeeded",
+    });
+
+    const unseenRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: unseenCommand,
+      intent: { reason: "same bundled task" },
+    });
+    const unseen = (await unseenRes.json()) as { structuredContent: { code?: string } };
+    expect(unseen.structuredContent.code).toBe("APPROVAL_REQUIRED");
   });
 
   it("runs server-verified cloud inventory reads without creating an approval", async () => {
+    if (process.platform === "win32") {
+      // The fixture writes a #!/bin/sh script and executes it directly;
+      // there is no POSIX exec path on Windows, so this scenario is
+      // covered by the equivalent command-based tests above.
+      return;
+    }
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
 
@@ -1981,4 +3102,202 @@ describe("Custom GPT action bridge", () => {
       candidate.matchReasons?.includes("full-hint-match"),
     )).toBe(true);
   });
+
+  it("hydrates a remote Windows work-session slice through the executor instead of treating C:\\ paths as OCI-local", async () => {
+    const localJkRoot = path.join(projectRoot, "local-jk");
+    await fs.mkdir(localJkRoot, { recursive: true });
+    const worker = await startFakeWindowsExecutor(stateDir);
+    const server = await startApp(makeCtx(stateDir, projectRoot, [
+      { projectId: "chatgpt2codex", name: "chatgpt2codex", root: localJkRoot },
+    ]));
+    stop = server.stop;
+    const remoteProjectId = "windows-main::chatgpt2codex";
+    try {
+      const selected = await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId,
+        preset: "full-write",
+        reason: "remote resume setup",
+      });
+      expect(selected.status).toBe(200);
+
+      const goalRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+        goal: "remember one remote file slice",
+        projectId: remoteProjectId,
+        maxTurns: 4,
+        currentTask: "read resume.txt",
+      });
+      const goal = (await goalRes.json()) as { structuredContent: { workSessionId?: string } };
+      const workSessionId = goal.structuredContent.workSessionId;
+      expect(workSessionId).toMatch(/^ws_/u);
+
+      const readRes = await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: remoteProjectId,
+        workSessionId,
+        path: "resume.txt",
+        start: 1,
+        end: 1,
+      });
+      expect(readRes.status).toBe(200);
+
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj",
+        preset: "full-write",
+        reason: "switch away before fused remote resume",
+        confirmSwitch: true,
+      })).status).toBe(200);
+
+      const resumedRes = await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId,
+        workSessionId,
+        preset: "full-write",
+        reason: "fused remote resume",
+        confirmSwitch: true,
+        includeResumeContext: true,
+        includeResumeSlice: true,
+      });
+      const resumed = (await resumedRes.json()) as {
+        ok: boolean;
+        structuredContent: { resumeContext?: { activeSlice?: { content?: string } | null } | null };
+      };
+      expect(resumedRes.status).toBe(200);
+      expect(resumed.ok).toBe(true);
+      expect(resumed.structuredContent.resumeContext?.activeSlice?.content).toContain("remote resume content");
+      expect(worker.calls.filter((job) => job.tool === "file_read_slice").length).toBeGreaterThanOrEqual(3);
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it("centralizes remote Windows runtime_upgrade approval, executes the same job once, and lets goal_loop consume the continuation", async () => {
+    const localJkRoot = path.join(projectRoot, "local-jk");
+    await fs.mkdir(localJkRoot, { recursive: true });
+    const worker = await startFakeWindowsExecutor(stateDir);
+    const server = await startApp(makeCtx(stateDir, projectRoot, [
+      { projectId: "chatgpt2codex", name: "chatgpt2codex", root: localJkRoot },
+    ]));
+    stop = server.stop;
+    const remoteProjectId = "windows-main::chatgpt2codex";
+    try {
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId,
+        preset: "full-write",
+        reason: "central runtime upgrade",
+      })).status).toBe(200);
+
+      const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+        goal: "activate verified JK-next on the Windows executor exactly once",
+        projectId: remoteProjectId,
+        maxTurns: 5,
+        currentTask: "activate verified JK-next",
+        pending: ["activate verified JK-next"],
+      });
+      const loop = (await loopRes.json()) as { structuredContent: { loopId?: string; workSessionId?: string } };
+      expect(loop.structuredContent.loopId).toBeTruthy();
+      expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
+
+      const upgrade = async () => postAction(server.baseUrl, "/actions/call-tool", {
+        toolName: "runtime_upgrade",
+        input: {
+          projectId: remoteProjectId,
+          workSessionId: loop.structuredContent.workSessionId,
+        },
+      });
+      const first = (await (await upgrade()).json()) as {
+        structuredContent: { code?: string; approvalId?: string; jobId?: string };
+      };
+      expect(first.structuredContent.code).toBe("APPROVAL_REQUIRED");
+      expect(first.structuredContent.approvalId).toMatch(/^[a-f0-9]{64}$/u);
+      expect(first.structuredContent.jobId).toBe(first.structuredContent.approvalId);
+
+      const second = (await (await upgrade()).json()) as {
+        structuredContent: { code?: string; approvalId?: string; jobId?: string; approvalReused?: string };
+      };
+      expect(second.structuredContent.code).toBe("APPROVAL_REQUIRED");
+      expect(second.structuredContent.approvalId).toBe(first.structuredContent.approvalId);
+      expect(second.structuredContent.jobId).toBe(first.structuredContent.jobId);
+      expect(second.structuredContent.approvalReused).toBe("existing-job");
+
+      const approvalsBefore = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        approvals?: Array<{ id?: string; projectId?: string }>;
+      };
+      expect(approvalsBefore.approvals?.filter((item) => item.projectId === remoteProjectId)).toHaveLength(1);
+
+      const approve = await fetch(`${server.baseUrl}/api/jk/control/approvals/${first.structuredContent.approvalId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      expect(approve.status).toBe(200);
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const beforeStableProof = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        jobs?: Array<{ id?: string; status?: string }>;
+      };
+      expect(beforeStableProof.jobs?.find((job) => job.id === first.structuredContent.jobId)?.status).toBe("running");
+
+      let succeeded = false;
+      for (let i = 0; i < 160 && !succeeded; i += 1) {
+        const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+          jobs?: Array<{ id?: string; status?: string }>;
+        };
+        succeeded = approvals.jobs?.some((job) => job.id === first.structuredContent.jobId && job.status === "succeeded") ?? false;
+        if (!succeeded) await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(succeeded).toBe(true);
+      const runtimeCalls = worker.calls.filter((job) => job.tool === "local_shell_run");
+      expect(runtimeCalls).toHaveLength(1);
+      expect(String(runtimeCalls[0]?.payload.command ?? "")).toContain("reload-jk-runtime.ps1");
+      expect(String(runtimeCalls[0]?.payload.command ?? "")).toContain("-ExecutorOnly");
+
+      const peek = async () => {
+        const res = await postAction(server.baseUrl, "/actions/project-status", { projectId: remoteProjectId });
+        return (await res.json()) as { structuredContent: { taskContinuation?: { jobResult?: { jobId?: string; status?: string } } } };
+      };
+      const peekOne = await peek();
+      const peekTwo = await peek();
+      expect(peekOne.structuredContent.taskContinuation?.jobResult).toMatchObject({
+        jobId: first.structuredContent.jobId,
+        status: "succeeded",
+      });
+      expect(peekTwo.structuredContent.taskContinuation?.jobResult?.jobId).toBe(first.structuredContent.jobId);
+
+      const finalLoopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+        loopId: loop.structuredContent.loopId,
+        projectId: remoteProjectId,
+        workSessionId: loop.structuredContent.workSessionId,
+        maxTurns: 5,
+        currentTask: "verify executor reconnect",
+        completed: ["activate verified JK-next", "verify executor reconnect"],
+        pending: [],
+        phase: "release",
+        verificationStatus: "pass",
+        lastResult: "Windows executor reconnected with upgraded heartbeat",
+      });
+      const finalLoop = (await finalLoopRes.json()) as {
+        structuredContent: {
+          terminal?: boolean;
+          terminalStatus?: string | null;
+          taskContinuation?: { jobResult?: { jobId?: string; status?: string } };
+        };
+      };
+      expect(finalLoop.structuredContent.terminal).toBe(true);
+      expect(finalLoop.structuredContent.terminalStatus).toBe("succeeded");
+      expect(finalLoop.structuredContent.taskContinuation?.jobResult).toMatchObject({
+        jobId: first.structuredContent.jobId,
+        status: "succeeded",
+      });
+
+      const afterConsume = await peek();
+      expect(afterConsume.structuredContent.taskContinuation).toBeUndefined();
+
+      const executorRes = await fetch(`${server.baseUrl}/api/executors`, {
+        headers: { authorization: `Bearer ${OWNER_TOKEN}` },
+      });
+      const executors = (await executorRes.json()) as { executors?: Array<{ executorId?: string; capabilities?: string[] }> };
+      expect(executors.executors?.find((item) => item.executorId === "windows-main")?.capabilities).toContain("git_sync_start");
+    } finally {
+      await worker.stop();
+    }
+  });
+
 });

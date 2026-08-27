@@ -13,6 +13,23 @@ const OUTPUT_HEAD_BYTES = 16_000;
 const OUTPUT_TAIL_BYTES = 8_000;
 const COMPATIBILITY_PROBE_TIMEOUT_MS = 5_000;
 const REQUIRED_RUN_FLAGS = ["--json", "--directory", "--agent", "--model", "--session-id", "--verbose"] as const;
+const REQUIRED_NATIVE_FLAGS = [
+  "--mode",
+  "--print",
+  "--model",
+  "--session-id",
+  "--verbose",
+  "--omo-senpi-ultrawork-disabled",
+] as const;
+const NATIVE_ULTRAWORK_TRIGGER = /(?:ultrawork|ulw(?!-))/iu;
+const INJECTED_ULTRAWORK_MARKER = /<ultrawork-mode>/iu;
+
+export type OmoCliContract = "legacy-run" | "native-print";
+export type UltraworkTransport =
+  | "none"
+  | "native-hook-disabled"
+  | "native-hook-trigger"
+  | "legacy-keyword-trigger";
 
 export interface OmoRunOptions {
   message: string;
@@ -21,6 +38,7 @@ export interface OmoRunOptions {
   sessionId?: string;
   timeoutSec?: number;
   verbose?: boolean;
+  ultrawork?: boolean;
 }
 
 interface OmoCandidate {
@@ -32,8 +50,9 @@ interface OmoCandidate {
 export interface OmoInvocation {
   command: string;
   argsPrefix: string[];
-  source: "env-bin" | "env-node-cli" | "codex-cache" | "path";
+  source: "env-bin" | "env-node-cli" | "codex-cache" | "native-global" | "path";
   compatibilityStatus: "compatible";
+  cliContract: OmoCliContract;
   detectedVersion?: string;
   selectedVersion?: string;
   fallbackFromVersion?: string;
@@ -43,6 +62,7 @@ export interface OmoInvocation {
 interface CompatibilityProbe {
   compatible: boolean;
   reason: string;
+  cliContract?: OmoCliContract;
 }
 
 const compatibilityCache = new Map<string, { mtimeMs: number; result: CompatibilityProbe }>();
@@ -64,7 +84,7 @@ function versionSortDesc(a: string, b: string): number {
 
 function buildOmoEnv(): NodeJS.ProcessEnv {
   const env = buildSafeChildEnv();
-  for (const key of ["USERPROFILE", "HOMEDRIVE", "HOMEPATH", "CODEX_HOME", "XDG_CONFIG_HOME"]) {
+  for (const key of ["USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "CODEX_HOME", "XDG_CONFIG_HOME"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   return env;
@@ -88,11 +108,54 @@ async function findCodexNodeClis(): Promise<OmoCandidate[]> {
   return candidates;
 }
 
+async function findGlobalNativeNodeCli(): Promise<string | undefined> {
+  const appData = process.env.APPDATA;
+  if (!appData) return undefined;
+  const cliPath = path.join(appData, "npm", "node_modules", "omo-ai", "bin", "omo.js");
+  const stat = await fs.stat(cliPath).catch(() => null);
+  return stat?.isFile() ? cliPath : undefined;
+}
+
 async function probeOmoCompatibility(command: string, argsPrefix: string[]): Promise<CompatibilityProbe> {
+  const runHelp = await probeHelp(command, [...argsPrefix, "run", "--help"]);
+  if (runHelp !== null) {
+    const missing = REQUIRED_RUN_FLAGS.filter((flag) => !runHelp.includes(flag));
+    if (missing.length === 0) {
+      return {
+        compatible: true,
+        reason: "required OMO run flags are available",
+        cliContract: "legacy-run",
+      };
+    }
+  }
+
+  const nativeHelp = await probeHelp(command, [...argsPrefix, "--help"]);
+  if (nativeHelp !== null) {
+    const missing = REQUIRED_NATIVE_FLAGS.filter((flag) => !nativeHelp.includes(flag));
+    if (missing.length === 0) {
+      return {
+        compatible: true,
+        reason: "required OMO Native print flags are available",
+        cliContract: "native-print",
+      };
+    }
+    return {
+      compatible: false,
+      reason: `missing required native flags: ${missing.join(", ")}`,
+    };
+  }
+
+  return {
+    compatible: false,
+    reason: "legacy and native compatibility probes exited with an error",
+  };
+}
+
+async function probeHelp(command: string, args: string[]): Promise<string | null> {
   return await new Promise((resolve) => {
     execFile(
       command,
-      [...argsPrefix, "run", "--help"],
+      args,
       {
         env: buildOmoEnv(),
         timeout: COMPATIBILITY_PROBE_TIMEOUT_MS,
@@ -102,18 +165,10 @@ async function probeOmoCompatibility(command: string, argsPrefix: string[]): Pro
       },
       (error, stdout, stderr) => {
         if (error) {
-          const killed = Boolean((error as NodeJS.ErrnoException & { killed?: boolean }).killed);
-          resolve({ compatible: false, reason: killed ? "compatibility probe timed out" : "run --help exited with an error" });
+          resolve(null);
           return;
         }
-
-        const help = `${stdout ?? ""}\n${stderr ?? ""}`;
-        const missing = REQUIRED_RUN_FLAGS.filter((flag) => !help.includes(flag));
-        if (missing.length > 0) {
-          resolve({ compatible: false, reason: `missing required run flags: ${missing.join(", ")}` });
-          return;
-        }
-        resolve({ compatible: true, reason: "required OMO run flags are available" });
+        resolve(`${stdout ?? ""}\n${stderr ?? ""}`);
       },
     );
   });
@@ -133,10 +188,27 @@ async function requireCompatibleInvocation(
   source: OmoInvocation["source"],
 ): Promise<OmoInvocation> {
   const probe = await probeOmoCompatibility(command, argsPrefix);
-  if (!probe.compatible) {
+  if (!probe.compatible || !probe.cliContract) {
     throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `Configured OMO CLI is incompatible with JK: ${probe.reason}`);
   }
-  return { command, argsPrefix, source, compatibilityStatus: "compatible" };
+  return {
+    command,
+    argsPrefix,
+    source,
+    compatibilityStatus: "compatible",
+    cliContract: probe.cliContract,
+  };
+}
+
+async function findPathExecutable(command: string): Promise<string | null> {
+  const pathValue = process.env.PATH ?? "";
+  for (const directory of pathValue.split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, command);
+    const stat = await fs.stat(candidate).catch(() => null);
+    if (stat?.isFile()) return candidate;
+  }
+  return null;
 }
 
 export async function resolveOmoInvocation(): Promise<OmoInvocation> {
@@ -164,7 +236,7 @@ export async function resolveOmoInvocation(): Promise<OmoInvocation> {
     const incompatibleVersions: string[] = [];
     for (const candidate of candidates) {
       const probe = await probeCandidate(candidate);
-      if (!probe.compatible) {
+      if (!probe.compatible || !probe.cliContract) {
         incompatibleVersions.push(candidate.version);
         continue;
       }
@@ -173,6 +245,7 @@ export async function resolveOmoInvocation(): Promise<OmoInvocation> {
         argsPrefix: [candidate.cliPath],
         source: "codex-cache",
         compatibilityStatus: "compatible",
+        cliContract: probe.cliContract,
         detectedVersion,
         selectedVersion: candidate.version,
         fallbackFromVersion: candidate.version === detectedVersion ? undefined : detectedVersion,
@@ -186,6 +259,11 @@ export async function resolveOmoInvocation(): Promise<OmoInvocation> {
     );
   }
 
+  const globalNativeCli = await findGlobalNativeNodeCli();
+  if (globalNativeCli) {
+    return await requireCompatibleInvocation(process.execPath, [globalNativeCli], "native-global");
+  }
+
   if (process.platform === "win32") {
     throw new DomainError(
       ErrorCode.COMMAND_NOT_ALLOWED,
@@ -193,7 +271,14 @@ export async function resolveOmoInvocation(): Promise<OmoInvocation> {
     );
   }
 
-  return await requireCompatibleInvocation("omo", [], "path");
+  const pathOmo = await findPathExecutable("omo");
+  if (!pathOmo) {
+    throw new DomainError(
+      ErrorCode.COMMAND_NOT_ALLOWED,
+      "OMO runner could not find an OMO CLI on PATH. Install/configure OMO or set CHATGPT2CODEX_OMO_BIN/CHATGPT2CODEX_OMO_NODE_CLI before using omo_run.",
+    );
+  }
+  return await requireCompatibleInvocation(pathOmo, [], "path");
 }
 
 function extractSessionId(stdout: string): string | undefined {
@@ -201,8 +286,13 @@ function extractSessionId(stdout: string): string | undefined {
   for (const candidate of candidates) {
     if (!candidate.startsWith("{")) continue;
     try {
-      const parsed = JSON.parse(candidate) as { sessionId?: unknown; session_id?: unknown };
-      const value = parsed.sessionId ?? parsed.session_id;
+      const parsed = JSON.parse(candidate) as {
+        id?: unknown;
+        sessionId?: unknown;
+        session_id?: unknown;
+        type?: unknown;
+      };
+      const value = parsed.sessionId ?? parsed.session_id ?? (parsed.type === "session" ? parsed.id : undefined);
       if (typeof value === "string" && value.length > 0) return value;
     } catch {
       // OMO can emit progress lines before the final JSON object.
@@ -218,6 +308,9 @@ export async function runOmo(
   cwd: string;
   source: OmoInvocation["source"];
   compatibilityStatus: OmoInvocation["compatibilityStatus"];
+  cliContract: OmoCliContract;
+  ultraworkRequested: boolean;
+  ultraworkTransport: UltraworkTransport;
   detectedVersion?: string;
   selectedVersion?: string;
   fallbackFromVersion?: string;
@@ -231,12 +324,34 @@ export async function runOmo(
 }> {
   const baseRoot = await fs.realpath(root);
   const invocation = await resolveOmoInvocation();
-  const args = [...invocation.argsPrefix, "run", "--json", "--directory", baseRoot];
-  args.push("--agent", options.agent ?? DEFAULT_AGENT);
-  if (options.model) args.push("--model", options.model);
-  if (options.sessionId) args.push("--session-id", options.sessionId);
-  if (options.verbose) args.push("--verbose");
-  args.push(options.message);
+  const ultraworkRequested = options.ultrawork === true;
+  const alreadyInjected = INJECTED_ULTRAWORK_MARKER.test(options.message);
+  const nativeHookRequested = ultraworkRequested && !alreadyInjected;
+  const effectiveMessage =
+    nativeHookRequested && !NATIVE_ULTRAWORK_TRIGGER.test(options.message)
+      ? `${options.message}\n\nulw`
+      : options.message;
+  const args = [...invocation.argsPrefix];
+  let ultraworkTransport: UltraworkTransport;
+  if (invocation.cliContract === "legacy-run") {
+    args.push("run", "--json", "--directory", baseRoot);
+    args.push("--agent", options.agent ?? DEFAULT_AGENT);
+    if (options.model) args.push("--model", options.model);
+    if (options.sessionId) args.push("--session-id", options.sessionId);
+    if (options.verbose) args.push("--verbose");
+    ultraworkTransport = nativeHookRequested ? "legacy-keyword-trigger" : "none";
+  } else {
+    if (options.agent) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "OMO Native print mode does not support selecting an agent");
+    }
+    args.push("--mode", "json", "--print");
+    if (options.model) args.push("--model", options.model);
+    if (options.sessionId) args.push("--session-id", options.sessionId);
+    if (options.verbose) args.push("--verbose");
+    if (!nativeHookRequested) args.push("--omo-senpi-ultrawork-disabled");
+    ultraworkTransport = nativeHookRequested ? "native-hook-trigger" : "native-hook-disabled";
+  }
+  args.push(effectiveMessage);
 
   const effectiveTimeoutSec = Math.min(Math.max(options.timeoutSec ?? DEFAULT_TIMEOUT_SEC, 1), MAX_TIMEOUT_SEC);
   const startedAt = Date.now();
@@ -269,6 +384,9 @@ export async function runOmo(
           cwd: ".",
           source: invocation.source,
           compatibilityStatus: invocation.compatibilityStatus,
+          cliContract: invocation.cliContract,
+          ultraworkRequested,
+          ultraworkTransport,
           detectedVersion: invocation.detectedVersion,
           selectedVersion: invocation.selectedVersion,
           fallbackFromVersion: invocation.fallbackFromVersion,

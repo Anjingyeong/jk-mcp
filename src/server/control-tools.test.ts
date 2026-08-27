@@ -6,6 +6,21 @@ import { createServer } from "./mcp-server.js";
 import type { Lease, ToolContext } from "../types.js";
 import { enqueue } from "../control/queue.js";
 
+/**
+ * computer_request_action's dry-run AX preview is darwin-gated in production
+ * code (resolveAxElement throws NOT_IMPLEMENTED elsewhere). The real
+ * osascript path against a deliberately nonexistent app simply reports a
+ * found:false preview, which is exactly what this suite asserts — so run the
+ * suite with the platform stubbed to darwin on every host OS.
+ */
+const ORIGINAL_PLATFORM = Object.getOwnPropertyDescriptor(process, "platform")!;
+beforeEach(function stubDarwinPlatform() {
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+});
+afterEach(function restorePlatform() {
+  Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
+});
+
 interface RegisteredToolLike {
   handler?: (input: Record<string, unknown>) => Promise<{
     structuredContent?: Record<string, unknown>;
@@ -335,5 +350,17 @@ describe("desktop-control tool gating", () => {
     expect(result?.isError).toBeFalsy();
     expect((result?.structuredContent?.lease as { preset?: string } | undefined)?.preset).toBe("control");
     expect(events.some((e) => e.type === "control.granted")).toBe(true);
+  });
+
+  it("project_select preserves lease identity when renewing the same non-control project/preset", async () => {
+    const { ctx } = makeCtx(stateDir, projectRoot);
+    const tools = await registeredTools(ctx);
+    const first = await tools.project_select?.handler?.({ projectId: "proj", reason: "first select", preset: "full-write" });
+    const second = await tools.project_select?.handler?.({ projectId: "proj", reason: "same task continues", preset: "full-write" });
+    const firstLease = first?.structuredContent?.lease as { leaseId?: string; expiresAt?: number } | undefined;
+    const secondLease = second?.structuredContent?.lease as { leaseId?: string; expiresAt?: number } | undefined;
+    expect(firstLease?.leaseId).toBeTruthy();
+    expect(secondLease?.leaseId).toBe(firstLease?.leaseId);
+    expect(secondLease?.expiresAt).toBeGreaterThanOrEqual(firstLease?.expiresAt ?? 0);
   });
 });

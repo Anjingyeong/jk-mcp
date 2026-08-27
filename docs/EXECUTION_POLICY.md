@@ -1,48 +1,65 @@
-# JK Execution Policy
+# JK Execution Location and Git Policy
 
-JK의 공개 배포판은 **로컬 MCP 하네스**를 기본으로 합니다. 특정 클라우드 공급자, 상시 서버, 개인 도메인, 자동 배포 환경은 공개 코어의 전제 조건이 아닙니다.
+This document defines JK's one-way hybrid flow: Windows publishes to GitHub, and OCI safely follows GitHub for runtime deployment.
 
-## 1. Local first
+## Source of truth
 
-- 프로젝트는 기본적으로 현재 JK 인스턴스의 local workspace에서 실행합니다.
-- 원격 executor는 사용자가 별도로 연결한 경우에만 사용합니다.
-- GUI, 디바이스, 서명 키, 로컬 전용 파일 등 플랫폼 종속 작업은 해당 환경에서 실행합니다.
-- 원격 worker가 없거나 offline이면 가능한 local project를 사용합니다.
+GitHub is the durable source of truth for any project that is enabled for OCI work.
 
-## 2. Git handoff
+- GitHub is the durable source of truth.
+- Windows is the primary interactive development workspace and never auto-pulls.
+- OCI is the deployment/always-on follower for GitHub `main`.
+- OCI may fast-forward only when its checkout is clean, on the expected branch/upstream, and has no local-only commits or divergence.
+- Do not edit the same branch independently on Windows and OCI at the same time.
 
-여러 executor가 같은 Git 저장소를 다룬다면 configured upstream을 durable source of truth로 사용합니다.
+## Project modes
 
-- 원격 checkout은 작업 전 clean 상태와 upstream 관계를 확인합니다.
-- 자동 동기화가 필요한 배포 follower는 fast-forward-only 방식만 사용해야 합니다.
-- dirty, diverged, local-only commit 상태는 자동으로 정리하지 않습니다.
-- 자동 `stash`, `reset`, `rebase`, force update는 하지 않습니다.
-- 같은 branch를 여러 executor에서 독립적으로 동시에 수정하지 않습니다.
-- Windows working copy는 사용자가 명시적으로 요청하지 않는 한 자동 pull하지 않습니다.
+### local-only — default for new/local projects
 
-## 3. Remote workers
+Use this until the user explicitly asks to use the project from OCI or another executor.
 
-Remote executor 기능은 범용 실행 수단입니다. 공개 JK는 특정 서버 공급자나 배포 토폴로지를 강제하지 않습니다.
+- No automatic GitHub repository creation.
+- No automatic upload of local code.
+- Windows/local remains the only working copy unless the project already has its own remote.
 
-예를 들어 사용자는 별도 머신, VM, 사내 서버 또는 개인 호스트에 worker를 구성할 수 있습니다. 그 호스트의 서비스 관리, reverse proxy, tunnel, 배포 자동화, 비용 정책은 host-local 운영 설정으로 관리합니다.
+### hybrid — opt-in
 
-## 4. Private host overrides
+Promote a project to hybrid when the user says things such as `OCI에서도 작업해`, `PC 꺼져도 작업되게 해`, or explicitly asks to synchronize it.
 
-공개 저장소에 개인 운영 로직을 넣지 않고도 host별 동작을 추가할 수 있습니다.
+For hybrid projects:
 
-- launcher override: `~/.local/share/chatgpt2codex/local/launcher.sh`
-- Control Center quick links: `~/.local/share/chatgpt2codex/control-center/quick-links.json`
+- GitHub is the shared source of truth.
+- Windows does not automatically pull from GitHub or OCI. Pull there only when the user explicitly requests it.
+- OCI polls GitHub `main` and may update only by guarded fast-forward.
+- After an OCI update, JK builds, reloads the runtime, and runs health/auth/tunnel QA.
+- OCI stops instead of stashing, resetting, rebasing, or force-updating when the tree is dirty, diverged, or contains local-only commits.
+- Windows remains mandatory for Android Studio/emulators, Windows packaging, local GUI/device access, signing state, and local-only files.
 
-이 파일들은 Git 저장소 밖의 로컬 상태이며 공개 배포판에 포함되지 않습니다. 자세한 내용은 `docs/LOCAL_OVERRIDES.md`를 참고하세요.
+## Handoff rule
 
-## 5. Public distribution boundary
+When publishing from Windows to OCI:
 
-공개 `jk-mcp`의 책임 범위는 MCP 서버, 프로젝트/Role/Approval, goal loop, 로컬·원격 executor, 안전한 Git 도구와 Control Center 같은 **하네스 기능**입니다.
+1. Finish or checkpoint the Windows task.
+2. Verify the relevant tests/build.
+3. Commit and push the intended changes to GitHub.
+4. OCI detects the updated `main` and fast-forwards only if all safety gates pass.
+5. OCI builds, reloads JK, and runs health/auth/tunnel QA.
 
-다음은 공개 코어에 포함하지 않습니다.
+This keeps a single branch history and avoids copying arbitrary working directories between machines.
 
-- 개인 도메인과 개인 서비스 링크
-- 특정 클라우드 공급자용 provisioning/인증 UI
-- 개인 서버 systemd unit과 tunnel 설정
-- 특정 서버로의 자동 배포 스크립트
-- 개인 프로젝트별 운영 정책과 credentials
+## Default decision
+
+Use the following order:
+
+1. Use Windows/local for normal interactive coding and Windows-specific work.
+2. Use OCI for deployment, always-on/server automation, cron, Cloudflare/server work, and long-running services.
+3. Treat automatic synchronization as one-way: `Windows -> GitHub -> OCI`.
+4. Never auto-pull changes back into Windows.
+5. Never promote a local-only project to hybrid or upload its source without explicit user intent.
+
+## Current examples
+
+- SongSong: hybrid.
+- CleanTube: hybrid; general code may run on OCI, while Android Studio/emulator and Windows-specific packaging stay on Windows.
+
+This policy intentionally keeps the system simple: Windows publishes, GitHub is the hub/source of truth, and OCI safely follows for deployment and always-on runtime work.

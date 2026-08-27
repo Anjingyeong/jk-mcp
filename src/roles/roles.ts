@@ -555,6 +555,7 @@ const ROLE_TOOL_BY_MCP_TOOL: Readonly<Record<string, RoleTool>> = {
   e2e_screenshot: "tests",
   e2e_open_target: "browser",
   e2e_open_url_screenshot: "browser",
+  seo_geo_audit: "browser",
   file_apply_patch: "file_write",
   file_create: "file_write",
   checkpoint_restore: "file_write",

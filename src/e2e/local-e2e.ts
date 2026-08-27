@@ -27,6 +27,7 @@ export interface E2eScreenshotResult {
 interface ActiveE2eServer {
   runId: string;
   pid: number;
+  port?: number;
   cwd: string;
   logPath: string;
   command: string;
@@ -42,6 +43,40 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Resolve the PID actually listening on a loopback TCP port (Windows).
+ * The detached cmd.exe wrapper can exit instantly while the spawned node
+ * server keeps running, so the stored shell pid is not always killable —
+ * the listener pid is the source of truth. */
+async function getWindowsListenerPid(port: number): Promise<number | undefined> {
+  if (!port || port < 1) return undefined;
+  try {
+    const { stdout } = await execFileAsync("netstat.exe", ["-ano", "-p", "tcp"]);
+    for (const line of stdout.split(/\r?\n/)) {
+      const cols = line.trim().split(/\s+/);
+      // Proto Local-Address Foreign-Address State PID
+      if (cols.length >= 5 && /LISTENING/i.test(cols[3]!) && cols[1]!.endsWith(`:${port}`)) {
+        const pid = Number.parseInt(cols[4]!, 10);
+        if (Number.isInteger(pid) && pid > 0) return pid;
+      }
+    }
+  } catch {
+    // netstat unavailable/blocked — fall back to stored-pid-only kill.
+  }
+  return undefined;
+}
+
+/** Wait until a taskkill'd Windows process tree actually exits. taskkill /f
+ * returns before the kernel has released every child handle (notably the
+ * Chromium profile lockfile), so deleting the profile dir immediately after
+ * can fail with EBUSY. Poll for up to ~4s; best-effort, never throws. */
+async function waitForProcessExit(pid: number, timeoutMs = 4_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return;
+    await delay(100);
   }
 }
 
@@ -62,13 +97,13 @@ function isLocalHttpUrl(value: string): boolean {
   return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(value);
 }
 
-function assertLocalHttpUrl(url: string, fnName: string): void {
-  if (!isLocalHttpUrl(url)) {
-    throw new DomainError(
-      ErrorCode.APPROVAL_REQUIRED,
-      `${fnName} only opens local loopback http(s) URLs; external/file/custom-scheme URLs require local approval.`,
-    );
-  }
+function assertAllowedHttpUrl(url: string, fnName: string, approvedExternalHttp = false): void {
+  if (isLocalHttpUrl(url)) return;
+  if (approvedExternalHttp && /^https?:\/\//i.test(url)) return;
+  throw new DomainError(
+    ErrorCode.APPROVAL_REQUIRED,
+    `${fnName} only opens local loopback http(s) URLs unless the active task has an approved external-http verification grant; file/custom-scheme URLs remain blocked.`,
+  );
 }
 
 function slug(value: string): string {
@@ -306,9 +341,19 @@ export async function startE2eServer(
   await out.close();
 
   const wait = input.waitUrl ? await waitForUrl(input.waitUrl, input.waitTimeoutSec ?? 30) : undefined;
+  const waitUrlPort = (() => {
+    try {
+      const parsed = new URL(input.waitUrl!);
+      const p = Number.parseInt(parsed.port, 10);
+      return Number.isInteger(p) && p > 0 ? p : parsed.protocol === "https:" ? 443 : 80;
+    } catch {
+      return undefined;
+    }
+  })();
   const result = {
     runId,
     pid: child.pid ?? 0,
+    port: input.waitUrl ? waitUrlPort : undefined,
     cwd: path.relative(root, commandCwd) || ".",
     logPath,
     replacedPid,
@@ -318,6 +363,7 @@ export async function startE2eServer(
     activeE2eServers.set(reuseKey, {
       runId: result.runId,
       pid: result.pid,
+      port: result.port,
       cwd: result.cwd,
       logPath: result.logPath,
       command: input.command,
@@ -333,7 +379,22 @@ export async function stopE2eServer(input: { pid: number }): Promise<{ stopped: 
   }
   if (process.platform === "win32") {
     try {
-      await execFileAsync("taskkill.exe", ["/pid", String(input.pid), "/t", "/f"]);
+      // The stored pid is the detached cmd.exe wrapper, which may have
+      // already exited while its node child keeps the port. Kill the real
+      // listener first (when we know the port), then the wrapper tree.
+      const entry = [...activeE2eServers.values()].find((server) => server.pid === input.pid);
+      const listenerPid = entry?.port ? await getWindowsListenerPid(entry.port) : undefined;
+      if (listenerPid && listenerPid !== input.pid) {
+        // process.kill uses TerminateProcess directly and avoids the
+        // taskkill/ACL issues seen in restricted environments; taskkill
+        // remains a best-effort fallback for tree members.
+        try { process.kill(listenerPid); } catch { /* already gone */ }
+        await execFileAsync("taskkill.exe", ["/pid", String(listenerPid), "/t", "/f"]).catch(() => undefined);
+        await waitForProcessExit(listenerPid).catch(() => undefined);
+      }
+      try { process.kill(input.pid); } catch { /* already exited */ }
+      await execFileAsync("taskkill.exe", ["/pid", String(input.pid), "/t", "/f"]).catch(() => undefined);
+      await waitForProcessExit(input.pid).catch(() => undefined);
       for (const [key, server] of activeE2eServers) if (server.pid === input.pid) activeE2eServers.delete(key);
       return { stopped: true };
     } catch (error) {
@@ -360,11 +421,11 @@ export async function stopE2eServer(input: { pid: number }): Promise<{ stopped: 
   }
 }
 
-export async function openE2eTarget(input: { url?: string; appName?: string; appPath?: string; args?: string[] }): Promise<{
+export async function openE2eTarget(input: { url?: string; appName?: string; appPath?: string; args?: string[]; approvedExternalHttp?: boolean }): Promise<{
   launched: string;
 }> {
   if (input.url) {
-    assertLocalHttpUrl(input.url, "openE2eTarget");
+    assertAllowedHttpUrl(input.url, "openE2eTarget", input.approvedExternalHttp);
     if (process.platform === "win32") {
       await execFileAsync("rundll32.exe", ["url.dll,FileProtocolHandler", input.url]);
     } else {
@@ -565,7 +626,18 @@ async function captureWindowsViewportShots(
   });
   const navigation = await cdp.send<{ errorText?: string }>("Page.navigate", { url: input.url }, 20_000);
   if (navigation.errorText) throw new Error(`Chromium navigation failed: ${navigation.errorText}`);
-  await waitForWindowsDocumentReady(cdp);
+  // The GPU process can crash-restart on headless Edge (exit_code=-1073741790)
+  // and briefly reset the CDP socket; tolerate a couple of transient failures
+  // before giving up instead of failing the whole capture.
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await waitForWindowsDocumentReady(cdp);
+      break;
+    } catch (error) {
+      if (attempt >= 2) throw error;
+      await delay(500);
+    }
+  }
   if (input.waitMs && input.waitMs > 0) await delay(Math.min(input.waitMs, 30_000));
 
   const metrics = await cdp.send<{ result?: { value?: { scrollHeight?: number } } }>("Runtime.evaluate", {
@@ -640,20 +712,36 @@ async function captureWindowsUrlScreenshotSetInternal(
   let browserProcess: ReturnType<typeof spawn> | undefined;
   let cdp: CdpWebSocketClient | undefined;
   let stderr = "";
+  const launchArgs = [
+    "--headless=new",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--in-process-gpu",
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-component-update",
+    "--disable-sync",
+    "--disable-client-side-phishing-detection",
+    "--disable-domain-reliability",
+    "--no-service-autorun",
+    "--metrics-recording-only",
+    "--no-default-browser-check",
+    "--hide-scrollbars",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-features=DawnGraphiteCache,DawnCache,GpuCache",
+    "--remote-debugging-address=127.0.0.1",
+    "--remote-debugging-port=0",
+    `--user-data-dir=${profileDir}`,
+    "about:blank",
+  ];
   try {
-    browserProcess = spawn(browserExecutable, [
-      "--headless=new",
-      "--disable-gpu",
-      "--hide-scrollbars",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--remote-debugging-address=127.0.0.1",
-      "--remote-debugging-port=0",
-      `--user-data-dir=${profileDir}`,
-      "about:blank",
-    ], {
+    browserProcess = spawn(browserExecutable, launchArgs, {
       env: buildSafeChildEnv(),
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"],
@@ -734,6 +822,9 @@ async function captureWindowsUrlScreenshotSetInternal(
       await new Promise<void>((resolve) => {
         execFile("taskkill.exe", ["/pid", String(browserProcess!.pid), "/t", "/f"], { windowsHide: true }, () => resolve());
       });
+      // taskkill returns before the kernel releases the profile lockfile
+      // handle; wait briefly so the rm below doesn't race the exit.
+      await delay(150);
     }
     for (let attempt = 0; attempt < 8; attempt += 1) {
       try {
@@ -742,7 +833,7 @@ async function captureWindowsUrlScreenshotSetInternal(
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== "EBUSY" && code !== "EPERM") break;
-        await delay(100 * (attempt + 1));
+        await delay(250 * (attempt + 1));
       }
     }
   }
@@ -769,9 +860,6 @@ export async function captureE2eScreenshot(
   projectRoot: string,
   input: { label?: string; waitMs?: number; openAfterCapture?: boolean },
 ): Promise<E2eScreenshotResult> {
-  if (process.platform !== "darwin") {
-    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "screencapture-based E2E screenshots are currently supported on macOS");
-  }
   if (input.waitMs && input.waitMs > 0) {
     await delay(Math.min(input.waitMs, 30_000));
   }
@@ -779,6 +867,39 @@ export async function captureE2eScreenshot(
   const dir = path.join(await e2eDir(root), "screenshots");
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${Date.now()}-${slug(input.label ?? "screen")}.png`);
+
+  if (process.platform === "win32") {
+    const outputPath = `'${file.replace(/'/g, "''")}'`;
+    const script = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "Add-Type -AssemblyName System.Drawing",
+      "$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen",
+      "if ($bounds.Width -le 0 -or $bounds.Height -le 0) { throw 'No interactive Windows screen is available' }",
+      "$bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)",
+      "$graphics = [System.Drawing.Graphics]::FromImage($bitmap)",
+      `try { $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size); $bitmap.Save(${outputPath}, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $graphics.Dispose(); $bitmap.Dispose() }`,
+    ].join("; ");
+    try {
+      await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
+    } catch (error) {
+      throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Windows screen capture failed.", {
+        cause: summarizeE2eError(error),
+      });
+    }
+    const stat = await fs.stat(file).catch(() => null);
+    if (!stat?.isFile() || stat.size === 0) {
+      throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Windows screen capture did not produce a PNG file.");
+    }
+    const opened = input.openAfterCapture === true;
+    if (opened) {
+      await execFileAsync("explorer.exe", [file]).catch(() => undefined);
+    }
+    return { path: file, bytes: stat.size, opened, captureMode: "screen" };
+  }
+
+  if (process.platform !== "darwin") {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "screen E2E screenshots are currently supported on macOS and Windows");
+  }
   try {
     await execFileAsync("/usr/sbin/screencapture", ["-x", file]);
   } catch (error) {
@@ -814,9 +935,10 @@ export async function captureE2eUrlScreenshot(
     y?: number;
     width?: number;
     height?: number;
+    approvedExternalHttp?: boolean;
   },
 ): Promise<E2eScreenshotResult> {
-  assertLocalHttpUrl(input.url, "captureE2eUrlScreenshot");
+  assertAllowedHttpUrl(input.url, "captureE2eUrlScreenshot", input.approvedExternalHttp);
   if (process.platform === "win32") {
     return captureWindowsUrlScreenshot(projectRoot, input, input.label ?? "url", input.label);
   }
@@ -843,7 +965,7 @@ export async function captureE2eUrlScreenshot(
       `,
     ]);
   } catch {
-    await openE2eTarget({ url: input.url });
+    await openE2eTarget({ url: input.url, approvedExternalHttp: input.approvedExternalHttp });
     return captureE2eScreenshot(projectRoot, {
       label: input.label ?? "url-fallback",
       waitMs: input.waitMs ?? 1500,
@@ -875,9 +997,10 @@ export async function captureE2eUrlScreenshotSet(
     y?: number;
     width?: number;
     height?: number;
+    approvedExternalHttp?: boolean;
   },
 ): Promise<E2eScreenshotResult[]> {
-  assertLocalHttpUrl(input.url, "captureE2eUrlScreenshotSet");
+  assertAllowedHttpUrl(input.url, "captureE2eUrlScreenshotSet", input.approvedExternalHttp);
   if (process.platform === "win32") {
     return captureWindowsUrlScreenshotSetInternal(
       projectRoot,

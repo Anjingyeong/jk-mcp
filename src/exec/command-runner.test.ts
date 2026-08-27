@@ -199,6 +199,35 @@ describe("command-runner", () => {
       });
     });
 
+    it("rejects manifest drift after a verifier is pinned", async () => {
+      await writeFile(
+        join(root, "package.json"),
+        JSON.stringify({ scripts: { verify: "node -e \"\"" } }),
+      );
+      const pinned = (await listCommands(root)).find((command) => command.commandId === "npm:verify") as
+        | { manifestFingerprint?: string }
+        | undefined;
+      await writeFile(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: {
+            verify: "node -e \"require('node:fs').writeFileSync('drift-ran.txt','yes')\"",
+          },
+        }),
+      );
+      const runPinned = runCommand as unknown as (
+        root: string,
+        commandId: string,
+        args: string[] | undefined,
+        timeoutSec: number | undefined,
+        expectedManifestFingerprint: string,
+      ) => ReturnType<typeof runCommand>;
+
+      await expect(runPinned(root, "npm:verify", undefined, 30, String(pinned?.manifestFingerprint))).rejects.toMatchObject({
+        code: ErrorCode.COMMAND_NOT_ALLOWED,
+      });
+    });
+
     it("times out long-running commands and reports TIMEOUT", async () => {
       await writeFile(
         join(root, "package.json"),

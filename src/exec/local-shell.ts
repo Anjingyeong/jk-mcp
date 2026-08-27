@@ -240,6 +240,47 @@ function executableName(token: string): string {
   return token.split(/[\\/]/).pop()?.toLowerCase() ?? token.toLowerCase();
 }
 
+function splitInspectionPipeline(command: string): string[] | null {
+  const parts: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (quote) {
+      if (char === quote) quote = null;
+      current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "|") {
+      if (!current.trim()) return null;
+      parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    if (char === "&" || char === ";" || char === ">" || char === "<" || char === "\n" || char === "\r") return null;
+    current += char;
+  }
+  if (quote || !current.trim()) return null;
+  parts.push(current.trim());
+  return parts;
+}
+
+function isReadOnlyInspectionCommand(command: string): boolean {
+  const pipeline = splitInspectionPipeline(command);
+  if (!pipeline?.length) return false;
+  return pipeline.every((segment) => {
+    const tokens = tokenizeShellSegment(segment);
+    if (!tokens?.length || tokens.some(containsShellInterpolation)) return false;
+    const executable = executableName(tokens[0]!);
+    return executable === "grep" || executable === "rg" || executable === "head" || executable === "tail";
+  });
+}
+
 function executesJkReloadScript(command: string): boolean {
   const segments = splitTopLevelConjunctions(command);
   if (!segments?.length) return false;
@@ -248,9 +289,11 @@ function executesJkReloadScript(command: string): boolean {
     const tokens = tokenizeShellSegment(segment);
     if (!tokens?.length) return false;
     const executable = executableName(tokens[0]!);
-    if (executable === "reload-jk-runtime.sh") return true;
+    if (executable === "reload-jk-runtime.sh") {
+      return !tokens.slice(1).includes("--check");
+    }
     if ((executable === "bash" || executable === "sh") && tokens[1]) {
-      return executableName(tokens[1]) === "reload-jk-runtime.sh";
+      return executableName(tokens[1]) === "reload-jk-runtime.sh" && !tokens.slice(2).includes("--check");
     }
     return false;
   });
@@ -408,6 +451,12 @@ export function inspectShellCommand(command: string): ShellCommandRisk {
         "local_shell_run blocked a command that appears to read secret-classified material",
       );
     }
+  }
+  // Search patterns are data, not shell actions. A quote-aware pipeline of
+  // grep/rg/head/tail must not become network/destructive merely because the
+  // text being searched contains tokens such as Invoke-WebRequest or rm -rf.
+  if (isReadOnlyInspectionCommand(command)) {
+    return { needsNetwork: false, destructive: false };
   }
   for (const pattern of HARD_BLOCKED_CLOUD_COST_PATTERNS) {
     if (pattern.test(command)) {

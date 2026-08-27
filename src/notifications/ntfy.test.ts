@@ -52,6 +52,7 @@ describe("JK ntfy notifications", () => {
   it("publishes as ntfy JSON and never throws on delivery failure", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockRejectedValueOnce(new Error("offline"))
       .mockRejectedValueOnce(new Error("offline"));
     const env = {
       JK_NTFY_TOPIC: "jk_mobile_123",
@@ -66,6 +67,24 @@ describe("JK ntfy notifications", () => {
     expect(JSON.parse(String(init?.body))).toMatchObject({ topic: "jk_mobile_123", priority: 5 });
 
     await expect(sendJkPush({ kind: "failure", projectId: "example-app" }, env)).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries one transient ntfy failure and succeeds without exposing payload details", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new Error("temporary network failure"))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    const infoMock = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const env = {
+      JK_NTFY_TOPIC: "jk_mobile_123",
+      JK_NTFY_BASE_URL: "https://ntfy.sh",
+    };
+
+    await expect(sendJkPush({ kind: "success", projectId: "proj", reason: "secret-ish detail" }, env)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("attempt=2/2"));
+    expect(infoMock.mock.calls.flat().join(" ")).not.toContain("secret-ish detail");
   });
 
   it("generates and stores a private topic in JK state, then disables cleanly", async () => {
@@ -74,7 +93,10 @@ describe("JK ntfy notifications", () => {
     expect(enabled.enabled).toBe(true);
     expect(enabled.topic).toMatch(/^jk_[A-Za-z0-9_-]{20,}$/);
     expect(await readNtfySettings(stateDir, {})).toEqual(enabled);
-    expect((await stat(path.join(stateDir, "notifications", "ntfy.json"))).mode & 0o777).toBe(0o600);
+    const settingsMode = (await stat(path.join(stateDir, "notifications", "ntfy.json"))).mode & 0o777;
+    if (process.platform !== "win32") {
+      expect(settingsMode).toBe(0o600);
+    }
 
     await saveNtfySettings(stateDir, { enabled: false });
     expect((await readNtfySettings(stateDir, {})).enabled).toBe(false);
@@ -86,12 +108,13 @@ describe("JK ntfy notifications", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response("{}", { status: 200 }))
       .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("offline"))
       .mockResolvedValueOnce(new Response("{}", { status: 200 }));
 
     await expect(sendJkPushOnce(stateDir, "goal:1:success", { kind: "success", projectId: "proj" }, env)).resolves.toBe("delivered");
     await expect(sendJkPushOnce(stateDir, "goal:1:success", { kind: "success", projectId: "proj" }, env)).resolves.toBe("duplicate");
     await expect(sendJkPushOnce(stateDir, "goal:2:failure", { kind: "failure", projectId: "proj" }, env)).resolves.toBe("failed");
     await expect(sendJkPushOnce(stateDir, "goal:2:failure", { kind: "failure", projectId: "proj" }, env)).resolves.toBe("delivered");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });

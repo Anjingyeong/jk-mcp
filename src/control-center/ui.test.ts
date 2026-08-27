@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import { CONTROL_CENTER_HTML } from "./ui.js";
 
 describe("Control Center dashboard links and mobile layout", () => {
-  it("keeps built-in Quick Links generic and host-local links external", () => {
+  it("keeps Quick Links limited to external service entry points", () => {
     expect(CONTROL_CENTER_HTML).toContain("Quick Links");
-    expect(CONTROL_CENTER_HTML).toContain("JK Dashboard");
-    expect(CONTROL_CENTER_HTML).toContain("/approvals");
+    expect(CONTROL_CENTER_HTML).toContain("hiddenQuickLinkTitles = ['CleanTube APK', 'Gecko QA APK']");
+    expect(CONTROL_CENTER_HTML).not.toContain("{title:'JK Dashboard'");
+    expect(CONTROL_CENTER_HTML).not.toContain("href:location.origin + '/approvals'");
+    expect(CONTROL_CENTER_HTML).toContain("별도 서비스와 배포 진입점만 모았습니다.");
   });
 
   it("keeps compact mobile chrome and approval actions responsive", () => {
@@ -29,8 +31,24 @@ describe("Control Center dashboard links and mobile layout", () => {
     expect(CONTROL_CENTER_HTML).toContain("Network ");
   });
 
+  it("offers a bounded one-click JK runtime sync that still requires one owner approval", () => {
+    expect(CONTROL_CENTER_HTML).toContain('id="sync-jk-runtime"');
+    expect(CONTROL_CENTER_HTML).toContain("서버 동기화 · 재시작");
+    expect(CONTROL_CENTER_HTML).toContain("승인 1회만 필요합니다.");
+    expect(CONTROL_CENTER_HTML).toContain("/api/jk/control/deployment/sync");
+    expect(CONTROL_CENTER_HTML).toContain("bash scripts/sync-jk-oci.sh --reload-current");
+  });
+
   it("labels reconciled stale approval history separately from live failures", () => {
     expect(CONTROL_CENTER_HTML).toContain("stale history");
     expect(CONTROL_CENTER_HTML).toContain("이전 실행 기록 정리");
+  });
+
+  it("keeps live dashboard execution and signals on short foreground refresh intervals", () => {
+    expect(CONTROL_CENTER_HTML).toContain("if (document.hidden) return;");
+    expect(CONTROL_CENTER_HTML).toContain("if (state.page === 'dashboard') {\n        render();");
+    expect(CONTROL_CENTER_HTML).toContain("setInterval(refreshExecution,1500);");
+    expect(CONTROL_CENTER_HTML).toContain("setInterval(refreshSignals,2500);");
+    expect(CONTROL_CENTER_HTML).toContain("setInterval(() => loadAll({quiet:true}), 15000);");
   });
 });

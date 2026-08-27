@@ -21,7 +21,7 @@ async function runGit(
   cwd: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync("git", args, { ...EXEC_OPTS, cwd });
+  return execFileAsync("git", ["-c", "core.hooksPath=/dev/null", ...args], { ...EXEC_OPTS, cwd });
 }
 
 /** True if `err` looks like "not a git repository" / git missing, vs a real failure. */
@@ -37,55 +37,54 @@ function isNonGitError(err: unknown): boolean {
   );
 }
 
+export function parsePorcelainStatus(output: string): {
+  dirtyFiles: string[];
+  staged: string[];
+} {
+  const dirtyFiles: string[] = [];
+  const staged: string[] = [];
+  const records = output.split("\0");
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index] ?? "";
+    if (record.length < 3) continue;
+    const indexStatus = record[0] ?? " ";
+    const worktreeStatus = record[1] ?? " ";
+    const relative = record.slice(3);
+    if (indexStatus === "?" && worktreeStatus === "?") {
+      dirtyFiles.push(relative);
+    } else {
+      if (indexStatus !== " " && indexStatus !== "?") staged.push(relative);
+      if (worktreeStatus !== " " && worktreeStatus !== "?") dirtyFiles.push(relative);
+    }
+    if (indexStatus === "R" || indexStatus === "C" || worktreeStatus === "R" || worktreeStatus === "C") {
+      index += 1;
+    }
+  }
+  return { dirtyFiles, staged };
+}
+
 /** Git status summary for a project (PRD §8.6 git_status). */
 export async function gitStatus(
   root: string,
 ): Promise<{ branch: string; dirtyFiles: string[]; staged: string[] }> {
   try {
+    // Single spawn: porcelain -b prepends "## <branch>" (or "## HEAD (no
+    // branch)" when unborn), saving the separate rev-parse roundtrip —
+    // measurable on Windows where each git spawn costs 100ms+.
+    const statusResult = await runGit(root, ["status", "--porcelain=v1", "-b", "-z", "--untracked-files=all"]);
+    const statusText = statusResult.stdout;
+
     let branch = "";
-    let hasHead = true;
-    try {
-      const branchResult = await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
-      branch = branchResult.stdout.trim();
-    } catch (branchErr) {
-      const e = branchErr as { stderr?: string; message?: string };
-      const text = `${e.stderr ?? ""} ${e.message ?? ""}`.toLowerCase();
-      if (text.includes("ambiguous argument") || text.includes("unknown revision") || text.includes("bad revision") || text.includes("needed a single revision")) {
-        hasHead = false;
-        branch = (await runGit(root, ["branch", "--show-current"]).catch(() => ({ stdout: "", stderr: "" }))).stdout.trim();
-      } else {
-        throw branchErr;
-      }
+    let body = statusText;
+    if (body.startsWith("## ")) {
+      const headerEnd = body.indexOf("\0");
+      const header = headerEnd >= 0 ? body.slice(2, headerEnd) : body.slice(2).replace(/\n$/, "");
+      body = headerEnd >= 0 ? body.slice(headerEnd + 1) : "";
+      // "main...origin/main [ahead 1]" -> "main"; detached -> "HEAD (no branch)"
+      branch = header.split("...")[0]!.replace(/\s*\[.*\]$/, "").trim();
     }
 
-    const statusResult = await runGit(root, ["status", "--porcelain=v1"]);
-    const dirtyFiles: string[] = [];
-    const staged: string[] = [];
-
-    for (const rawLine of statusResult.stdout.split("\n")) {
-      if (rawLine.length === 0) continue;
-      // Porcelain v1 format: XY PATH  (XY = 2 status chars, then space, then path)
-      // For renames the path is "old -> new"; take the destination path.
-      const indexStatus = rawLine[0] ?? " ";
-      const worktreeStatus = rawLine[1] ?? " ";
-      let path = rawLine.slice(3);
-      const arrow = path.indexOf(" -> ");
-      if (arrow !== -1) {
-        path = path.slice(arrow + 4);
-      }
-
-      if (indexStatus === "?" && worktreeStatus === "?") {
-        // Untracked file: counts as dirty, not staged.
-        dirtyFiles.push(path);
-        continue;
-      }
-      if (indexStatus !== " " && indexStatus !== "?") {
-        staged.push(path);
-      }
-      if (worktreeStatus !== " " && worktreeStatus !== "?") {
-        dirtyFiles.push(path);
-      }
-    }
+    const { dirtyFiles, staged } = parsePorcelainStatus(body);
 
     return { branch, dirtyFiles, staged };
   } catch (err) {

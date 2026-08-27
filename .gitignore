@@ -18,6 +18,7 @@ dist/
 /bin/
 /release/
 /projects/
+/evidence/
 *.pkg
 .DS_Store
 

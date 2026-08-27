@@ -16,16 +16,12 @@ ROOT="$(resolve_self)"
 if [ ! -f "$ROOT/dist/cli.js" ]; then
   ROOT="$(cd -P "$ROOT/.." && pwd)"
 fi
-LOCAL_LAUNCHER="${JK_LOCAL_LAUNCHER:-${HOME:-}/.local/share/chatgpt2codex/local/launcher.sh}"
-if [ "${JK_LOCAL_LAUNCHER_ACTIVE:-0}" != "1" ] && [ -x "$LOCAL_LAUNCHER" ]; then
-  export JK_LOCAL_LAUNCHER_ACTIVE=1
-  exec "$LOCAL_LAUNCHER" "$ROOT/linux/start-chatgpt2codex.sh" "$@"
-fi
 BIN_DIR="$ROOT/bin"
 PATH="$BIN_DIR:$PATH"
 export PATH
 
 DOCTOR=0
+NO_TUNNEL=0
 WORKSPACE="${WORKSPACE:-$HOME/workspace}"
 PORT="${PORT:-7979}"
 PUBLIC_HOSTNAME="${PUBLIC_HOSTNAME:-}"
@@ -37,7 +33,7 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --no-tunnel)
-      # Backward-compatible no-op. Public JK no longer provisions tunnels.
+      NO_TUNNEL=1
       shift
       ;;
     --workspace)
@@ -62,12 +58,16 @@ done
 WORKSPACE="$(mkdir -p "$WORKSPACE" && cd "$WORKSPACE" && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt2codex.XXXXXX")"
 SERVER_PID=""
+TUNNEL_PID=""
 SCHEDULER_PIDS=()
 
 cleanup() {
   local status=$?
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+    kill "$TUNNEL_PID" 2>/dev/null || true
   fi
   local pid
   for pid in "${SCHEDULER_PIDS[@]:-}"; do
@@ -180,10 +180,15 @@ if [[ "$doctor_text" != *"owner token configured"* || "${CHATGPT2CODEX_ROTATE_OW
   echo "[chatgpt2codex] save the printed owner token securely."
 fi
 
-if [ -n "$PUBLIC_HOSTNAME" ]; then
-  # Public exposure is managed outside JK. This hostname is metadata only;
-  # the server itself remains bound to loopback.
-  PUBLIC_URL="https://$PUBLIC_HOSTNAME"
+if [ "$NO_TUNNEL" -eq 1 ]; then
+  if [ -n "$PUBLIC_HOSTNAME" ]; then
+    # External/named tunnel is supervised separately (for example by
+    # systemd). JK still needs the stable public URL for OAuth metadata while
+    # it continues to bind only to loopback.
+    PUBLIC_URL="https://$PUBLIC_HOSTNAME"
+  else
+    PUBLIC_URL="http://127.0.0.1:$PORT"
+  fi
 else
   PUBLIC_URL="http://127.0.0.1:$PORT"
 fi

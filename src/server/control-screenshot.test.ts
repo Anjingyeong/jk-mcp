@@ -25,6 +25,19 @@ const macInput = await import("../control/mac-input.js");
 const localE2e = await import("../e2e/local-e2e.js");
 const { createServer } = await import("./mcp-server.js");
 
+/**
+ * handleComputerScreenshot's live-frontmost gate is darwin-gated in
+ * production code; mac-input is mocked here, so stub the platform to darwin
+ * for the whole suite to exercise the real gating logic on any host OS.
+ */
+const ORIGINAL_PLATFORM = Object.getOwnPropertyDescriptor(process, "platform")!;
+beforeEach(function stubDarwinPlatform() {
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+});
+afterEach(function restorePlatform() {
+  Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
+});
+
 interface RegisteredToolLike {
   handler?: (input: Record<string, unknown>) => Promise<{
     structuredContent?: Record<string, unknown>;

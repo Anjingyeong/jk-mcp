@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { resolveMassUlwExecutionId } from "../orchestration/mass-ulw-identity-index.js";
+import { MassUlwDocumentSchema } from "../orchestration/mass-ulw-store.js";
 
 export type TaskExecutionMode = "implement" | "debug" | "research" | "review" | "plan";
 export type WorkflowPhase = "discover" | "plan" | "patch" | "verify" | "review" | "recovery" | "release";
@@ -21,6 +23,15 @@ export interface TaskExecutionSnapshot {
   lastVerification: { success?: boolean; at?: number; tool?: string } | null;
 }
 
+export interface MassUlwExecutionStatus {
+  currentWave: number | null;
+  runningLanes: string[];
+  readonly failedLanes: readonly string[];
+  readonly blockedLanes: readonly string[];
+  blockedDependencies: string[];
+  verification: "not-started" | "in-flight" | "passed" | "failed" | "unknown-after-interruption";
+}
+
 export interface TaskExecutionView {
   projectId: string | null;
   projectName: string | null;
@@ -31,6 +42,7 @@ export interface TaskExecutionView {
   phase: WorkflowPhase | null;
   primaryStage: WorkflowStage | null;
   supportingStages: WorkflowStage[];
+  massUlw: MassUlwExecutionStatus | null;
   verificationStatus: WorkflowVerificationStatus;
   failureCount: number;
   completedCount: number;
@@ -88,6 +100,43 @@ async function readJson(target: string): Promise<Record<string, unknown> | null>
   }
 }
 
+async function readMassUlwExecutionStatus(
+  stateDir: string,
+  projectId: string | null,
+  loopId: string,
+): Promise<MassUlwExecutionStatus | null> {
+  const mappedExecutionId = projectId
+    ? await resolveMassUlwExecutionId(stateDir, { projectId, externalLoopId: loopId })
+    : null;
+  const executionId = mappedExecutionId ?? loopId;
+  const raw = await readJson(path.join(stateDir, "orchestration", "mass-ulw", `${executionId}.json`));
+  const parsed = MassUlwDocumentSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.loopId !== executionId) return null;
+  const document = parsed.data;
+  return {
+    currentWave: document.currentWave,
+    runningLanes: document.plan.lanes
+      .filter((lane) => document.lanes[lane.id]?.status === "in-flight")
+      .map((lane) => lane.id),
+    failedLanes: document.plan.lanes
+      .filter((lane) => document.lanes[lane.id]?.status === "failed")
+      .map((lane) => lane.id),
+    blockedLanes: document.plan.lanes
+      .filter((lane) => document.lanes[lane.id]?.status === "blocked")
+      .map((lane) => lane.id),
+    blockedDependencies: [...new Set(document.plan.lanes.flatMap((lane) => {
+      const status = document.lanes[lane.id]?.status;
+      return status === "planned" || status === "blocked"
+        ? lane.dependsOn.filter((dependencyId) => {
+            const dependencyStatus = document.lanes[dependencyId]?.status;
+            return dependencyStatus === "failed" || dependencyStatus === "blocked";
+          })
+        : [];
+    }))],
+    verification: document.integrationVerification.status,
+  };
+}
+
 function latestOrchestration(loop: Record<string, unknown>): Record<string, unknown> | null {
   const turns = Array.isArray(loop.turns) ? loop.turns : [];
   for (let index = turns.length - 1; index >= 0; index -= 1) {
@@ -127,6 +176,7 @@ export async function readTaskExecutionView(
       phase: null,
       primaryStage: null,
       supportingStages: [],
+      massUlw: null,
       verificationStatus: "unknown",
       failureCount: 0,
       completedCount: 0,
@@ -143,11 +193,16 @@ export async function readTaskExecutionView(
   let phase: WorkflowPhase | null = null;
   let primaryStage: WorkflowStage | null = null;
   let supportingStages: WorkflowStage[] = [];
+  let massUlw: MassUlwExecutionStatus | null = null;
   let verificationStatus: WorkflowVerificationStatus = "unknown";
   let failureCount = 0;
 
   if (validStateId(snapshot.loopId)) {
-    const loop = await readJson(path.join(stateDir, "goals", `${snapshot.loopId}.loop.json`));
+    const [loop, persistedMassUlw] = await Promise.all([
+      readJson(path.join(stateDir, "goals", `${snapshot.loopId}.loop.json`)),
+      readMassUlwExecutionStatus(stateDir, snapshot.projectId, snapshot.loopId),
+    ]);
+    massUlw = persistedMassUlw;
     if (loop) {
       mode = asMode(loop.mode);
       if (mode) modeSource = "loop";
@@ -188,6 +243,7 @@ export async function readTaskExecutionView(
     phase,
     primaryStage,
     supportingStages,
+    massUlw,
     verificationStatus,
     failureCount,
     completedCount: snapshot.completed.length,

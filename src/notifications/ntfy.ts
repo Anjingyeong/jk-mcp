@@ -169,25 +169,53 @@ export async function sendJkPush(
   const config = await readNtfyConfigForState(stateDir, env);
   if (!config) return false;
 
-  try {
-    const response = await fetch(`${config.baseUrl}/`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(ntfyPayload(config, event)),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!response.ok) {
-      console.warn(`[JK push] ntfy returned HTTP ${response.status}`);
-      return false;
+  const body = JSON.stringify(ntfyPayload(config, event));
+  for (let attempt = 1; attempt <= NTFY_MAX_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now();
+    try {
+      const response = await fetch(`${config.baseUrl}/`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(NTFY_ATTEMPT_TIMEOUT_MS),
+      });
+      const durationMs = Date.now() - startedAt;
+      if (response.ok) {
+        console.info(`[JK push] ntfy delivered kind=${event.kind} attempt=${attempt}/${NTFY_MAX_ATTEMPTS} durationMs=${durationMs}`);
+        return true;
+      }
+
+      const retryable = shouldRetryNtfyStatus(response.status) && attempt < NTFY_MAX_ATTEMPTS;
+      console.warn(
+        `[JK push] ntfy HTTP ${response.status} kind=${event.kind} attempt=${attempt}/${NTFY_MAX_ATTEMPTS} durationMs=${durationMs}${retryable ? " retrying" : ""}`,
+      );
+      if (!retryable) return false;
+    } catch (err) {
+      const durationMs = Date.now() - startedAt;
+      const retryable = attempt < NTFY_MAX_ATTEMPTS;
+      console.warn(
+        `[JK push] ntfy delivery failed kind=${event.kind} attempt=${attempt}/${NTFY_MAX_ATTEMPTS} durationMs=${durationMs}: ${(err as Error).message}${retryable ? " retrying" : ""}`,
+      );
+      if (!retryable) return false;
     }
-    return true;
-  } catch (err) {
-    console.warn(`[JK push] ntfy delivery failed: ${(err as Error).message}`);
-    return false;
+    await wait(NTFY_RETRY_DELAY_MS);
   }
+  return false;
 }
 
 export type JkPushOnceResult = "delivered" | "duplicate" | "failed";
+
+const NTFY_ATTEMPT_TIMEOUT_MS = 3_000;
+const NTFY_RETRY_DELAY_MS = 250;
+const NTFY_MAX_ATTEMPTS = 2;
+
+function shouldRetryNtfyStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** Persisted, atomic best-effort dedupe for terminal notifications. Failed deliveries release the claim so a later retry can succeed. */
 export async function sendJkPushOnce(

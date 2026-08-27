@@ -28,6 +28,20 @@ const macInput = await import("./mac-input.js");
 const localE2e = await import("../e2e/local-e2e.js");
 const { runExecutorOnce } = await import("./executor.js");
 
+/**
+ * The executor's preflight/frontmost/evidence path is darwin-gated in
+ * production code, but the mocked mac-input/local-e2e bindings behave
+ * identically on any OS. Stub the platform to darwin for the whole suite so
+ * these tests exercise the real gating logic on Windows/Linux CI hosts too.
+ */
+const ORIGINAL_PLATFORM = Object.getOwnPropertyDescriptor(process, "platform")!;
+beforeEach(function stubDarwinPlatform() {
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+});
+afterEach(function restorePlatform() {
+  Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
+});
+
 function makeCtx(stateDir: string, events: Array<Record<string, unknown>>): ToolContext {
   return {
     workspaceRoot: "/tmp",

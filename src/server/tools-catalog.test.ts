@@ -112,9 +112,33 @@ describe("tool catalog", () => {
       | { _def?: { innerType?: { shape?: Record<string, unknown> } } }
       | undefined;
     expect(localShellIntent?._def?.innerType?.shape?.approvedByHuman).toBeUndefined();
+    expect(localShellIntent?._def?.innerType?.shape?.approvalBundle).toBeDefined();
     expect(tools?.omo_run).toBeDefined();
     expect(tools?.omo_run?.inputSchema?.shape?.agent).toBeDefined();
     expect(tools?.omo_run?.inputSchema?.shape?.sessionId).toBeDefined();
+    expect(tools?.mass_ulw_execute).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.projectId).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.loopId).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.planFingerprint).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.workSessionId).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.lanePatches).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.laneVerificationCommandIds).toBeDefined();
+    expect(tools?.mass_ulw_execute?.inputSchema?.shape?.finalVerificationCommandId).toBeDefined();
+  });
+
+  it("lists executable Mass ULW on the ChatGPT MCP surface", async () => {
+    const server = await createServer(makeCtx());
+    const handler = (
+      server.server as unknown as {
+        _requestHandlers?: Map<
+          string,
+          (request: { method: string; params: Record<string, never> }) => Promise<{ tools: Array<{ name: string }> }>
+        >;
+      }
+    )._requestHandlers?.get("tools/list");
+
+    const listed = await handler?.({ method: "tools/list", params: {} });
+    expect(listed?.tools.map((tool) => tool.name)).toContain("mass_ulw_execute");
   });
 
   it("keeps the one-shot E2E tool out of destructive/open-world routing", async () => {

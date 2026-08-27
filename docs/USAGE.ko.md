@@ -106,19 +106,17 @@ JK는 commit이나 push를 자동으로 해버리는 것보다 **사용자가 �
 
 단순히 "고쳐줘"라고 말한 경우에는 보통 수정과 검증까지만 기대하는 것이 안전합니다.
 
-### G. Local / Remote 실행 선택
+### G. Windows / GitHub / OCI 동기화
 
-프로젝트는 기본적으로 **local-only**입니다. Remote executor는 사용자가 별도로 연결하고 해당 작업에서 선택했을 때만 사용합니다.
+하이브리드 프로젝트의 기본 흐름은 **`Windows -> GitHub -> OCI` 단방향**입니다.
 
-여러 executor가 같은 Git 프로젝트를 공유한다면 configured upstream을 durable source of truth로 사용합니다.
-
-- 일반 작업과 해당 PC에만 있는 파일·도구는 local executor에서 처리합니다.
-- 다른 연결 머신을 의도적으로 사용할 때만 remote executor를 선택합니다.
-- 공유 remote checkout은 작업 전에 clean 상태와 fast-forward-only upstream 동기화를 확인합니다.
-- dirty/diverged/local-only commit을 stash/reset/rebase/force로 자동 정리하지 않습니다.
-- Windows는 자동 pull하지 않습니다. 사용자가 명시적으로 요청했을 때만 수동 동기화합니다.
-- 같은 branch를 여러 executor에서 독립적으로 동시에 수정하지 않습니다.
-- 공개 JK는 특정 클라우드 공급자나 기본 배포 서버를 전제로 하지 않습니다.
+- GitHub가 코드의 기준점입니다.
+- Windows는 자동 pull하지 않습니다. 사용자가 명시적으로 요청할 때만 pull합니다.
+- 평소 개발과 Windows 전용 작업은 Windows에서 수행합니다.
+- OCI는 GitHub `main`을 주기적으로 확인하고, clean 상태에서 fast-forward 가능한 경우에만 반영합니다.
+- OCI 반영 후에는 build -> JK reload -> health/auth/tunnel QA를 수행합니다.
+- OCI가 dirty/diverged 상태이거나 OCI에만 있는 commit이 있으면 자동 동기화는 중단되고 기존 작업을 보존합니다.
+- 자동 stash/reset/rebase/force-update는 하지 않습니다.
 
 ## 3. 추천 프롬프트 구조
 

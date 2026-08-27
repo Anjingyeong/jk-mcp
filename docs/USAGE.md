@@ -104,19 +104,17 @@ JK treats commit and push as explicit user actions rather than something to do s
 
 If you only say "fix it," the safe expectation is usually implementation plus verification, not an automatic push.
 
-### G. Choose local vs remote execution
+### G. Choose Windows vs OCI
 
-Projects stay **local-only by default**. A remote executor is used only after it has been configured and selected for the task.
+Projects stay **local-only by default**. A project becomes **hybrid** only after the user explicitly asks to use it from OCI or another executor.
 
-When multiple executors share a Git project, use the configured upstream as the durable source of truth.
+For hybrid projects, GitHub is the shared source of truth and synchronization is intentionally one-way for normal operation: `Windows -> GitHub -> OCI`.
 
-- Use the local executor for normal work and for files or tools that exist only on that machine.
-- Use a remote executor when the task intentionally targets another connected machine.
-- Before editing a shared remote checkout, require a clean tree and fast-forward-only sync from upstream.
-- Never auto-resolve dirty, diverged, or local-only commits with stash/reset/rebase/force operations.
-- Windows is never auto-pulled. Update it only when the user explicitly asks for a manual sync.
-- Do not independently modify the same branch on multiple executors at the same time.
-- Public JK does not assume a specific cloud provider or built-in deployment host.
+- Windows never auto-pulls. Pull there only when the user explicitly asks.
+- Windows is the normal interactive development workspace and is required for Windows-specific tooling, GUI/device access, signing, Android Studio/emulators, and packaging.
+- OCI follows GitHub `main` only through the guarded clean + fast-forward-only path, then builds, reloads JK, and runs health/auth/tunnel QA.
+- If OCI is dirty, diverged, or has local-only commits, automatic synchronization stops without stash/reset/rebase/force-update.
+- Do not independently modify the same branch on OCI and Windows at the same time.
 
 See `docs/EXECUTION_POLICY.md` for the durable policy.
 

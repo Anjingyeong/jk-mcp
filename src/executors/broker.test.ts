@@ -20,7 +20,7 @@ describe("executor broker", () => {
   const localProject: ProjectRegistryEntry = {
     projectId: "clean-app",
     name: "clean-app",
-    root: "/srv/jk/workspace/clean-app",
+    root: "/opt/jk/workspace/clean-app",
     aliases: ["clean-app"],
   };
 
@@ -38,12 +38,12 @@ describe("executor broker", () => {
       executorId: "windows-main",
       label: "Windows PC",
       platform: "win32/x64",
-      workspaceRoot: "C:\\workspace",
+      workspaceRoot: "C:\\shakw",
       capabilities: ["code_search", "file_read_slice"],
       projects: [{
         projectId,
         name: projectId,
-        root: `C:\\workspace\\${projectId}`,
+        root: `C:\\shakw\\${projectId}`,
         aliases: [projectId],
       }],
     });
@@ -71,7 +71,7 @@ describe("executor broker", () => {
 
     const routed = await resolveRoutedLocalProject(stateDir, localProject);
     expect(routed.executorId).toBe("windows-main");
-    expect(routed.root).toBe("C:\\workspace\\clean-app");
+    expect(routed.root).toBe("C:\\shakw\\clean-app");
 
     vi.setSystemTime(Date.now() + EXECUTOR_HEARTBEAT_TTL_MS + 1);
     const stale = await listExecutorStatus(stateDir);
@@ -82,33 +82,33 @@ describe("executor broker", () => {
   });
 
   it("treats a remote package-name alias as the same logical local project", async () => {
-    const exampleService: ProjectRegistryEntry = {
-      projectId: "example-service",
-      name: "example-service",
-      root: "/srv/jk/workspace/example-service",
-      aliases: ["example-service"],
+    const songsong: ProjectRegistryEntry = {
+      projectId: "songsong",
+      name: "songsong",
+      root: "/opt/jk/workspace/songsong",
+      aliases: ["songsong"],
     };
     await recordExecutorHeartbeat(stateDir, {
       executorId: "windows-main",
       label: "Windows PC",
       platform: "win32/x64",
-      workspaceRoot: "C:\\workspace",
+      workspaceRoot: "C:\\shakw",
       capabilities: ["code_search"],
       projects: [{
-        projectId: "workspace-root",
-        name: "workspace-root",
-        root: "C:\\workspace",
-        aliases: ["workspace-root", "example-service"],
+        projectId: "shakw",
+        name: "shakw",
+        root: "C:\\shakw",
+        aliases: ["shakw", "songsong"],
       }],
     });
 
-    const registry = await getExecutorProjectRegistry(stateDir, [exampleService]);
-    expect(registry[0]?.projectId).toBe("windows-main::workspace-root");
+    const registry = await getExecutorProjectRegistry(stateDir, [songsong]);
+    expect(registry[0]?.projectId).toBe("windows-main::shakw");
 
-    await setProjectExecutorRoute(stateDir, "example-service", "windows-main");
-    const routed = await resolveRoutedLocalProject(stateDir, exampleService);
+    await setProjectExecutorRoute(stateDir, "songsong", "windows-main");
+    const routed = await resolveRoutedLocalProject(stateDir, songsong);
     expect(routed.executorId).toBe("windows-main");
-    expect(routed.sourceProjectId).toBe("workspace-root");
+    expect(routed.sourceProjectId).toBe("shakw");
   });
 
   it("dispatches a job to a polling worker and resolves its result", async () => {

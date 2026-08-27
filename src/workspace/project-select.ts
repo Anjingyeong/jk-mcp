@@ -26,6 +26,31 @@ export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset): Lea
   };
 }
 
+/**
+ * Renew an already-authorized lease without changing its identity when the
+ * owner selects the same project/root/preset again. Keeping the lease id
+ * stable prevents task/approval identities from changing during a long goal,
+ * while still extending the normal short-lived TTL. A changed project root,
+ * preset, or expired lease gets a fresh identity.
+ */
+export function renewLease(entry: ProjectRegistryEntry, preset: LeasePreset, current?: Lease): Lease {
+  const issuedAt = Date.now();
+  if (
+    current &&
+    current.projectId === entry.projectId &&
+    current.projectRoot === entry.root &&
+    current.preset === preset &&
+    issuedAt <= current.expiresAt
+  ) {
+    return {
+      ...current,
+      issuedAt,
+      expiresAt: issuedAt + DEFAULT_LEASE_TTL_MS,
+    };
+  }
+  return makeLease(entry, preset);
+}
+
 /** Shape session state is expected to carry the active lease under (PRD §10 sessions.json). */
 interface SessionWithLease {
   lease?: Lease;

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ interface DiscoveredCommand {
   source: string;
   riskTier: string;
   argv: string[];
+  manifestFingerprint: string;
 }
 
 const MAX_TIMEOUT_SEC = 300;
@@ -22,6 +24,10 @@ const DEFAULT_TIMEOUT_SEC = 30;
 /** Head+tail bytes kept per stream when truncating output. */
 const OUTPUT_HEAD_BYTES = 4000;
 const OUTPUT_TAIL_BYTES = 2000;
+
+function manifestFingerprint(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
 
 /** Env vars allowed to reach the child process (PRD §8.5 execution tools). */
 const ENV_ALLOWLIST = [
@@ -86,12 +92,16 @@ async function discoverPackageJsonCommands(root: string): Promise<DiscoveredComm
     const raw = await readFile(pkgPath, "utf8");
     const pkg = JSON.parse(raw) as { scripts?: Record<string, string> };
     const scripts = pkg.scripts ?? {};
+    const fingerprint = manifestFingerprint(JSON.stringify(
+      Object.fromEntries(Object.entries(scripts).sort(([left], [right]) => left.localeCompare(right))),
+    ));
     return Object.entries(scripts).map(([name, script]) => ({
       commandId: `npm:${name}`,
       display: `npm run ${name}`,
       source: "package.json",
       riskTier: classifyManifestCommand(name, script),
       argv: npmRunArgv(name),
+      manifestFingerprint: fingerprint,
     }));
   } catch {
     return [];
@@ -111,6 +121,7 @@ async function discoverMakefileCommands(root: string): Promise<DiscoveredCommand
   if (!existsSync(makePath)) return [];
   try {
     const raw = await readFile(makePath, "utf8");
+    const fingerprint = manifestFingerprint(raw.replace(/\r\n/gu, "\n"));
     const lines = raw.split("\n");
     const targets: DiscoveredCommand[] = [];
     const seen = new Set<string>();
@@ -148,6 +159,7 @@ async function discoverMakefileCommands(root: string): Promise<DiscoveredCommand
         source: "Makefile",
         riskTier: classifyManifestCommand(name, recipeBody),
         argv: ["make", name],
+        manifestFingerprint: fingerprint,
       });
     }
     return targets;
@@ -159,22 +171,29 @@ async function discoverMakefileCommands(root: string): Promise<DiscoveredCommand
 async function discoverPubspecCommands(root: string): Promise<DiscoveredCommand[]> {
   const pubspecPath = join(root, "pubspec.yaml");
   if (!existsSync(pubspecPath)) return [];
-  return [
-    {
-      commandId: "flutter:test",
-      display: "flutter test",
-      source: "pubspec.yaml",
-      riskTier: "verify",
-      argv: ["flutter", "test"],
-    },
-    {
-      commandId: "flutter:analyze",
-      display: "flutter analyze",
-      source: "pubspec.yaml",
-      riskTier: "verify",
-      argv: ["flutter", "analyze"],
-    },
-  ];
+  try {
+    const fingerprint = manifestFingerprint((await readFile(pubspecPath, "utf8")).replace(/\r\n/gu, "\n"));
+    return [
+      {
+        commandId: "flutter:test",
+        display: "flutter test",
+        source: "pubspec.yaml",
+        riskTier: "verify",
+        argv: ["flutter", "test"],
+        manifestFingerprint: fingerprint,
+      },
+      {
+        commandId: "flutter:analyze",
+        display: "flutter analyze",
+        source: "pubspec.yaml",
+        riskTier: "verify",
+        argv: ["flutter", "analyze"],
+        manifestFingerprint: fingerprint,
+      },
+    ];
+  } catch {
+    return [];
+  }
 }
 
 async function discoverAllCommands(root: string): Promise<DiscoveredCommand[]> {
@@ -192,13 +211,14 @@ async function discoverAllCommands(root: string): Promise<DiscoveredCommand[]> {
  */
 export async function listCommands(
   root: string,
-): Promise<{ commandId: string; display: string; source: string; riskTier: string }[]> {
+): Promise<{ commandId: string; display: string; source: string; riskTier: string; manifestFingerprint: string }[]> {
   const commands = await discoverAllCommands(root);
-  return commands.map(({ commandId, display, source, riskTier }) => ({
+  return commands.map(({ commandId, display, source, riskTier, manifestFingerprint }) => ({
     commandId,
     display,
     source,
     riskTier,
+    manifestFingerprint,
   }));
 }
 
@@ -228,7 +248,21 @@ function killProcessTree(pid: number | undefined, done: () => void): void {
     return;
   }
   if (process.platform === "win32") {
-    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => done());
+    // Terminate the full process tree while the parent PID still exists.
+    // Killing the parent first can orphan npm/cmd grandchildren and leave
+    // them holding cwd handles, which keeps temp/workspace folders locked.
+    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, (error) => {
+      if (error) {
+        // taskkill can be unavailable or policy-blocked. Fall back to the
+        // direct child so callers are still not left waiting forever.
+        try {
+          process.kill(pid);
+        } catch {
+          // Already exited.
+        }
+      }
+      done();
+    });
     return;
   }
   try {
@@ -265,6 +299,8 @@ export async function runCommand(
   commandId: string,
   args?: string[],
   timeoutSec?: number,
+  expectedManifestFingerprint?: string,
+  approvedRisky = false,
 ): Promise<{
   exitCode: number;
   stdoutSummary: string;
@@ -283,8 +319,19 @@ export async function runCommand(
       { commandId },
     );
   }
+  if (expectedManifestFingerprint && found.manifestFingerprint !== expectedManifestFingerprint) {
+    throw new DomainError(
+      ErrorCode.COMMAND_NOT_ALLOWED,
+      `command "${commandId}" manifest changed after approval`,
+      {
+        commandId,
+        expectedManifestFingerprint,
+        receivedManifestFingerprint: found.manifestFingerprint,
+      },
+    );
+  }
 
-  if (found.riskTier === "destructive" || found.riskTier === "network") {
+  if ((found.riskTier === "destructive" || found.riskTier === "network") && !approvedRisky) {
     throw new DomainError(
       ErrorCode.APPROVAL_REQUIRED,
       `command "${commandId}" requires explicit human approval (riskTier=${found.riskTier})`,

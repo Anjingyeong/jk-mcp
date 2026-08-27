@@ -16,7 +16,7 @@ import {
   type ToolResult,
 } from "../types.js";
 import { scanWorkspaceWithRuntimeSelf, findProject, nestedProjectRoots } from "../workspace/registry.js";
-import { makeLease } from "../workspace/project-select.js";
+import { makeLease, renewLease } from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
 import { codeSearch } from "../code/search.js";
 import { readSlice } from "../code/read-slice.js";
@@ -32,18 +32,32 @@ import {
 import { listImages, retrieveImage, saveImage, writeVersionedImage } from "../assets/images.js";
 import { intakeFromClipboard, intakeFromDownload, intakeFromPath, readClipboardText } from "../assets/image-intake.js";
 import { fetchImageFromUrl } from "../assets/image-url.js";
+import { auditSeoGeoUrl } from "../audit/seo-geo-audit.js";
 import { prepareChatGptImagesApp } from "../assets/chatgpt-images-app.js";
 import { listCommands, runCommand } from "../exec/command-runner.js";
 import { isAutonomousDevelopmentNetworkCommand } from "../exec/local-shell.js";
 import { classifyReadOnlyNetworkApprovalScope, inspectShellCommand, runLocalShell } from "../exec/local-shell.js";
-import { consumeLocalShellApproval, requestLocalShellApproval } from "../policy/local-approvals.js";
+import { consumeLocalShellApprovalGrant, hasActiveTaskNetworkApproval, localShellApprovalId, requestLocalShellApproval, taskApprovalIdentity } from "../policy/local-approvals.js";
 import { isAutonomousCloudInventoryRead } from "../exec/local-shell.js";
 import { isTrustedOwnerRoutineNetworkCommand } from "../exec/local-shell.js";
-import { queueLocalShellJob, readLocalShellJob } from "../policy/local-shell-jobs.js";
+import {
+  findReusableLocalShellJob,
+  localShellRunnerInstanceId,
+  queueLocalShellJob,
+  readLocalShellJob,
+  updateLocalShellJob,
+  type LocalShellJobCompletionProof,
+} from "../policy/local-shell-jobs.js";
 import { isJkMaintenanceCommand } from "../exec/local-shell.js";
 import { runOmo } from "../exec/omo-runner.js";
+import { buildMassUlwPlan, type MassUlwPlan } from "../orchestration/mass-ulw.js";
+import { createMassUlwExecutionIdentity } from "./mass-ulw-identity.js";
+import { cleanupReconciledMassUlwTerminal, updateMassUlwLifecycle } from "./mass-ulw-lifecycle.js";
+import { executeMassUlwTool } from "./mass-ulw-execution.js";
+import type { MassUlwExecuteInput } from "./mass-ulw-processes.js";
 import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { addToolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
+import { getRuntimeSchemaHealth, recordRegisteredToolSchemas } from "./runtime-schema-health.js";
 import {
   captureE2eAppScreenshot,
   captureE2eAppScreenshotSet,
@@ -66,6 +80,7 @@ import { clearKill } from "../control/queue.js";
 import {
   dispatchExecutorJob,
   getExecutorProjectRegistry,
+  listExecutorStatus,
   resolveRoutedLocalProject,
 } from "../executors/broker.js";
 import {
@@ -78,6 +93,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import path from "node:path";
+import {
+  approvalPlanContains,
+  buildTaskSafetyGate,
+  inferCommandExecutionKind,
+  inferTaskExecutionKind,
+  makeDefaultTaskSafety,
+  mergeTaskSafety,
+  strongerExecutionKind,
+  type TaskExecutionSafety,
+  type TaskExecutionKind,
+} from "./task-safety.js";
 
 // ---------------------------------------------------------------------------
 // Session helpers
@@ -139,7 +165,20 @@ interface TaskState {
   pending: string[];
   decisions: TaskDecision[];
   continuation: TaskContinuation | null;
+  executionSafety: TaskExecutionSafety;
   updatedAt: number;
+}
+
+function isReleaseShellCommand(command: string): boolean {
+  const normalized = command.trim().replace(/\s+/g, " ").toLowerCase();
+  return (
+    /(?:^|[;&|]\s*)wrangler(?:\.cmd)?\s+(?:deploy|publish)\b/u.test(normalized) ||
+    /(?:^|[;&|]\s*)(?:npm|pnpm)\s+publish\b/u.test(normalized) ||
+    /(?:^|[;&|]\s*)yarn\s+npm\s+publish\b/u.test(normalized) ||
+    /(?:^|[;&|]\s*)cargo\s+publish\b/u.test(normalized) ||
+    /(?:^|[;&|]\s*)gh\s+release\s+(?:create|upload|edit|delete)\b/u.test(normalized) ||
+    /(?:^|[;&|]\s*)docker\s+(?:push|buildx\s+build\b[^\r\n]*\s--push\b)/u.test(normalized)
+  );
 }
 
 interface WorkContext {
@@ -232,26 +271,6 @@ async function hashWorkContextFile(
   return slice.workContextFileHash ?? slice.fileHash;
 }
 
-async function readWorkContextSlice(
-  ctx: ToolContext,
-  entry: ProjectRegistryEntry,
-  rel: string,
-  start: number,
-  end: number,
-): Promise<WorkContextSlice> {
-  if (isRemoteProject(entry)) {
-    return await dispatchExecutorJob<WorkContextSlice>(
-      ctx.stateDir,
-      entry.executorId,
-      "file_read_slice",
-      remotePayload(entry, { path: rel, start, end }),
-    );
-  }
-  const abs = await resolveInProject(entry.root, rel, { allowSymlink: false });
-  await guardSecretPath(ctx, abs, "session_resume");
-  return await readSlice(entry.root, rel, start, end);
-}
-
 function makeEmptyWorkContext(projectId: string, now = Date.now(), workSessionId: string | null = null): WorkContext {
   return {
     projectId,
@@ -282,6 +301,24 @@ function getWorkContext(
     return session.workSessions[projectId]?.[workSessionId] ?? null;
   }
   return session.workContexts[projectId] ?? null;
+}
+
+async function hasTaskNetworkVerificationApproval(
+  ctx: ToolContext,
+  projectId: string,
+  workSessionId?: string,
+  cwd?: string,
+): Promise<boolean> {
+  const session = await loadSession(ctx);
+  const workContext = getWorkContext(session, projectId, workSessionId);
+  const identity = taskApprovalIdentity({
+    goalId: workContext?.taskState?.goalId,
+    loopId: workContext?.taskState?.loopId,
+    workSessionId: workSessionId ?? workContext?.workSessionId,
+    leaseId: session.lease?.projectId === projectId && session.lease.expiresAt > Date.now() ? session.lease.leaseId : undefined,
+  });
+  if (!identity) return false;
+  return hasActiveTaskNetworkApproval(ctx.stateDir, { projectId, cwd, taskIdentity: identity });
 }
 
 function findLoopContinuation(
@@ -330,6 +367,26 @@ function findLoopContinuation(
 
   const legacy = getWorkContext(session, projectId);
   return legacy?.taskState?.loopId ? { context: legacy } : null;
+}
+
+function findLoopContextById(
+  session: SessionState,
+  projectId: string,
+  loopId: string,
+  workSessionId?: string,
+): { context: WorkContext; workSessionId?: string } | null {
+  if (workSessionId) {
+    const explicit = getWorkContext(session, projectId, workSessionId);
+    return explicit?.taskState?.loopId === loopId ? { context: explicit, workSessionId } : null;
+  }
+
+  const matched = Object.values(session.workSessions[projectId] ?? {})
+    .filter((context) => context.taskState?.loopId === loopId)
+    .sort((a, b) => b.lastActivityAt - a.lastActivityAt)[0];
+  if (matched) return { context: matched, workSessionId: matched.workSessionId ?? undefined };
+
+  const legacy = getWorkContext(session, projectId);
+  return legacy?.taskState?.loopId === loopId ? { context: legacy } : null;
 }
 
 function withWorkContext(
@@ -593,7 +650,22 @@ async function buildResumeSnapshot(
     } else {
       const maxLines = options.maxActiveSliceLines ?? 160;
       const requestedEnd = Math.min(active.end, active.start + maxLines - 1);
-      const slice = await readWorkContextSlice(ctx, entry, active.path, active.start, requestedEnd);
+      const slice: WorkContextSlice = isRemoteProject(entry)
+        ? await (async () => {
+            const abs = resolveRemotePathLexically(entry.root, active.path);
+            await guardSecretPath(ctx, abs, "session_resume");
+            return await dispatchExecutorJob<WorkContextSlice>(
+              ctx.stateDir,
+              entry.executorId,
+              "file_read_slice",
+              remotePayload(entry, { path: active.path, start: active.start, end: requestedEnd }),
+            );
+          })()
+        : await (async () => {
+            const abs = await resolveInProject(entry.root, active.path, { allowSymlink: false });
+            await guardSecretPath(ctx, abs, "session_resume");
+            return await readSlice(entry.root, active.path, active.start, requestedEnd);
+          })();
       activeSlice = {
         path: active.path,
         start: slice.start,
@@ -638,6 +710,7 @@ function makeEmptyTaskState(now = Date.now()): TaskState {
     pending: [],
     decisions: [],
     continuation: null,
+    executionSafety: makeDefaultTaskSafety(),
     updatedAt: now,
   };
 }
@@ -673,6 +746,8 @@ async function recordTaskProgress(
     completed?: string[];
     pending?: string[];
     decisions?: Array<{ summary: string; rationale?: string }>;
+    executionSafety?: Partial<TaskExecutionSafety>;
+    inferredExecutionKind?: TaskExecutionKind;
   },
 ): Promise<TaskState> {
   const now = Date.now();
@@ -710,6 +785,15 @@ async function recordTaskProgress(
       pending:
         update.pending === undefined ? previous.pending : mergeUniqueTaskItems([], update.pending),
       decisions: [...decisionMap.values()].slice(-30),
+      executionSafety: mergeTaskSafety(
+        previous.executionSafety,
+        update.executionSafety,
+        update.inferredExecutionKind ?? "workspace",
+      ),
+      continuation:
+        previous.continuation?.deliveredAt && now - previous.continuation.deliveredAt > 5 * 60 * 1000
+          ? null
+          : previous.continuation,
       updatedAt: now,
     };
     recorded = taskState;
@@ -924,6 +1008,9 @@ function mapError(err: unknown): ToolResult<{
   error: string;
   code: string;
   details?: unknown;
+  approvalId?: string;
+  jobId?: string;
+  approvalReused?: string;
   approvalRequired?: boolean;
   approvalPending?: boolean;
   approvalInstruction?: string;
@@ -931,6 +1018,16 @@ function mapError(err: unknown): ToolResult<{
   if (err instanceof DomainError) {
     const safeMessage = redact(err.message);
     const safeDetails = redactUnknown(err.details);
+    const safeDetailsRecord = safeDetails && typeof safeDetails === "object"
+      ? safeDetails as Record<string, unknown>
+      : null;
+    const rawDetailsRecord = err.details && typeof err.details === "object"
+      ? err.details as Record<string, unknown>
+      : null;
+    const correlationId = (value: unknown): string | undefined =>
+      typeof value === "string" && /^[a-f0-9]{64}$/u.test(value) ? value : undefined;
+    const approvalId = correlationId(rawDetailsRecord?.approvalId);
+    const jobId = correlationId(rawDetailsRecord?.jobId);
     const approvalRequired = err.code === ErrorCode.APPROVAL_REQUIRED;
     const approvalPending = Boolean(
       approvalRequired &&
@@ -945,6 +1042,9 @@ function mapError(err: unknown): ToolResult<{
         error: safeMessage,
         code: err.code,
         details: safeDetails,
+        ...(approvalId ? { approvalId } : {}),
+        ...(jobId ? { jobId } : {}),
+        ...(typeof safeDetailsRecord?.approvalReused === "string" ? { approvalReused: safeDetailsRecord.approvalReused } : {}),
         approvalRequired,
         approvalPending,
         approvalInstruction: approvalPending
@@ -1054,39 +1154,44 @@ function schemaToJsonSchema(schema: unknown, pipeStrategy: "input" | "output"): 
 
 function installChatGptToolListHandler(s: McpServer): void {
   const registeredTools = (s as unknown as { _registeredTools: Record<string, RegisteredToolLike> })._registeredTools;
+  const listVisibleTools = () => {
+    const exposeControl = isControlChatGptExposed();
+    return Object.entries(registeredTools)
+      .filter(
+        ([name, tool]) =>
+          tool.enabled !== false &&
+          !CHATGPT_SAFETY_HIDDEN_TOOL_NAMES.has(name) &&
+          (exposeControl || !CONTROL_TOOL_NAMES.has(name)),
+      )
+      .map(([name, tool]) => {
+        const definition: Record<string, unknown> = {
+          name,
+          title: tool.title,
+          description: tool.description,
+          inputSchema: schemaToJsonSchema(tool.inputSchema, "input"),
+          securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+          annotations: tool.annotations,
+          execution: tool.execution,
+          _meta: {
+            securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+            ui: { visibility: ["model"] },
+            "openai/visibility": "public",
+            ...(tool._meta ?? {}),
+          },
+        };
+        if (tool.outputSchema) definition.outputSchema = schemaToJsonSchema(tool.outputSchema, "output");
+        return definition;
+      });
+  };
   s.server.setRequestHandler(ListToolsRequestSchema, () => {
     // Re-read at request time (not server-construction time) so tests/ops
     // toggling the env var take effect immediately.
-    const exposeControl = isControlChatGptExposed();
-    return {
-      tools: Object.entries(registeredTools)
-        .filter(
-          ([name, tool]) =>
-            tool.enabled !== false &&
-            !CHATGPT_SAFETY_HIDDEN_TOOL_NAMES.has(name) &&
-            (exposeControl || !CONTROL_TOOL_NAMES.has(name)),
-        )
-        .map(([name, tool]) => {
-          const definition: Record<string, unknown> = {
-            name,
-            title: tool.title,
-            description: tool.description,
-            inputSchema: schemaToJsonSchema(tool.inputSchema, "input"),
-            securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
-            annotations: tool.annotations,
-            execution: tool.execution,
-            _meta: {
-              securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
-              ui: { visibility: ["model"] },
-              "openai/visibility": "public",
-              ...(tool._meta ?? {}),
-            },
-          };
-          if (tool.outputSchema) definition.outputSchema = schemaToJsonSchema(tool.outputSchema, "output");
-          return definition;
-        }),
-    };
+    const tools = listVisibleTools();
+    recordRegisteredToolSchemas(tools.map((tool) => ({ name: String(tool.name), inputSchema: tool.inputSchema })));
+    return { tools };
   });
+  const tools = listVisibleTools();
+  recordRegisteredToolSchemas(tools.map((tool) => ({ name: String(tool.name), inputSchema: tool.inputSchema })));
 }
 
 /**
@@ -1163,6 +1268,7 @@ function isDeliverableContinuation(continuation: TaskContinuation | null | undef
 async function takeTaskContinuationNotice(
   ctx: ToolContext,
   input: unknown,
+  consume = true,
 ): Promise<Record<string, unknown> | null> {
   let notice: Record<string, unknown> | null = null;
   await updateSessionState(ctx, async (session) => {
@@ -1197,14 +1303,16 @@ async function takeTaskContinuationNotice(
       if (job.continuation?.goalId && job.continuation.goalId !== task.goalId) continue;
       if (job.continuation?.loopId && job.continuation.loopId !== task.loopId) continue;
 
-      const deliveredAt = Date.now();
-      const nextContext: WorkContext = {
-        ...candidate.context,
-        taskState: {
-          ...task,
-          continuation: { ...continuation, deliveredAt },
-        },
-      };
+      const deliveredAt = consume ? Date.now() : null;
+      const nextContext: WorkContext = consume
+        ? {
+            ...candidate.context,
+            taskState: {
+              ...task,
+              continuation: { ...continuation, deliveredAt: deliveredAt! },
+            },
+          }
+        : candidate.context;
       const commandPreview = redact(job.command).slice(0, 800);
       const recoveryInstruction =
         continuation.status === "ready-to-resume"
@@ -1236,7 +1344,9 @@ async function takeTaskContinuationNotice(
         deliveredAt,
         instruction: `${recoveryInstruction} This notice does not grant permission for any new risky action; normal approval checks still apply.`,
       };
-      return withWorkContext(session, projectId, candidate.workSessionId, nextContext);
+      return consume
+        ? withWorkContext(session, projectId, candidate.workSessionId, nextContext)
+        : session;
     }
     return session;
   });
@@ -1247,8 +1357,9 @@ async function attachTaskContinuationNotice<T extends Record<string, unknown>>(
   ctx: ToolContext,
   input: unknown,
   result: ToolResult<T>,
+  consume = true,
 ): Promise<ToolResult<Record<string, unknown>>> {
-  const notice = await takeTaskContinuationNotice(ctx, input);
+  const notice = await takeTaskContinuationNotice(ctx, input, consume);
   if (!notice) return result as ToolResult<Record<string, unknown>>;
   const status = String(notice.continuationStatus ?? "ready-to-resume");
   const loopId = typeof notice.loopId === "string" ? notice.loopId : "unknown";
@@ -1280,6 +1391,7 @@ async function withErrorMapping<T extends Record<string, unknown>>(
       ctx,
       input,
       await attachActiveRoleContext(ctx, input, await fn()),
+      toolName === "goal_loop",
     );
     await ctx.ledger.append({
       type: "tool.call.completed",
@@ -1289,7 +1401,7 @@ async function withErrorMapping<T extends Record<string, unknown>>(
     });
     return toCallToolResult(toolName, result);
   } catch (err) {
-    const mapped = await attachTaskContinuationNotice(ctx, input, mapError(err));
+    const mapped = await attachTaskContinuationNotice(ctx, input, mapError(err), toolName === "goal_loop");
     await ctx.ledger.append({
       type: "tool.call.failed",
       tool: toolName,
@@ -1340,6 +1452,223 @@ function loopIdFor(goal: string): string {
 type NativeOrchestrationPhase = "discover" | "plan" | "patch" | "verify" | "review" | "recovery" | "release";
 type NativeVerificationStatus = "unknown" | "pass" | "fail" | "blocked";
 type WorkflowStage = "explorer" | "oracle" | "implementer" | "reviewer" | "verifier" | "recovery";
+type NativeExecutionProfile = "auto" | "fast" | "max";
+
+type NativeFanoutCandidate = {
+  id: string;
+  task: string;
+  estimatedWeight?: number;
+  readScopes?: string[];
+  writeScopes?: string[];
+  dependsOn?: string[];
+  exclusiveResources?: string[];
+  latencyBound?: boolean;
+};
+
+function normalizeFanoutScope(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").toLowerCase();
+}
+
+function fanoutScopesOverlap(left: string, right: string): boolean {
+  const a = normalizeFanoutScope(left);
+  const b = normalizeFanoutScope(right);
+  if (!a || !b) return false;
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function inferExecutionProfile(input: {
+  requested?: NativeExecutionProfile;
+  complexity: "low" | "medium" | "high";
+  mode: "implement" | "research" | "debug" | "review" | "plan";
+  text: string;
+  pendingCount: number;
+}) {
+  const requested = input.requested ?? "auto";
+  if (requested !== "auto") {
+    return {
+      requested,
+      effective: requested,
+      source: "explicit" as const,
+      rationale: requested === "max"
+        ? "Max was explicitly requested; optimize for wall-clock speed, verification coverage, and reduced rework while preserving hard safety guards."
+        : "Fast was explicitly requested; keep the workflow narrow and avoid coordination overhead unless safety/recovery requires otherwise.",
+    };
+  }
+
+  const text = input.text.toLowerCase();
+  const maxIntent =
+    /\b(max|maximum|full qa|full audit|comprehensive|end[- ]to[- ]end|e2e|regression|release|deploy|migration|refactor|audit)\b/i.test(text) ||
+    /(끝까지|전체\s*qa|전체적으로|전부|빡세게|세게|최종까지|풀\s*qa|전체\s*검증|배포까지)/i.test(input.text);
+  const fastIntent =
+    /\b(fast|quick|tiny|typo|copy change|one[- ]file|small fix)\b/i.test(text) ||
+    /(빠르게|간단히|오타|문구|버튼\s*글자|한\s*파일|작은\s*수정)/i.test(input.text);
+
+  if (maxIntent || input.pendingCount >= 4 || (input.complexity === "high" && input.pendingCount >= 2)) {
+    return {
+      requested,
+      effective: "max" as const,
+      source: "auto" as const,
+      rationale: "Auto detected a broad/high-impact task; prefer aggressive safe fan-out, wider verification coverage, and early failure discovery.",
+    };
+  }
+  if (fastIntent || (input.complexity === "low" && input.pendingCount <= 1 && input.text.length <= 180 && input.mode !== "debug")) {
+    return {
+      requested,
+      effective: "fast" as const,
+      source: "auto" as const,
+      rationale: "Auto detected a small/narrow task; avoid fan-out overhead and use one focused inspect/patch/verify path.",
+    };
+  }
+  return {
+    requested,
+    effective: "auto" as const,
+    source: "auto" as const,
+    rationale: "Auto kept the balanced profile because the task is neither tiny nor broad enough to justify forcing Fast or Max.",
+  };
+}
+
+function buildLegacyMassUlwDecision(input: {
+  complexity: "low" | "medium" | "high";
+  mode: "implement" | "research" | "debug" | "review" | "plan";
+  pendingCount: number;
+  executionProfile: NativeExecutionProfile;
+  candidates?: NativeFanoutCandidate[];
+}) {
+  const maxLanes = 4;
+  const candidates = input.candidates ?? [];
+  const shouldEvaluate =
+    candidates.length === 0 &&
+    input.pendingCount >= 2 &&
+    input.executionProfile !== "fast" &&
+    (input.executionProfile === "max" || input.complexity !== "low") &&
+    input.mode !== "review" &&
+    input.mode !== "plan";
+
+  if (candidates.length === 0) {
+    return {
+      state: shouldEvaluate ? "evaluate" : "inactive",
+      recommended: false,
+      maxLanes,
+      candidateCount: 0,
+      netGain: 0,
+      hardBlocks: [] as string[],
+      rationale: shouldEvaluate
+        ? `${input.executionProfile === "max" ? "Max profile favors early safe fan-out. " : ""}Multiple non-trivial pending tasks exist. Describe 2-4 candidate lanes with scopes/resources so JK can make a deterministic fan-out decision.`
+        : input.executionProfile === "fast"
+          ? "Fast profile keeps this turn single-lane to avoid coordination overhead."
+          : "Mass ULW fan-out is not warranted from the current task shape.",
+    };
+  }
+
+  const hardBlocks: string[] = [];
+  if (candidates.length < 2) hardBlocks.push("fewer-than-two-lanes");
+  if (candidates.length > maxLanes) hardBlocks.push(`lane-count-exceeds-${maxLanes}`);
+
+  const ids = new Set(candidates.map((candidate) => candidate.id));
+  if (ids.size !== candidates.length) hardBlocks.push("duplicate-lane-id");
+
+  for (const candidate of candidates) {
+    const internalDependency = (candidate.dependsOn ?? []).find((dependency) => ids.has(dependency));
+    if (internalDependency) hardBlocks.push(`dependency:${candidate.id}->${internalDependency}`);
+  }
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    for (let j = i + 1; j < candidates.length; j += 1) {
+      const left = candidates[i]!;
+      const right = candidates[j]!;
+      const leftWrites = left.writeScopes ?? [];
+      const rightWrites = right.writeScopes ?? [];
+      const leftReadsAndWrites = [...(left.readScopes ?? []), ...leftWrites];
+      const rightReadsAndWrites = [...(right.readScopes ?? []), ...rightWrites];
+      const scopeCollision =
+        leftWrites.some((scope) => rightReadsAndWrites.some((other) => fanoutScopesOverlap(scope, other))) ||
+        rightWrites.some((scope) => leftReadsAndWrites.some((other) => fanoutScopesOverlap(scope, other)));
+      if (scopeCollision) hardBlocks.push(`scope-collision:${left.id}<->${right.id}`);
+
+      const leftResources = new Set((left.exclusiveResources ?? []).map(normalizeFanoutScope).filter(Boolean));
+      const resourceCollision = (right.exclusiveResources ?? [])
+        .map(normalizeFanoutScope)
+        .filter(Boolean)
+        .some((resource) => leftResources.has(resource));
+      if (resourceCollision) hardBlocks.push(`exclusive-resource:${left.id}<->${right.id}`);
+    }
+  }
+
+  const weights = candidates.map((candidate) => Math.min(5, Math.max(1, candidate.estimatedWeight ?? 1)));
+  const serialWork = weights.reduce((sum, weight) => sum + weight, 0);
+  const criticalPathWork = Math.max(...weights, 0);
+  const writeLaneCount = candidates.filter((candidate) => (candidate.writeScopes?.length ?? 0) > 0).length;
+  const readOnlyLaneCount = candidates.filter((candidate) => (candidate.writeScopes?.length ?? 0) === 0).length;
+  const verificationLaneCount = candidates.filter((candidate) =>
+    /(test|qa|verify|verification|review|audit|regression|e2e|검증|테스트|회귀)/i.test(candidate.task),
+  ).length;
+  const unknownScopeCount = candidates.filter(
+    (candidate) => (candidate.readScopes?.length ?? 0) === 0 && (candidate.writeScopes?.length ?? 0) === 0,
+  ).length;
+  const maxProfile = input.executionProfile === "max";
+  const latencyBonus = candidates.filter((candidate) => candidate.latencyBound).length * (maxProfile ? 0.75 : 0.5);
+  const coverageBonus = verificationLaneCount * (maxProfile ? 0.75 : 0.4);
+  const readParallelBonus = readOnlyLaneCount * (maxProfile ? 0.4 : 0.2);
+  const coordinationCost =
+    (maxProfile ? 0.4 : 0.75) +
+    Math.max(0, candidates.length - 2) * (maxProfile ? 0.2 : 0.35) +
+    writeLaneCount * (maxProfile ? 0.25 : 0.35);
+  const contextPollutionCost = candidates.length * 0.1 + unknownScopeCount * 0.35;
+  const threshold = maxProfile ? 0.25 : 0.75;
+  const netGain = Number(
+    (serialWork - criticalPathWork + latencyBonus + coverageBonus + readParallelBonus - coordinationCost - contextPollutionCost).toFixed(2),
+  );
+  const policyBlocked = input.executionProfile === "fast";
+  const recommended = !policyBlocked && hardBlocks.length === 0 && netGain >= threshold;
+
+  return {
+    state: recommended ? "fanout" : "sequential",
+    recommended,
+    maxLanes,
+    candidateCount: candidates.length,
+    serialWork,
+    criticalPathWork,
+    coordinationCost,
+    latencyBonus,
+    coverageBonus,
+    readParallelBonus,
+    contextPollutionCost,
+    threshold,
+    netGain,
+    hardBlocks,
+    lanes: candidates.map((candidate, index) => ({
+      id: candidate.id,
+      task: candidate.task,
+      estimatedWeight: weights[index],
+      readScopes: candidate.readScopes ?? [],
+      writeScopes: candidate.writeScopes ?? [],
+      dependsOn: candidate.dependsOn ?? [],
+      exclusiveResources: candidate.exclusiveResources ?? [],
+      latencyBound: candidate.latencyBound ?? false,
+    })),
+    rationale:
+      hardBlocks.length > 0
+        ? `Fan-out blocked by safety guard(s): ${hardBlocks.join(", ")}.`
+        : policyBlocked
+          ? "Fast profile keeps candidate lanes sequential to avoid coordination overhead."
+        : recommended
+          ? `Performance-first fan-out gain ${netGain} clears the ${input.executionProfile} threshold (>= ${threshold}) after coordination and context-pollution costs.`
+          : `Performance-first fan-out gain ${netGain} does not clear the ${input.executionProfile} threshold (>= ${threshold}); keep the work sequential.`,
+  };
+}
+
+function buildMassUlwDecision(input: {
+  complexity: "low" | "medium" | "high";
+  mode: "implement" | "research" | "debug" | "review" | "plan";
+  pendingCount: number;
+  executionProfile: NativeExecutionProfile;
+  candidates?: NativeFanoutCandidate[];
+}) {
+  if (!input.candidates || input.candidates.length === 0) {
+    return buildLegacyMassUlwDecision(input);
+  }
+  return buildMassUlwPlan({ executionProfile: input.executionProfile, candidates: input.candidates });
+}
 
 function recommendedLeasePreset(mode: RoleTaskMode, rolePermission?: string | null): LeasePreset {
   if (rolePermission === "read-only") return "read-only";
@@ -1358,6 +1687,8 @@ function buildNativeOrchestration(input: {
   verificationStatus?: NativeVerificationStatus;
   failureCount?: number;
   turn?: number;
+  executionProfile?: NativeExecutionProfile;
+  fanoutCandidates?: NativeFanoutCandidate[];
 }) {
   const mode = input.mode ?? "implement";
   const verificationStatus = input.verificationStatus ?? "unknown";
@@ -1372,10 +1703,24 @@ function buildNativeOrchestration(input: {
   }
   if (mode === "plan" || mode === "debug") complexityScore += 1;
   const complexity = complexityScore >= 3 ? "high" : complexityScore >= 1 ? "medium" : "low";
+  const executionProfile = inferExecutionProfile({
+    requested: input.executionProfile,
+    complexity,
+    mode,
+    text,
+    pendingCount,
+  });
+  const massUlw = buildMassUlwDecision({
+    complexity,
+    mode,
+    pendingCount,
+    executionProfile: executionProfile.effective,
+    candidates: input.fanoutCandidates,
+  });
 
   let phase: NativeOrchestrationPhase;
-  if (input.phase) phase = input.phase;
-  else if (failureCount >= 3 || verificationStatus === "blocked") phase = "recovery";
+  if (failureCount >= 2 || verificationStatus === "blocked") phase = "recovery";
+  else if (input.phase) phase = input.phase;
   else if (verificationStatus === "fail") phase = "verify";
   else if (mode === "research") phase = "discover";
   else if (mode === "plan") phase = "plan";
@@ -1414,10 +1759,10 @@ function buildNativeOrchestration(input: {
   if (failureCount === 1) {
     recoveryPolicy = "First failure: inspect the exact failing output and the assumption behind the last change before editing again.";
   } else if (failureCount === 2) {
-    recoveryPolicy = "Second failure: try one materially different approach, not a cosmetic retry of the same patch.";
+    recoveryPolicy = "Second failure: stop the current fix path, identify a root cause from fresh evidence, and only then try a materially different approach.";
   } else if (failureCount >= 3) {
     recoveryPolicy =
-      "Three or more failures: stop editing, preserve the current diff/checkpoint evidence, switch to recovery/oracle review, and report a proven blocker if no new hypothesis is supported.";
+      "Three or more failures: stop editing, preserve the current diff/checkpoint evidence, and escalate beyond the local symptom to harness/environment/architecture assumptions before any further patch.";
   }
 
   return {
@@ -1425,12 +1770,14 @@ function buildNativeOrchestration(input: {
     externalModelRequired: false,
     note: "Workflow stages are reasoning lenses for the current ChatGPT web session. User-selectable Roles are a separate permission/workflow-profile concept.",
     complexity,
+    executionProfile,
     phase,
     primaryStage: primaryStageByPhase[phase],
     supportingStages: supportingStagesByPhase[phase],
     stageInstructions,
     verificationStatus,
     failureCount,
+    massUlw,
     verificationGate:
       mode === "research"
         ? "Ground conclusions in inspected local evidence; do not claim implementation work."
@@ -1604,6 +1951,30 @@ interface E2eDeliverableShot {
   inlineUrl?: string;
   inlineExpiresAt?: string;
   shotLabel?: string;
+}
+
+interface RemoteE2eScreenshotResult {
+  path: string;
+  bytes: number;
+  opened: boolean;
+  captureMode: "screen";
+  imageBase64: string;
+  mimeType: "image/png";
+}
+
+async function materializeRemoteE2eScreenshot(
+  ctx: ToolContext,
+  remote: RemoteE2eScreenshotResult,
+): Promise<RemoteE2eScreenshotResult & { path: string; remotePath: string }> {
+  const image = Buffer.from(remote.imageBase64, "base64");
+  if (image.length === 0 || image.length > 6 * 1024 * 1024) {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Remote E2E screenshot payload is empty or too large.");
+  }
+  const dir = path.join(ctx.stateDir, "remote-e2e-screenshots");
+  await fs.mkdir(dir, { recursive: true });
+  const localPath = path.join(dir, `${Date.now()}-${randomUUID()}.png`);
+  await fs.writeFile(localPath, image);
+  return { ...remote, path: localPath, remotePath: remote.path };
 }
 
 const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -1813,6 +2184,7 @@ async function writeGoalLoop(ctx: ToolContext, loopId: string, payload: Record<s
   await fs.writeFile(path.join(loopsDir, `${loopId}.loop.json`), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
+
 /**
  * image-intake destinations default into `.chatgpt2codex/images/**`, which only
  * needs the `image` lease capability (same as save_image). Writing anywhere
@@ -1994,7 +2366,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "local_shell_run for Codex-style local commands inside the selected project",
               "For a multi-step network/destructive shell task whose risky commands are already known, put the exact follow-up commands in local_shell_run intent.approvalBundle on the first risky call. One local-owner approval then covers only those exact command+risk hashes for the same project, cwd, and goal/loop/work-session; any new command or changed risk must request approval again.",
               "For JK runtime reloads, use the stable high-level action `bash scripts/reload-jk-runtime.sh` with reason `Reload JK runtime and run local QA`. It stays destructive/approval-gated, but one approval covers the reload plus local health, OAuth, dashboard, approvals, remote-auth-gate, and tunnel-continuity checks. Do not handcraft separate systemctl/kill/curl steps.",
-              "For an established remote-worker workflow: before edits call git_sync_start so the checkout must be clean and fast-forwarded from upstream; after verification inspect repo_diff_summary and call git_sync_finish with only the explicit task paths. The configured upstream is the source of truth. Deployment followers may use clean fast-forward-only sync; Windows is never auto-pulled and only updates when the user explicitly requests a manual sync.",
+              "For JK hybrid projects, GitHub is the durable source of truth. Windows never auto-pulls from OCI or GitHub; update Windows only when the user explicitly requests a pull. OCI may follow GitHub main automatically only through the guarded clean + ff-only sync path, followed by build, runtime reload, and health/auth/tunnel QA.",
               "If the user says 'e2e 테스트하고 스크린샷 보여줘' or asks for E2E proof in one sentence, call e2e_test_and_show_screenshot immediately. It uses the active project; ChatGPT renders the captured screenshots inline through the E2E screenshot widget, and the Actions response returns inline image markdown.",
               "For UI/E2E proof: use e2e_start_server, then e2e_run_command for test commands; it captures a screenshot by default. Use [REDACTED] for manual visual proof. Return the screenshot path/markdown to the user.",
               "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
@@ -2034,6 +2406,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 "Use code_search first, then narrow file_read_slice calls to inspect the repo. Avoid broad context-pack calls in ChatGPT because OpenAI safety may block them before they reach chatgpt2codex.",
                 "Apply changes directly with file_apply_patch or file_create. Never hand the user a script to paste when the action bridge is reachable.",
                 "Use command_run or local_shell_run for verification; network/destructive shell intents remain approval-gated by the tool.",
+                "When several known risky local_shell_run steps belong to one task, predeclare their exact command strings in intent.approvalBundle on the first risky call so the owner can approve the bounded bundle once.",
                 "Use repo status/diff/show changes and then commit/push only when requested.",
               ],
               imageSaveFlow: [
@@ -2159,6 +2532,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         projectId: z.string().optional(),
         workSessionId: WorkSessionIdSchema.optional(),
         mode: z.enum(["implement", "research", "debug", "review", "plan"]).optional(),
+        executionProfile: z.enum(["auto", "fast", "max"]).optional(),
         maxTurns: z.number().int().min(1).max(50).optional(),
         lastResult: z.string().optional(),
         phase: z.enum(["discover", "plan", "patch", "verify", "review", "recovery", "release"]).optional(),
@@ -2167,6 +2541,39 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         currentTask: z.string().max(500).optional(),
         completed: z.array(z.string().min(1).max(500)).max(50).optional(),
         pending: z.array(z.string().min(1).max(500)).max(50).optional(),
+        safety: z.object({
+          executionKind: z.enum(["workspace", "live-runtime", "release-deploy"]).optional(),
+          preflightStatus: z.enum(["unknown", "pass", "fail", "not-required"]).optional(),
+          preflightEvidence: z.array(z.string().min(1).max(2000)).max(30).optional(),
+          executionTarget: z.object({
+            machine: z.string().min(1).max(200),
+            projectRoot: z.string().min(1).max(1000),
+            branch: z.string().min(1).max(200),
+            dirty: z.boolean(),
+            runtimeTarget: z.string().min(1).max(500),
+          }).optional(),
+          approvalPlan: z.array(z.string().min(1).max(2000)).max(20).optional(),
+          rollbackStatus: z.enum(["unknown", "pass", "fail", "not-required"]).optional(),
+          releaseCollisionStatus: z.enum(["unknown", "pass", "fail", "not-required"]).optional(),
+          runtimeProofStatus: z.enum(["unknown", "pass", "fail", "not-required"]).optional(),
+          runtimeProofEvidence: z.array(z.string().min(1).max(2000)).max(30).optional(),
+          operationalDrift: z.array(z.string().min(1).max(2000)).max(30).optional(),
+        }).optional(),
+        fanoutCandidates: z
+          .array(
+            z.object({
+              id: z.string().min(1).max(80),
+              task: z.string().min(1).max(500),
+              estimatedWeight: z.number().int().min(1).max(5).optional(),
+              readScopes: z.array(z.string().min(1).max(300)).max(20).optional(),
+              writeScopes: z.array(z.string().min(1).max(300)).max(20).optional(),
+              dependsOn: z.array(z.string().min(1).max(80)).max(10).optional(),
+              exclusiveResources: z.array(z.string().min(1).max(120)).max(10).optional(),
+              latencyBound: z.boolean().optional(),
+            }),
+          )
+          .max(4)
+          .optional(),
         decisions: z
           .array(
             z.object({
@@ -2182,15 +2589,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       return withErrorMapping<Record<string, unknown>>(ctx, "goal_loop", { ...input, goal: input.goal ? "[goal redacted]" : undefined }, async () => {
         const currentSessionBeforeLoop = await loadSession(ctx);
         const resolvedProjectId = input.projectId ?? currentSessionBeforeLoop.activeProjectId ?? undefined;
-        const continuation =
-          !input.newLoop && !input.loopId && resolvedProjectId
-            ? findLoopContinuation(currentSessionBeforeLoop, resolvedProjectId, {
+        const continuation = !input.newLoop && resolvedProjectId
+          ? input.loopId
+            ? findLoopContextById(currentSessionBeforeLoop, resolvedProjectId, input.loopId.trim(), input.workSessionId)
+            : findLoopContinuation(currentSessionBeforeLoop, resolvedProjectId, {
                 workSessionId: input.workSessionId,
                 goalHint: input.goal,
               })
-            : null;
+          : null;
         const continuationLoopId = continuation?.context.taskState?.loopId ?? undefined;
-        const effectiveGoal = input.goal ?? continuation?.context.taskState?.currentGoal ?? undefined;
+        let effectiveGoal = input.goal ?? continuation?.context.taskState?.currentGoal ?? undefined;
         if (!input.loopId && !continuationLoopId && !effectiveGoal) {
           return makeResult(
             {
@@ -2207,25 +2615,38 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const maxTurns = input.maxTurns ?? 12;
         const loopFile = path.join(ctx.stateDir, "goals", `${loopId}.loop.json`);
         let previousTurns = 0;
-        let existingTurns: unknown[] = [];
+        let existingTurns: Array<Record<string, unknown>> = [];
         let existingWorkSessionId: string | undefined;
         let existingMode: RoleTaskMode | undefined;
+        let existingExecutionProfile: NativeExecutionProfile | undefined;
+        let existingGoalPreview: string | undefined;
         try {
           const existing = JSON.parse(await fs.readFile(loopFile, "utf8")) as {
             turns?: unknown[];
             workSessionId?: string;
             mode?: unknown;
+            executionProfile?: unknown;
+            goalPreview?: unknown;
           };
-          existingTurns = Array.isArray(existing.turns) ? existing.turns : [];
+          existingTurns = Array.isArray(existing.turns)
+            ? existing.turns.filter((turn): turn is Record<string, unknown> => Boolean(turn) && typeof turn === "object")
+            : [];
           existingWorkSessionId = existing.workSessionId;
+          if (typeof existing.goalPreview === "string" && existing.goalPreview.trim()) {
+            existingGoalPreview = existing.goalPreview.trim();
+          }
           if (existing.mode === "implement" || existing.mode === "research" || existing.mode === "debug" || existing.mode === "review" || existing.mode === "plan") {
             existingMode = existing.mode;
+          }
+          if (existing.executionProfile === "auto" || existing.executionProfile === "fast" || existing.executionProfile === "max") {
+            existingExecutionProfile = existing.executionProfile;
           }
           previousTurns = existingTurns.length;
         } catch {
           existingTurns = [];
           previousTurns = 0;
         }
+        effectiveGoal ??= existingGoalPreview;
         const turn = previousTurns + 1;
         const remainingTurns = Math.max(0, maxTurns - turn);
         const workSessionId =
@@ -2234,24 +2655,104 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           existingWorkSessionId ??
           (resolvedProjectId && previousTurns === 0 ? createWorkSessionId() : undefined);
         const effectiveMode: RoleTaskMode = input.mode ?? existingMode ?? "implement";
+        const effectiveExecutionProfile: NativeExecutionProfile = input.executionProfile ?? existingExecutionProfile ?? "auto";
+        const previousTurn = existingTurns.at(-1);
+        const previousFailureCount =
+          typeof previousTurn?.failureCount === "number" && Number.isFinite(previousTurn.failureCount)
+            ? Math.max(0, Math.floor(previousTurn.failureCount))
+            : 0;
+        const effectiveFailureCount =
+          input.failureCount ??
+          (input.verificationStatus === "pass"
+            ? 0
+            : input.verificationStatus === "fail" || input.verificationStatus === "blocked"
+              ? Math.min(20, previousFailureCount + 1)
+              : previousFailureCount);
+        const effectiveCurrentTask = input.currentTask ?? continuation?.context.taskState?.currentTask ?? undefined;
+        const inferredExecutionKind = inferTaskExecutionKind(`${effectiveGoal ?? ""}\n${effectiveCurrentTask ?? ""}`);
+        const effectiveSafety = mergeTaskSafety(
+          continuation?.context.taskState?.executionSafety,
+          input.safety,
+          inferredExecutionKind,
+        );
+        const safetyGate = buildTaskSafetyGate(effectiveSafety);
+        const basePending = input.pending ?? continuation?.context.taskState?.pending ?? [];
+        const effectivePending = [
+          ...basePending,
+          ...effectiveSafety.operationalDrift.map((item) => `Operational drift: ${item}`),
+        ].filter((item, index, values) => values.indexOf(item) === index);
         const orchestration = buildNativeOrchestration({
           goal: effectiveGoal,
-          currentTask: input.currentTask,
-          pending: input.pending,
+          currentTask: effectiveCurrentTask,
+          pending: effectivePending,
           mode: effectiveMode,
           phase: input.phase,
           verificationStatus: input.verificationStatus,
-          failureCount: input.failureCount,
+          failureCount: effectiveFailureCount,
           turn,
+          executionProfile: effectiveExecutionProfile,
+          fanoutCandidates: input.fanoutCandidates,
         });
+        const candidateMassUlw =
+          orchestration.massUlw.state === "fanout" && orchestration.massUlw.recommended
+            ? orchestration.massUlw as MassUlwPlan
+            : null;
         const roleProjectId = resolvedProjectId ?? currentSessionBeforeLoop.activeProjectId;
         if (roleProjectId) await autoSelectRoleForTask(ctx, roleProjectId, { mode: effectiveMode, goal: effectiveGoal });
         const activeRoleContext = roleProjectId ? await buildActiveRoleContext(ctx, roleProjectId) : null;
         const leasePreset = recommendedLeasePreset(effectiveMode, activeRoleContext?.rolePermission);
+        const massUlwLifecycle = resolvedProjectId
+          ? await (async () => {
+              const massEntry = await resolveOrThrow(ctx, { projectId: resolvedProjectId });
+              // MASS ULW execution is intentionally local-only. Do not try to
+              // canonicalize a remote executor path (for example C:\\JK\\...)
+              // on the OCI control plane; doing so breaks goal_loop before the
+              // remote task can even start.
+              if (isRemoteProject(massEntry)) return null;
+              return updateMassUlwLifecycle({
+                stateDir: ctx.stateDir,
+                identity: await createMassUlwExecutionIdentity({
+                  projectId: resolvedProjectId,
+                  repositoryRoot: massEntry.root,
+                  externalLoopId: loopId,
+                }),
+                candidatePlan: candidateMassUlw,
+                explicitFanoutDecision: input.fanoutCandidates !== undefined,
+                writeEnabled: leasePreset === "full-write",
+              });
+            })()
+          : null;
+        const executableMassUlw = massUlwLifecycle?.state === "approved" ? candidateMassUlw : null;
+        const safetyNextActions = effectiveSafety.executionKind === "workspace"
+          ? []
+          : !safetyGate.approvalReady
+            ? [
+                `Safety preflight is incomplete (${safetyGate.approvalBlockers.join(", ")}). Run read-only preflight and record safety evidence before requesting any approval or executing a release/runtime mutation.`,
+                "Record the exact execution target: machine, absolute project root, branch, dirty state, and runtime target.",
+                "Predeclare the full risky command chain in safety.approvalPlan; release/deploy work must also prove immutable-version collision status and rollback readiness before approval.",
+              ]
+            : !safetyGate.terminalReady
+              ? [
+                  `Safety completion proof is incomplete (${safetyGate.terminalBlockers.join(", ")}). Do not declare the goal done.`,
+                  "After the live change, prove runtime identity/behavior (PID or start-time/runtime marker plus endpoint or behavior verification) and record it in safety.runtimeProofEvidence.",
+                  "Resolve operational drift or keep it explicitly pending; warnings such as NeedDaemonReload must not be silently ignored.",
+                ]
+              : [];
         const nextActions = resolvedProjectId
           ? [
+              ...safetyNextActions,
               `Call project_select with projectId=${resolvedProjectId}${workSessionId ? `, workSessionId=${workSessionId}` : ""}, preset=${leasePreset}, reason=loop ${loopId} turn ${turn}.`,
               `Operate in JK-native ${orchestration.phase} phase with ${orchestration.primaryStage} as the primary workflow stage and ${orchestration.supportingStages.join(", ")} as supporting stages.`,
+              `Execution profile: requested=${orchestration.executionProfile.requested}, effective=${orchestration.executionProfile.effective}. ${orchestration.executionProfile.rationale}`,
+              "Treat the persisted goal contract as the parent objective. The latest user instruction refines or advances it unless the user explicitly replaces the goal.",
+              "Honor recorded decisions and settled constraints; do not ask the user to re-decide them unless new evidence creates a real conflict or a security/approval gate requires it.",
+              orchestration.massUlw.state === "evaluate"
+                ? "Mass ULW evaluation is warranted: identify 2-4 independently verifiable lanes, declare read/write scopes, dependencies, exclusive resources, and estimatedWeight (1-5), then call goal_loop with fanoutCandidates before broad patching."
+                : executableMassUlw
+                  ? `Mass ULW plan ${executableMassUlw.planFingerprint} approved and persisted with waves ${JSON.stringify(executableMassUlw.waves)}. Generate one Codex-style patch for every approved lane, then call mass_ulw_execute with this loopId, planFingerprint, workSessionId, lanePatches, safe per-lane verifier command IDs, and one final verifier command ID.`
+                  : orchestration.massUlw.state === "sequential"
+                    ? `Mass ULW stays sequential: ${orchestration.massUlw.rationale}`
+                    : "Mass ULW is inactive for this turn; use the normal single-lane workflow.",
               orchestration.phase === "recovery"
                 ? orchestration.recoveryPolicy
                 : "Call project_rules and project_status if they are not already fresh in this chat, then read the smallest relevant context slice.",
@@ -2268,16 +2769,27 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             ];
         const doneRule =
           "Stop only when the requested work is implemented and verified, a real blocker is proven, or a security/approval gate is hit.";
-        const pendingWasExplicitlyCleared = Array.isArray(input.pending) && input.pending.length === 0;
-        const terminalSuccess = input.phase === "release" && input.verificationStatus === "pass" && pendingWasExplicitlyCleared;
+        const terminalRequested = input.phase === "release" && input.verificationStatus === "pass" && Array.isArray(input.pending) && input.pending.length === 0;
+        const pendingWasExplicitlyCleared = terminalRequested && effectivePending.length === 0;
+        const terminalCandidate = terminalRequested && pendingWasExplicitlyCleared;
+        const terminalSuccess = terminalCandidate && safetyGate.terminalReady;
         const terminalFailure = input.verificationStatus === "blocked" && pendingWasExplicitlyCleared;
         const terminal = terminalSuccess || terminalFailure;
+        if (terminalSuccess && massUlwLifecycle?.executable) {
+          await cleanupReconciledMassUlwTerminal({
+            stateDir: ctx.stateDir,
+            executionId: massUlwLifecycle.executionId,
+            projectId: resolvedProjectId!,
+            externalLoopId: loopId,
+          });
+        }
         const payload = {
           loopId,
           goalPreview: effectiveGoal ? redact(effectiveGoal).slice(0, 1000) : undefined,
           projectId: resolvedProjectId,
           workSessionId,
           mode: effectiveMode,
+          executionProfile: effectiveExecutionProfile,
           maxTurns,
           turns: [
             ...existingTurns,
@@ -2288,9 +2800,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               currentTask: input.currentTask ? redact(input.currentTask).slice(0, 500) : undefined,
               phase: input.phase,
               verificationStatus: input.verificationStatus,
-              failureCount: input.failureCount,
+              failureCount: effectiveFailureCount,
+              executionProfile: orchestration.executionProfile,
               completed: input.completed?.map((item) => redact(item).slice(0, 500)),
-              pending: input.pending?.map((item) => redact(item).slice(0, 500)),
+              pending: effectivePending.map((item) => redact(item).slice(0, 500)),
+              safety: effectiveSafety,
+              safetyGate,
               decisions: input.decisions?.map((decision) => ({
                 summary: redact(decision.summary).slice(0, 500),
                 rationale: decision.rationale ? redact(decision.rationale).slice(0, 1000) : undefined,
@@ -2308,10 +2823,33 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               ...(input.currentTask !== undefined ? { currentTask: input.currentTask } : {}),
               ...(input.lastResult !== undefined ? { lastProgressSummary: input.lastResult } : {}),
               ...(input.completed !== undefined ? { completed: input.completed } : {}),
-              ...(input.pending !== undefined ? { pending: input.pending } : {}),
+              pending: effectivePending,
               ...(input.decisions !== undefined ? { decisions: input.decisions } : {}),
+              executionSafety: effectiveSafety,
+              inferredExecutionKind,
             })
           : undefined;
+        const intentContext = taskState
+          ? {
+              goalContract: taskState.currentGoal,
+              currentTask: taskState.currentTask,
+              pending: taskState.pending,
+              decisions: taskState.decisions,
+              executionSafety: taskState.executionSafety,
+              safetyGate: buildTaskSafetyGate(taskState.executionSafety),
+              instruction:
+                "Preserve the goal contract across turns. Interpret the newest instruction inside that goal and recorded decisions unless the user explicitly changes the objective.",
+            }
+          : {
+              goalContract: effectiveGoal ?? null,
+              currentTask: effectiveCurrentTask ?? null,
+              pending: effectivePending ?? [],
+              decisions: [],
+              executionSafety: effectiveSafety,
+              safetyGate,
+              instruction:
+                "Preserve the goal contract across turns. Interpret the newest instruction inside that goal unless the user explicitly changes the objective.",
+            };
         let terminalPushResult: "delivered" | "duplicate" | "failed" | null = null;
         if (resolvedProjectId && terminalSuccess) {
           terminalPushResult = await sendJkPushOnce(
@@ -2336,8 +2874,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             terminal,
             terminalStatus: terminalSuccess ? "succeeded" : terminalFailure ? "blocked" : null,
             terminalPushResult,
+            terminalBlockedBySafety: terminalRequested && (!pendingWasExplicitlyCleared || !safetyGate.terminalReady),
+            safety: effectiveSafety,
+            safetyGate,
             taskState,
+            intentContext,
             orchestration,
+            massUlwLifecycle,
             activeRoleContext,
             recommendedLeasePreset: leasePreset,
             nextActions,
@@ -2345,7 +2888,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "Do one small inspect/edit/verify batch per action round.",
               "Keep each tool call short; avoid silent long thinking turns.",
               orchestration.verificationGate,
+              effectiveSafety.executionKind === "workspace"
+                ? "Workspace-only work uses the normal verification gate."
+                : "Safety Contract: preflight and exact execution-target proof must pass before approvals; runtime proof and zero unresolved operational drift are required before terminal success.",
               orchestration.recoveryPolicy,
+              orchestration.executionProfile.effective === "fast"
+                ? "Fast profile: use the narrowest relevant context, one coherent patch, and one targeted verification; do not broaden into audit/fan-out work without new evidence."
+                : orchestration.executionProfile.effective === "max"
+                  ? "Max profile: optimize for completion speed and success rate by widening independent read-only/QA coverage early, fan out only through the deterministic safety gate, then integrate once and run regression verification."
+                  : "Auto profile: stay balanced and let JK promote tiny tasks to Fast or broad/high-impact tasks to Max from current task shape and intent.",
+              "Mass ULW may execute only after JK's deterministic gate approves and persists its fingerprint. Valid acyclic dependencies become ordered waves; only unsafe overlap between incomparable lanes, shared exclusive resources, cycles, malformed dependencies, or excessive lane count block fan-out.",
+              "Preserve the persisted goal contract and decision ledger across turns; do not collapse the task to only the newest literal command.",
+              "Do not re-ask settled non-security choices. Ask only when execution is genuinely blocked, requirements conflict, or a required security/approval boundary is reached.",
               doneRule,
               "This is JK-native orchestration driven by the current ChatGPT web session. It does not require a separate model/provider credential; OMO is optional.",
             ],
@@ -2628,7 +3182,6 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             { preset },
           );
         }
-        const lease = makeLease(entry, preset);
         const updatedSession = await updateSessionState(ctx, async (session) => {
           if (
             session.activeProjectId &&
@@ -2643,6 +3196,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               { activeProjectId: session.activeProjectId, required: "confirmSwitch" },
             );
           }
+          const lease = preset === "control"
+            ? makeLease(entry, preset)
+            : renewLease(entry, preset, session.lease ?? undefined);
           return {
             ...session,
             activeProjectId: entry.projectId,
@@ -2650,6 +3206,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             lease,
           };
         });
+        const lease = updatedSession.lease;
+        if (!lease) {
+          throw new DomainError(ErrorCode.LEASE_REQUIRED, "project_select did not persist an active lease", {
+            projectId: entry.projectId,
+          });
+        }
         const rankedCandidates = input.resumeHint
           ? rankWorkSessions(updatedSession, entry.projectId, input.resumeHint, 3)
           : [];
@@ -2915,6 +3477,29 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             hasCodeBrain: entry.hasCodeBrain ?? false,
           },
           `Project ${entry.name}: branch=${status.branch || "n/a"}, ${status.dirtyFiles.length} dirty file(s).`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "seo_geo_audit",
+    {
+      title: "Audit a public URL for SEO and GEO readiness",
+      description:
+        "Fetch a public http(s) page through JK's SSRF/DNS-rebinding guard and return an evidence-backed SEO + GEO readiness audit. Checks metadata, crawlability, sitemap/robots, JSON-LD, content structure, provenance, and citability. Scores are heuristics, not ranking or AI-citation guarantees.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Auditing SEO/GEO readiness...", "SEO/GEO audit complete"),
+      inputSchema: {
+        url: z.string().url(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "seo_geo_audit", input, async () => {
+        const audit = await auditSeoGeoUrl(input.url);
+        return makeResult(
+          { ...audit },
+          `SEO/GEO readiness ${audit.score.total}/100 (${audit.score.grade}); ${audit.priorities.length} prioritized improvement(s).`,
         );
       });
     },
@@ -3542,7 +4127,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       },
     },
     async (input) => {
-      return withErrorMapping(ctx, "command_run", input, async () => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "command_run", input, async () => {
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const commandsForPolicy = isRemoteProject(entry)
           ? (await dispatchExecutorJob<{ commands: Awaited<ReturnType<typeof listCommands>> }>(
@@ -3555,6 +4140,152 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const commandForPolicy = commandsForPolicy.find((c) => c.commandId === input.commandId);
         const capability = commandForPolicy?.riskTier === "verify" ? "verify" : commandForPolicy?.riskTier === "read" ? "read" : "remote";
         await requireProjectLease(ctx, input.projectId, capability);
+        if (commandForPolicy?.riskTier === "destructive" || commandForPolicy?.riskTier === "network") {
+          const session = await loadSession(ctx);
+          const workContext = getWorkContext(session, input.projectId, input.workSessionId);
+          const taskState = workContext?.taskState;
+          const approvalWorkSessionId = input.workSessionId ?? workContext?.workSessionId;
+          const taskIdentity = taskApprovalIdentity({
+            goalId: taskState?.goalId,
+            loopId: taskState?.loopId,
+            workSessionId: approvalWorkSessionId,
+            leaseId: session.lease?.projectId === input.projectId && session.lease.expiresAt > Date.now() ? session.lease.leaseId : undefined,
+          });
+          const continuation = taskState && (taskState.goalId || taskState.loopId)
+            ? {
+                workSessionId: approvalWorkSessionId ?? null,
+                goalId: taskState.goalId,
+                loopId: taskState.loopId,
+              }
+            : null;
+          const needsNetwork = commandForPolicy.riskTier === "network" || Boolean(input.intent?.needsNetwork);
+          const destructive = commandForPolicy.riskTier === "destructive";
+          const approvalCommand = `command_run ${JSON.stringify({
+            commandId: input.commandId,
+            args: input.args ?? [],
+            manifestFingerprint: commandForPolicy.manifestFingerprint,
+          })}`;
+          const approvalReason = `Run allowlisted project command ${input.commandId}`;
+          const jobInput = {
+            projectId: input.projectId,
+            command: approvalCommand,
+            executionKind: "command-run" as const,
+            reason: approvalReason,
+            taskIdentity,
+            workSessionId: approvalWorkSessionId,
+            needsNetwork,
+            destructive,
+            writesWorkspace: input.intent?.writesWorkspace,
+          };
+          const reusableJob = await findReusableLocalShellJob(ctx.stateDir, jobInput);
+          if (reusableJob) {
+            if (reusableJob.continuation) {
+              const continuationStatus = reusableJob.status === "pending"
+                ? "waiting-approval"
+                : reusableJob.status === "running"
+                  ? "running"
+                  : reusableJob.status === "succeeded"
+                    ? "ready-to-resume"
+                    : "blocked";
+              await recordTaskContinuation(
+                ctx,
+                input.projectId,
+                reusableJob.continuation.workSessionId ?? undefined,
+                { jobId: reusableJob.id, status: continuationStatus, updatedAt: Date.now() },
+              );
+            }
+            if (reusableJob.status === "pending") {
+              throw new DomainError(
+                ErrorCode.APPROVAL_REQUIRED,
+                "This exact project command is already waiting for local approval. Reuse the existing job; do not create or retry the command.",
+                {
+                  approvalId: reusableJob.id,
+                  jobId: reusableJob.id,
+                  expiresAt: reusableJob.expiresAt,
+                  approvalReused: "existing-job",
+                },
+              );
+            }
+            if (reusableJob.status === "running") {
+              return makeResult(
+                { jobId: reusableJob.id, status: reusableJob.status, reusedJob: true },
+                "The previously approved project command is already running. Do not reissue it; continue from this job result when it completes.",
+              );
+            }
+            if (reusableJob.status === "succeeded") {
+              return makeResult(
+                {
+                  exitCode: reusableJob.exitCode ?? 0,
+                  stdoutSummary: reusableJob.stdoutSummary ?? "",
+                  stderrSummary: reusableJob.stderrSummary ?? "",
+                  durationMs: reusableJob.durationMs ?? 0,
+                  outputTruncated: false,
+                  jobId: reusableJob.id,
+                  reusedJob: true,
+                },
+                "Reused the completed result of the same approved project command; the command was not executed again.",
+              );
+            }
+            throw new DomainError(
+              ErrorCode.COMMAND_FAILED,
+              "The same approved project command already failed. Inspect its stored result before deciding on a different command; do not request approval again.",
+              {
+                jobId: reusableJob.id,
+                exitCode: reusableJob.exitCode ?? null,
+                stdoutSummary: reusableJob.stdoutSummary ?? "",
+                stderrSummary: reusableJob.stderrSummary ?? "",
+                error: reusableJob.error ?? null,
+              },
+            );
+          }
+          const approvalInput = {
+            projectId: input.projectId,
+            command: approvalCommand,
+            reason: approvalReason,
+            taskIdentity,
+            workSessionId: approvalWorkSessionId,
+            needsNetwork,
+            destructive,
+          };
+          const pending = await requestLocalShellApproval(ctx.stateDir, approvalInput);
+          if (pending.status === "denied") {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "This exact project command was denied by the local owner", {
+              approvalId: pending.id,
+            });
+          }
+          const queuedJob = await queueLocalShellJob(ctx.stateDir, pending, {
+            command: approvalCommand,
+            executionKind: "command-run",
+            commandId: input.commandId,
+            args: input.args,
+            manifestFingerprint: commandForPolicy.manifestFingerprint,
+            reason: approvalReason,
+            taskIdentity,
+            workSessionId: approvalWorkSessionId,
+            needsNetwork,
+            destructive,
+            timeoutSec: input.intent?.expectedDurationSec,
+            writesWorkspace: input.intent?.writesWorkspace,
+            continuation,
+          });
+          if (queuedJob.continuation) {
+            await recordTaskContinuation(
+              ctx,
+              input.projectId,
+              queuedJob.continuation.workSessionId ?? undefined,
+              { jobId: queuedJob.id, status: "waiting-approval", updatedAt: Date.now() },
+            );
+          }
+          throw new DomainError(
+            ErrorCode.APPROVAL_REQUIRED,
+            "This allowlisted project command requires local approval in the JK Control Center. Approving it starts this exact pinned command job automatically; do not reissue the command.",
+            {
+              approvalId: pending.id,
+              jobId: queuedJob.id,
+              expiresAt: pending.expiresAt,
+            },
+          );
+        }
         await ctx.ledger.append({
           type: "process.started",
           projectId: input.projectId,
@@ -3612,7 +4343,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run local project shell",
       description:
-        "Run an arbitrary local shell command inside the selected project, Codex-style. Use when allowlisted command_run is too limited. Project-confined; output is redacted; secret-path and OS-destructive commands are blocked. Approval-required calls are queued: once the owner approves in JK Control Center, that queued job executes automatically. Do not call local_shell_run again merely to consume an approval; inspect the queued job/task continuation instead. For a known multi-step risky task, predeclare the exact follow-up commands in intent.approvalBundle so one owner approval can cover only that bounded task bundle. Approval UX rule: never tell the user that an approval is pending, visible, or ready to click unless this tool result explicitly contains structuredContent.approvalPending=true. APPROVAL_REQUIRED with approvalPending=false, a blocked/skipped call, timeout, unavailable tool, or missing result is NOT proof that anything appeared in Control Center.",
+        "Run an arbitrary local shell command inside the selected project, Codex-style. Use when allowlisted command_run is too limited. Project-confined; output is redacted; secret-path and OS-destructive commands are blocked. For a known multi-step risky task, predeclare the exact follow-up commands in intent.approvalBundle so one owner approval can cover only that bounded task bundle. Approval UX rule: never tell the user that an approval is pending, visible, or ready to click unless this tool result explicitly contains structuredContent.approvalPending=true. APPROVAL_REQUIRED with approvalPending=false, a blocked/skipped call, timeout, unavailable tool, or missing result is NOT proof that anything appeared in Control Center.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running local shell...", "Local shell finished"),
       inputSchema: {
@@ -3639,28 +4370,41 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       },
     },
     async (input) => {
-      return withErrorMapping(ctx, "local_shell_run", input, async () => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "local_shell_run", input, async () => {
         await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
         const session = await loadSession(ctx);
         const workContext = getWorkContext(session, input.projectId, input.workSessionId);
         const taskState = workContext?.taskState;
-        const approvalTaskIdentity = taskState?.goalId
-          ? `goal:${taskState.goalId}`
-          : taskState?.loopId
-            ? `loop:${taskState.loopId}`
-            : input.workSessionId
-              ? `work-session:${input.workSessionId}`
-              : undefined;
+        const approvalWorkSessionId = input.workSessionId ?? workContext?.workSessionId;
+        const approvalTaskIdentity = taskApprovalIdentity({
+          goalId: taskState?.goalId,
+          loopId: taskState?.loopId,
+          workSessionId: approvalWorkSessionId,
+          leaseId: session.lease?.projectId === input.projectId && session.lease.expiresAt > Date.now() ? session.lease.leaseId : undefined,
+        });
         const detectedRisk = inspectShellCommand(input.command);
+        const commandExecutionKind = inferCommandExecutionKind(input.command);
+        const persistedSafety = taskState?.executionSafety ?? makeDefaultTaskSafety();
+        const requiredExecutionKind = strongerExecutionKind(persistedSafety.executionKind, commandExecutionKind);
+        const commandSafety = mergeTaskSafety(persistedSafety, { executionKind: requiredExecutionKind }, requiredExecutionKind);
+        const commandSafetyGate = buildTaskSafetyGate(commandSafety);
         const approvalNeedsNetwork = Boolean(input.intent?.needsNetwork || detectedRisk.needsNetwork);
         const approvalDestructive = Boolean(input.intent?.destructive || detectedRisk.destructive);
-        const requestedBundleCommands = input.intent?.approvalBundle && approvalTaskIdentity
-          ? [...new Set([input.command, ...input.intent.approvalBundle.commands])].slice(0, 20)
+        const explicitApprovalBundle = input.intent?.approvalBundle;
+        const plannedBundleCommands =
+          approvalTaskIdentity &&
+          !explicitApprovalBundle &&
+          requiredExecutionKind !== "workspace" &&
+          commandSafetyGate.approvalReady
+            ? commandSafety.approvalPlan
+            : [];
+        const requestedBundleCommands = approvalTaskIdentity && (explicitApprovalBundle || plannedBundleCommands.length > 0)
+          ? [...new Set([input.command, ...(explicitApprovalBundle?.commands ?? plannedBundleCommands)])].slice(0, 20)
           : [];
         const approvalBundle = requestedBundleCommands.length
           ? {
-              label: input.intent!.approvalBundle!.label,
-              ttlMs: (input.intent!.approvalBundle!.ttlMinutes ?? 30) * 60 * 1000,
+              label: explicitApprovalBundle?.label ?? `${requiredExecutionKind} task approval plan`,
+              ttlMs: (explicitApprovalBundle?.ttlMinutes ?? 30) * 60 * 1000,
               entries: requestedBundleCommands.map((command) => {
                 if (command === input.command) {
                   return { command, needsNetwork: approvalNeedsNetwork, destructive: approvalDestructive };
@@ -3673,12 +4417,32 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const maintenanceScope = isJkMaintenanceCommand(input.command)
           ? { key: "maintenance:jk:runtime-reload", label: "JK runtime maintenance", ttlMs: 15 * 60 * 1000 }
           : undefined;
+        if (!maintenanceScope && isReleaseShellCommand(input.command)) {
+          const schemaHealth = await getRuntimeSchemaHealth();
+          if (schemaHealth.releaseBlocked) {
+            throw new DomainError(
+              ErrorCode.RUNTIME_SCHEMA_MISMATCH,
+              "Release command blocked because the running JK source/build/tool schema fingerprints do not agree. Upgrade/reload JK first, then verify the registered goal_loop schema before retrying the release.",
+              {
+                schemaStatus: schemaHealth.status,
+                reasons: schemaHealth.reasons,
+                missingGoalLoopInputFields: schemaHealth.missingGoalLoopInputFields,
+                toolSchemaFingerprint: schemaHealth.toolSchemaFingerprint,
+                sourceFingerprint: schemaHealth.sourceFingerprint,
+                expectedSourceFingerprint: schemaHealth.expectedSourceFingerprint,
+                buildFingerprint: schemaHealth.buildFingerprint,
+                expectedBuildFingerprint: schemaHealth.expectedBuildFingerprint,
+              },
+            );
+          }
+        }
         const approvalInput = {
           projectId: input.projectId,
           command: input.command,
           cwd: input.cwd,
           reason: input.intent?.reason,
           taskIdentity: approvalTaskIdentity,
+          workSessionId: approvalWorkSessionId,
           needsNetwork: approvalNeedsNetwork,
           destructive: approvalDestructive,
           bundle: approvalBundle,
@@ -3715,35 +4479,150 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             !trustedOwnerRoutineNetwork &&
             !autonomousCloudInventory &&
             !autonomousScopedRead);
-        let approved = requiresApproval ? await consumeLocalShellApproval(ctx.stateDir, approvalInput) : false;
+        const continuationContext = getWorkContext(session, input.projectId, input.workSessionId);
+        const continuationTask = continuationContext?.taskState;
+        const continuation =
+          continuationTask && (continuationTask.goalId || continuationTask.loopId)
+            ? {
+                workSessionId: input.workSessionId ?? continuationContext?.workSessionId ?? null,
+                goalId: continuationTask.goalId,
+                loopId: continuationTask.loopId,
+              }
+            : null;
+        if (requiresApproval && requiredExecutionKind !== "workspace") {
+          if (!commandSafetyGate.approvalReady) {
+            throw new DomainError(
+              ErrorCode.COMMAND_NOT_ALLOWED,
+              `Safety preflight must pass before creating an approval for ${requiredExecutionKind} work`,
+              { safetyBlockers: commandSafetyGate.approvalBlockers, approvalPending: false },
+            );
+          }
+          if (!approvalPlanContains(commandSafety, input.command)) {
+            throw new DomainError(
+              ErrorCode.COMMAND_NOT_ALLOWED,
+              "This risky command was not predeclared in the goal_loop safety approval plan",
+              { approvalPending: false },
+            );
+          }
+          if (commandSafety.approvalPlan.length > 1) {
+            const bundled = new Set(requestedBundleCommands);
+            const missing = commandSafety.approvalPlan.filter((command) => !bundled.has(command));
+            if (missing.length > 0) {
+              throw new DomainError(
+                ErrorCode.COMMAND_NOT_ALLOWED,
+                "The approval bundle must include the complete predeclared risky command chain",
+                { missingApprovalPlanCommands: missing, approvalPending: false },
+              );
+            }
+          }
+        }
+        if (requiresApproval) {
+          const reusableJob = await findReusableLocalShellJob(ctx.stateDir, {
+            projectId: input.projectId,
+            command: input.command,
+            cwd: input.cwd,
+            reason: input.intent?.reason,
+            taskIdentity: approvalTaskIdentity,
+            workSessionId: approvalWorkSessionId,
+            needsNetwork: approvalNeedsNetwork,
+            destructive: approvalDestructive,
+            writesWorkspace: input.intent?.writesWorkspace,
+          });
+          if (reusableJob) {
+            if (reusableJob.continuation) {
+              const continuationStatus = reusableJob.status === "pending"
+                ? "waiting-approval"
+                : reusableJob.status === "running"
+                  ? "running"
+                  : reusableJob.status === "succeeded"
+                    ? "ready-to-resume"
+                    : "blocked";
+              await recordTaskContinuation(
+                ctx,
+                input.projectId,
+                reusableJob.continuation.workSessionId ?? undefined,
+                { jobId: reusableJob.id, status: continuationStatus, updatedAt: Date.now() },
+              );
+            }
+            if (reusableJob.status === "pending") {
+              const pendingApproval = approvalBundle
+                ? await requestLocalShellApproval(ctx.stateDir, approvalInput)
+                : null;
+              throw new DomainError(
+                ErrorCode.APPROVAL_REQUIRED,
+                "This exact local shell request is already waiting for local approval. Reuse the existing job; do not create or retry the command.",
+                {
+                  approvalId: pendingApproval?.id ?? reusableJob.id,
+                  jobId: reusableJob.id,
+                  expiresAt: pendingApproval?.expiresAt ?? reusableJob.expiresAt,
+                  approvalReused: "existing-job",
+                  ...(pendingApproval?.bundleFingerprint
+                    ? { bundleFingerprint: pendingApproval.bundleFingerprint }
+                    : {}),
+                },
+              );
+            }
+            if (reusableJob.status === "running") {
+              return makeResult(
+                { jobId: reusableJob.id, status: reusableJob.status, reusedJob: true },
+                "The previously approved job is already running. Do not reissue the command; continue from this job result when it completes.",
+              );
+            }
+            if (reusableJob.status === "succeeded") {
+              return makeResult(
+                {
+                  cwd: reusableJob.cwd,
+                  exitCode: reusableJob.exitCode ?? 0,
+                  stdoutSummary: reusableJob.stdoutSummary ?? "",
+                  stderrSummary: reusableJob.stderrSummary ?? "",
+                  durationMs: reusableJob.durationMs ?? 0,
+                  outputTruncated: false,
+                  jobId: reusableJob.id,
+                  reusedJob: true,
+                },
+                "Reused the completed result of the same approved job; the command was not executed again.",
+              );
+            }
+            throw new DomainError(
+              ErrorCode.COMMAND_FAILED,
+              "The same approved job already failed. Inspect its stored result before deciding on a different command; do not request approval again.",
+              {
+                jobId: reusableJob.id,
+                exitCode: reusableJob.exitCode ?? null,
+                stdoutSummary: reusableJob.stdoutSummary ?? "",
+                stderrSummary: reusableJob.stderrSummary ?? "",
+                error: reusableJob.error ?? null,
+              },
+            );
+          }
+        }
+        const approvalGrant = requiresApproval
+          ? await consumeLocalShellApprovalGrant(ctx.stateDir, approvalInput)
+          : null;
+        const approved = Boolean(approvalGrant);
         if (requiresApproval && !approved) {
           const pending = await requestLocalShellApproval(ctx.stateDir, approvalInput);
+          const reusedPendingBundle = pending.id !== localShellApprovalId(approvalInput);
           if (pending.status === "denied") {
             throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "This exact local shell request was denied by the local owner", {
               approvalId: pending.id,
             });
           }
-          const continuationContext = getWorkContext(session, input.projectId, input.workSessionId);
-          const continuationTask = continuationContext?.taskState;
-          const continuation =
-            continuationTask && (continuationTask.goalId || continuationTask.loopId)
-              ? {
-                  workSessionId: input.workSessionId ?? continuationContext?.workSessionId ?? null,
-                  goalId: continuationTask.goalId,
-                  loopId: continuationTask.loopId,
-                }
-              : null;
-          const queuedJob = await queueLocalShellJob(ctx.stateDir, pending, {
-            command: input.command,
-            cwd: input.cwd,
-            reason: input.intent?.reason,
-            needsNetwork: approvalInput.needsNetwork,
-            destructive: approvalInput.destructive,
-            timeoutSec: input.timeoutSec,
-            writesWorkspace: input.intent?.writesWorkspace,
-            continuation,
-          });
-          if (queuedJob.continuation) {
+          const queuedJob = reusedPendingBundle
+            ? await readLocalShellJob(ctx.stateDir, pending.id)
+            : await queueLocalShellJob(ctx.stateDir, pending, {
+                command: input.command,
+                cwd: input.cwd,
+                reason: input.intent?.reason,
+                taskIdentity: approvalInput.taskIdentity,
+                workSessionId: approvalWorkSessionId,
+                needsNetwork: approvalInput.needsNetwork,
+                destructive: approvalInput.destructive,
+                timeoutSec: input.timeoutSec,
+                writesWorkspace: input.intent?.writesWorkspace,
+                continuation,
+              });
+          if (queuedJob?.continuation) {
             await recordTaskContinuation(
               ctx,
               input.projectId,
@@ -3754,24 +4633,60 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           throw new DomainError(
             ErrorCode.APPROVAL_REQUIRED,
             pending.bundleLabel
-              ? `This local shell request is queued for local approval. Approving it automatically runs the queued job and authorizes only the ${pending.bundleCommandKeys?.length ?? 0} predeclared command+risk hashes in task bundle ${pending.bundleLabel}. Do not retry the same command after approval.`
+              ? `This local shell request requires local approval. Approving it authorizes only the ${pending.bundleCommandKeys?.length ?? 0} predeclared command+risk hashes in task bundle ${pending.bundleLabel}.`
               : pending.scopeLabel
-              ? `This local shell request is queued for local approval. Approving it automatically runs the queued job and opens a short scoped session for ${pending.scopeLabel}. Do not retry the same command after approval.`
-              : "This exact local shell request is queued for local approval in the JK Control Center. Approval automatically runs the queued job; do not retry the same command after approval.",
+              ? `This local shell request requires local approval. Approving it opens a short scoped session for ${pending.scopeLabel}.`
+              : "This exact local shell request requires local approval in the JK Control Center",
             {
               approvalId: pending.id,
+              jobId: queuedJob?.id ?? pending.id,
               expiresAt: pending.expiresAt,
-              queued: true,
-              autoRunsAfterApproval: true,
               scopeLabel: pending.scopeLabel ?? null,
               scopeTtlMs: pending.scopeTtlMs ?? null,
               bundleLabel: pending.bundleLabel ?? null,
               bundleCount: pending.bundleCommandKeys?.length ?? 0,
               bundleTtlMs: pending.bundleTtlMs ?? null,
+              approvalReused: reusedPendingBundle ? "task-bundle" : null,
             },
           );
         }
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const bundleJob = approvalGrant?.source === "task-bundle"
+          ? await queueLocalShellJob(
+              ctx.stateDir,
+              {
+                id: approvalGrant.approvalId,
+                projectId: input.projectId,
+                workSessionId: approvalGrant.workSessionId ?? undefined,
+                bundleFingerprint: approvalGrant.bundleFingerprint,
+                createdAt: approvalGrant.createdAt,
+                expiresAt: approvalGrant.expiresAt,
+              },
+              {
+                command: input.command,
+                cwd: input.cwd,
+                reason: input.intent?.reason,
+                taskIdentity: approvalTaskIdentity,
+                workSessionId: approvalGrant.workSessionId,
+                approvalId: approvalGrant.approvalId,
+                bundleFingerprint: approvalGrant.bundleFingerprint,
+                needsNetwork: approvalNeedsNetwork,
+                destructive: approvalDestructive,
+                timeoutSec: input.timeoutSec,
+                writesWorkspace: input.intent?.writesWorkspace,
+                continuation,
+              },
+            )
+          : null;
+        if (bundleJob) {
+          await updateLocalShellJob(ctx.stateDir, bundleJob.id, (current) => ({
+            ...current,
+            status: "running",
+            runnerInstanceId: localShellRunnerInstanceId(),
+            interruptedByRestart: false,
+            startedAt: Date.now(),
+          }));
+        }
         await ctx.ledger.append({
           type: "process.started",
           projectId: input.projectId,
@@ -3785,24 +4700,48 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           autonomousScopedRead ||
           (approved && approvalInput.needsNetwork);
         const approvedDestructive = approved && approvalInput.destructive;
-        const result = isRemoteProject(entry)
-          ? await dispatchExecutorJob<Awaited<ReturnType<typeof runLocalShell>>>(
-              ctx.stateDir,
-              entry.executorId,
-              "local_shell_run",
-              remotePayload(entry, {
-                command: input.command,
-                cwd: input.cwd,
-                timeoutSec: input.timeoutSec,
-                approvedNeedsNetwork,
-                approvedDestructive,
-              }),
-              Math.max(60_000, (input.timeoutSec ?? 30) * 1_000 + 10_000),
-            )
-          : await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec, {
-              needsNetwork: approvedNeedsNetwork,
-              destructive: approvedDestructive,
-            });
+        let result: Awaited<ReturnType<typeof runLocalShell>>;
+        try {
+          result = isRemoteProject(entry)
+            ? await dispatchExecutorJob<Awaited<ReturnType<typeof runLocalShell>>>(
+                ctx.stateDir,
+                entry.executorId,
+                "local_shell_run",
+                remotePayload(entry, {
+                  command: input.command,
+                  cwd: input.cwd,
+                  timeoutSec: input.timeoutSec,
+                  approvedNeedsNetwork,
+                  approvedDestructive,
+                }),
+                Math.max(60_000, (input.timeoutSec ?? 30) * 1_000 + 10_000),
+              )
+            : await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec, {
+                needsNetwork: approvedNeedsNetwork,
+                destructive: approvedDestructive,
+              });
+        } catch (error) {
+          if (bundleJob) {
+            await updateLocalShellJob(ctx.stateDir, bundleJob.id, (current) => ({
+              ...current,
+              status: "failed",
+              finishedAt: Date.now(),
+              error: redact(error instanceof Error ? error.message : "Local shell job failed"),
+            }));
+          }
+          throw error;
+        }
+        if (bundleJob) {
+          await updateLocalShellJob(ctx.stateDir, bundleJob.id, (current) => ({
+            ...current,
+            status: result.exitCode === 0 ? "succeeded" : "failed",
+            finishedAt: Date.now(),
+            exitCode: result.exitCode,
+            stdoutSummary: redact(result.stdoutSummary),
+            stderrSummary: redact(result.stderrSummary),
+            durationMs: result.durationMs,
+          }));
+        }
         if (!input.intent?.writesWorkspace) {
           await recordVerification(ctx, input.projectId, input.workSessionId, {
             tool: "local_shell_run",
@@ -3826,8 +4765,187 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             stderrSummary: result.stderrSummary,
             durationMs: result.durationMs,
             outputTruncated: result.outputTruncated,
+            jobId: bundleJob?.id,
           },
           `Local shell exited ${result.exitCode} in ${result.durationMs}ms.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "runtime_upgrade",
+    {
+      title: "Upgrade or reload JK runtime",
+      description:
+        "Fixed bootstrap primitive for replacing/reloading the JK runtime without depending on release safety-schema fields. It only runs JK's repository-owned rollback-capable reload script, requires a full-write lease plus one explicit owner approval in the authoritative JK Control Center, supports the local runtime and remote Windows executor targets, and can recover from a stale tool schema without accepting arbitrary commands.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Preparing JK runtime upgrade...", "JK runtime upgrade queued"),
+      inputSchema: {
+        projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "runtime_upgrade", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "write");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        let command: string;
+        let completionProof: LocalShellJobCompletionProof | null = null;
+        if (isRemoteProject(entry)) {
+          const executor = (await listExecutorStatus(ctx.stateDir)).find((candidate) => candidate.executorId === entry.executorId);
+          if (!executor?.online) {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `Executor is offline: ${entry.executorId}`, { executorId: entry.executorId });
+          }
+          if (!executor.platform.toLowerCase().startsWith("win32")) {
+            throw new DomainError(
+              ErrorCode.COMMAND_NOT_ALLOWED,
+              "remote runtime_upgrade currently supports the Windows JK executor only",
+              { executorId: entry.executorId, platform: executor.platform },
+            );
+          }
+          completionProof = {
+            kind: "executor-reconnect",
+            executorId: entry.executorId,
+            previousInstanceId: executor.instanceId ?? null,
+            requiredHeartbeats: 3,
+            timeoutMs: 60_000,
+            requiredCapabilities: ["git_sync_start"],
+          };
+          for (const rel of ["src/server/tools.ts", "scripts/reload-jk-runtime.ps1"]) {
+            await dispatchExecutorJob<WorkContextSlice>(
+              ctx.stateDir,
+              entry.executorId,
+              "file_read_slice",
+              remotePayload(entry, { path: rel, start: 1, end: 1 }),
+            ).catch(() => {
+              throw new DomainError(
+                ErrorCode.COMMAND_NOT_ALLOWED,
+                "runtime_upgrade is restricted to a Windows JK/chatgpt2codex checkout with the fixed reload script",
+                { projectId: input.projectId, executorId: entry.executorId, missing: rel },
+              );
+            });
+          }
+          command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root . -ExecutorOnly";
+        } else {
+          const windowsScript = path.join(entry.root, "scripts", "reload-jk-runtime.ps1");
+          const unixScript = path.join(entry.root, "scripts", "reload-jk-runtime.sh");
+          const sourceMarker = path.join(entry.root, "src", "server", "tools.ts");
+          await fs.access(sourceMarker).catch(() => {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "runtime_upgrade is restricted to the JK/chatgpt2codex source project");
+          });
+          const script = process.platform === "win32" ? windowsScript : unixScript;
+          await fs.access(script).catch(() => {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "The fixed JK runtime reload script is missing", { script });
+          });
+          command = process.platform === "win32"
+            ? "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root ."
+            : "bash scripts/reload-jk-runtime.sh";
+        }
+        const session = await loadSession(ctx);
+        const workContext = getWorkContext(session, input.projectId, input.workSessionId);
+        const taskState = workContext?.taskState;
+        const approvalWorkSessionId = input.workSessionId ?? workContext?.workSessionId;
+        const taskIdentity = taskApprovalIdentity({
+          goalId: taskState?.goalId,
+          loopId: taskState?.loopId,
+          workSessionId: approvalWorkSessionId,
+          leaseId: session.lease?.projectId === input.projectId && session.lease.expiresAt > Date.now() ? session.lease.leaseId : undefined,
+        });
+        const continuation = taskState && (taskState.goalId || taskState.loopId)
+          ? {
+              workSessionId: approvalWorkSessionId ?? null,
+              goalId: taskState.goalId,
+              loopId: taskState.loopId,
+            }
+          : null;
+        const jobInput = {
+          projectId: input.projectId,
+          command,
+          cwd: undefined,
+          reason: isRemoteProject(entry)
+            ? "Reload the remote Windows JK runtime through the central rollback-capable runtime_upgrade primitive"
+            : "Reload JK runtime through the fixed rollback-capable runtime_upgrade primitive",
+          taskIdentity,
+          workSessionId: approvalWorkSessionId,
+          needsNetwork: false,
+          destructive: true,
+          writesWorkspace: false,
+          completionProof,
+        };
+        const reusable = await findReusableLocalShellJob(ctx.stateDir, jobInput);
+        if (reusable) {
+          if (reusable.status === "pending") {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This JK runtime upgrade is already waiting for owner approval in the authoritative JK Control Center; reuse the existing job.", {
+              approvalId: reusable.id,
+              jobId: reusable.id,
+              expiresAt: reusable.expiresAt,
+              approvalReused: "existing-job",
+            });
+          }
+          if (reusable.status === "running") {
+            return makeResult({ jobId: reusable.id, status: reusable.status, reusedJob: true }, "The approved JK runtime upgrade is already running.");
+          }
+          if (reusable.status === "succeeded") {
+            return makeResult({
+              jobId: reusable.id,
+              exitCode: reusable.exitCode ?? 0,
+              stdoutSummary: reusable.stdoutSummary ?? "",
+              stderrSummary: reusable.stderrSummary ?? "",
+              durationMs: reusable.durationMs ?? 0,
+              reusedJob: true,
+            }, "Reused the completed JK runtime upgrade job result.");
+          }
+          throw new DomainError(ErrorCode.COMMAND_FAILED, "The previous JK runtime upgrade job failed. Inspect that job result instead of requesting another approval.", {
+            jobId: reusable.id,
+            exitCode: reusable.exitCode ?? null,
+            stdoutSummary: reusable.stdoutSummary ?? "",
+            stderrSummary: reusable.stderrSummary ?? "",
+            error: reusable.error ?? null,
+          });
+        }
+        const approvalInput = {
+          projectId: input.projectId,
+          command,
+          cwd: undefined,
+          reason: jobInput.reason,
+          taskIdentity,
+          workSessionId: approvalWorkSessionId,
+          needsNetwork: false,
+          destructive: true,
+        };
+        const pending = await requestLocalShellApproval(ctx.stateDir, approvalInput);
+        if (pending.status === "denied") {
+          throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "This JK runtime upgrade was denied by the local owner", { approvalId: pending.id });
+        }
+        const queued = await queueLocalShellJob(ctx.stateDir, pending, {
+          command,
+          reason: jobInput.reason,
+          taskIdentity,
+          workSessionId: approvalWorkSessionId,
+          needsNetwork: false,
+          destructive: true,
+          timeoutSec: 120,
+          writesWorkspace: false,
+          continuation,
+          completionProof,
+        });
+        if (queued.continuation) {
+          await recordTaskContinuation(ctx, input.projectId, queued.continuation.workSessionId ?? undefined, {
+            jobId: queued.id,
+            status: "waiting-approval",
+            updatedAt: Date.now(),
+          });
+        }
+        throw new DomainError(
+          ErrorCode.APPROVAL_REQUIRED,
+          "JK runtime upgrade is queued behind one explicit owner approval in the authoritative JK Control Center. After approval the fixed reload script executes automatically on the selected runtime target; do not reissue a shell command.",
+          {
+            approvalId: pending.id,
+            jobId: queued.id,
+            expiresAt: pending.expiresAt,
+            runtimeUpgrade: true,
+          },
         );
       });
     },
@@ -3838,7 +4956,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run OMO coding agent",
       description:
-        "Optional adapter, invoked only when the user explicitly asks for OMO; it is never part of the default JK-native goal_loop. Runs Oh My OpenAgent/OMO against the selected project using its non-interactive `run` command, probes installed CLIs for compatible flags, and may use remote model providers. Requires a remote-capable lease. The prompt is passed as argv, never through a shell.",
+        "Optional adapter, invoked only when the user explicitly asks for OMO; it is never part of the default JK-native goal_loop. Runs compatible legacy or OMO Native non-interactive CLIs and may use remote model providers. Set ultrawork=true to activate the native-compatible ULW path explicitly. Requires a remote-capable lease. The prompt is passed as argv, never through a shell.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking OMO compatibility and running agent...", "OMO finished"),
       inputSchema: {
@@ -3849,6 +4967,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         sessionId: z.string().optional(),
         timeoutSec: z.number().int().positive().max(3600).optional(),
         verbose: z.boolean().optional(),
+        ultrawork: z
+          .boolean()
+          .optional()
+          .describe("Explicitly activate OMO-compatible ultrawork mode; omitted and false keep normal execution."),
       },
     },
     async (input) => {
@@ -3863,6 +4985,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           agent: input.agent,
           model: input.model,
           resumedSession: Boolean(input.sessionId),
+          ultraworkRequested: input.ultrawork === true,
         });
         const result = await runOmo(entry.root, {
           message: input.message,
@@ -3871,6 +4994,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           sessionId: input.sessionId,
           timeoutSec: input.timeoutSec,
           verbose: input.verbose,
+          ultrawork: input.ultrawork,
         });
         await ctx.ledger.append({
           type: "process.output.redacted",
@@ -3883,6 +5007,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           selectedVersion: result.selectedVersion,
           fallbackFromVersion: result.fallbackFromVersion,
           compatibilityStatus: result.compatibilityStatus,
+          cliContract: result.cliContract,
+          ultraworkRequested: result.ultraworkRequested,
+          ultraworkTransport: result.ultraworkTransport,
         });
         const versionText = result.selectedVersion ? ` ${result.selectedVersion}` : "";
         const fallbackText = result.fallbackFromVersion
@@ -3893,6 +5020,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             cwd: result.cwd,
             runnerSource: result.source,
             compatibilityStatus: result.compatibilityStatus,
+            cliContract: result.cliContract,
             detectedVersion: result.detectedVersion,
             selectedVersion: result.selectedVersion,
             fallbackFromVersion: result.fallbackFromVersion,
@@ -3901,12 +5029,53 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             stdoutSummary: result.stdoutSummary,
             stderrSummary: result.stderrSummary,
             sessionId: result.sessionId,
+            ultraworkRequested: result.ultraworkRequested,
+            ultraworkTransport: result.ultraworkTransport,
             durationMs: result.durationMs,
             outputTruncated: result.outputTruncated,
           },
           `OMO${versionText}${fallbackText} exited ${result.exitCode} in ${result.durationMs}ms${result.sessionId ? ` (session ${result.sessionId})` : ""}.`,
         );
       });
+    },
+  );
+
+  registerTool(
+    "mass_ulw_execute",
+    {
+      title: "Execute approved MASS ULW plan",
+      description:
+        "Execute the exact dependency-wave plan approved and persisted by goal_loop without OMO. The current ChatGPT session supplies one Codex-style patch per lane; JK applies each patch in a private checkout, verifies only through manifest-discovered verify commands, merges dependency waves, verifies the integrated result once, and atomically publishes it. No separate model/provider credential is required.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Executing approved MASS ULW waves...", "MASS ULW execution finished"),
+      inputSchema: {
+        projectId: z.string().min(1),
+        loopId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/u),
+        planFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+        workSessionId: WorkSessionIdSchema,
+        lanePatches: z.record(z.string().min(1).max(80), z.string().min(1).max(10 * 1024 * 1024)),
+        laneVerificationCommandIds: z.record(z.string().min(1).max(80), z.string().min(1).max(200)),
+        finalVerificationCommandId: z.string().min(1).max(200),
+        timeoutSec: z.number().int().positive().max(3600).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "mass_ulw_execute", input, async () =>
+        executeMassUlwTool(ctx, input, {
+          resolveProject: async (projectId) => resolveOrThrow(ctx, { projectId }),
+          isApprovedGoalLoop: async (candidate: MassUlwExecuteInput) => {
+            const session = await loadSession(ctx);
+            return findLoopContextById(session, candidate.projectId, candidate.loopId, candidate.workSessionId) !== null;
+          },
+          recordVerification: async (candidate, success) => recordVerification(ctx, candidate.projectId, candidate.workSessionId, {
+            tool: "command_run",
+            command: candidate.finalVerificationCommandId,
+            success,
+            exitCode: success ? 0 : 1,
+            durationMs: null,
+          }),
+        }),
+      );
     },
   );
 
@@ -3939,11 +5108,21 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input) => {
       return withErrorMapping(ctx, "e2e_start_server", { ...input, command: redact(input.command) }, async () => {
         await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
-        if (input.intent?.needsNetwork || input.intent?.destructive) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This E2E server request requires explicit approval");
+        const detectedRisk = inspectShellCommand(input.command);
+        const destructive = Boolean(input.intent?.destructive || detectedRisk.destructive);
+        const needsNetwork = Boolean(input.intent?.needsNetwork || detectedRisk.needsNetwork);
+        const externalWaitUrl = Boolean(input.waitUrl && /^https?:\/\//i.test(input.waitUrl) && !isLocalHttpUrl(input.waitUrl));
+        const taskNetworkApproved = (needsNetwork || externalWaitUrl)
+          ? await hasTaskNetworkVerificationApproval(ctx, input.projectId, input.workSessionId, input.cwd)
+          : false;
+        if (destructive) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Destructive E2E server requests still require an exact local-shell approval path");
         }
-        if (input.waitUrl && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(input.waitUrl)) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Waiting on a non-local URL requires explicit approval");
+        if ((needsNetwork || externalWaitUrl) && !taskNetworkApproved) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This E2E network verification requires an active task approval");
+        }
+        if (input.waitUrl && !isLocalHttpUrl(input.waitUrl) && !taskNetworkApproved) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Waiting on a non-local URL requires an active task approval");
         }
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await startE2eServer(entry.root, {
@@ -3983,6 +5162,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Opening E2E target...", "E2E target opened"),
       inputSchema: {
         projectId: z.string().optional(),
+        workSessionId: WorkSessionIdSchema.optional(),
         url: z.string().optional(),
         appName: z.string().optional(),
         appPath: z.string().optional(),
@@ -3997,10 +5177,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             throw new DomainError(ErrorCode.PROJECT_NOT_SELECTED, "projectId is required to open a URL target");
           }
           if (!isLocalHttpUrl(input.url)) {
-            throw new DomainError(
-              ErrorCode.APPROVAL_REQUIRED,
-              "e2e_open_target only opens local app/dev-server URLs; external/file/custom-scheme URLs require local approval.",
-            );
+            const approvedExternalHttp = /^https?:\/\//i.test(input.url)
+              ? await hasTaskNetworkVerificationApproval(ctx, input.projectId, input.workSessionId)
+              : false;
+            if (!approvedExternalHttp) {
+              throw new DomainError(
+                ErrorCode.APPROVAL_REQUIRED,
+                "e2e_open_target only opens local URLs unless the active task has an approved external-http verification grant.",
+              );
+            }
           }
         }
         if (input.projectId) {
@@ -4019,7 +5204,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         } else if (appPath && !appPath.startsWith("/Applications/")) {
           throw new DomainError(ErrorCode.PROJECT_NOT_SELECTED, "projectId is required for project-relative appPath");
         }
-        const result = await openE2eTarget({ url: input.url, appName: input.appName, appPath, args: input.args });
+        const approvedExternalHttp = Boolean(input.url && !isLocalHttpUrl(input.url) && /^https?:\/\//i.test(input.url) && input.projectId
+          ? await hasTaskNetworkVerificationApproval(ctx, input.projectId, input.workSessionId)
+          : false);
+        const result = await openE2eTarget({ url: input.url, appName: input.appName, appPath, args: input.args, approvedExternalHttp });
         await ctx.ledger.append({ type: "e2e.target.opened", projectId: input.projectId, launched: result.launched });
         return makeResult(result, `Opened E2E target: ${result.launched}`);
       });
@@ -4057,8 +5245,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input) => {
       return withErrorMapping(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async () => {
         await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
-        if (input.intent?.needsNetwork || input.intent?.destructive) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This E2E command request requires explicit approval");
+        const detectedRisk = inspectShellCommand(input.command);
+        const destructive = Boolean(input.intent?.destructive || detectedRisk.destructive);
+        const needsNetwork = Boolean(input.intent?.needsNetwork || detectedRisk.needsNetwork);
+        const externalScreenshotHttp = Boolean(input.screenshotUrl && /^https?:\/\//i.test(input.screenshotUrl) && !isLocalHttpUrl(input.screenshotUrl));
+        const taskNetworkApproved = (needsNetwork || externalScreenshotHttp)
+          ? await hasTaskNetworkVerificationApproval(ctx, input.projectId, input.workSessionId, input.cwd)
+          : false;
+        if (destructive) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Destructive E2E commands still require an exact local-shell approval path");
+        }
+        if (needsNetwork && !taskNetworkApproved) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This E2E network command requires an active task approval");
         }
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         await ctx.ledger.append({
@@ -4066,7 +5264,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           projectId: input.projectId,
           command: redact(input.command),
         });
-        const result = await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec);
+        const result = await runLocalShell(
+          entry.root,
+          input.command,
+          input.cwd,
+          input.timeoutSec,
+          taskNetworkApproved ? { needsNetwork: true } : undefined,
+        );
         let screenshot:
           | {
               path: string;
@@ -4083,6 +5287,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               label: input.label ?? "e2e-command",
               waitMs: input.screenshotWaitMs ?? 1800,
               openAfterCapture: input.openAfterCapture,
+              approvedExternalHttp: taskNetworkApproved,
             });
           } else {
             captured = await captureE2eScreenshot(entry.root, {
@@ -4178,12 +5383,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             serverStopped = await stopE2eServer(server);
           };
           try {
-            if (input.url && !isLocalHttpUrl(input.url)) {
-              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "One-shot E2E screenshots only open local app/dev-server URLs. Use the lower-level URL screenshot tool for explicit external URLs.");
+            const externalRequestedUrl = Boolean(input.url && /^https?:\/\//i.test(input.url) && !isLocalHttpUrl(input.url));
+            const externalAutoWaitUrl = Boolean(autoWaitUrl && /^https?:\/\//i.test(autoWaitUrl) && !isLocalHttpUrl(autoWaitUrl));
+            const taskNetworkApproved = (externalRequestedUrl || externalAutoWaitUrl)
+              ? await hasTaskNetworkVerificationApproval(ctx, project.projectId, input.workSessionId, input.cwd)
+              : false;
+            if (input.url && !isLocalHttpUrl(input.url) && !taskNetworkApproved) {
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "One-shot E2E external HTTP screenshots require an active task approval; file/custom-scheme URLs remain blocked.");
             }
             if (autoServerCommand) {
-              if (autoWaitUrl && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(autoWaitUrl)) {
-                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Waiting on a non-local URL requires explicit approval");
+              if (autoWaitUrl && !isLocalHttpUrl(autoWaitUrl) && !taskNetworkApproved) {
+                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Waiting on a non-local URL requires an active task approval");
               }
               server = await startE2eServer(project.root, {
                 command: autoServerCommand,
@@ -4216,6 +5426,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                       label: "e2e-test",
                       waitMs: input.screenshotWaitMs ?? 1800,
                       openAfterCapture: input.openAfterCapture,
+                      approvedExternalHttp: taskNetworkApproved,
                     })
                   : [
                       await captureE2eScreenshot(project.root, {
@@ -4294,7 +5505,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Capture E2E screenshot",
       description:
-        "Capture the current Mac screen to .chatgpt2codex/e2e/screenshots in the selected project. Use after opening a browser/app target so the user can inspect visual proof.",
+        "Capture the current macOS or Windows screen to .chatgpt2codex/e2e/screenshots in the selected project. Remote Windows projects capture on their executor and return visual proof to the hub.",
       annotations: LOCAL_STATE_ANNOTATIONS,
       _meta: chatGptToolMeta("Capturing E2E screenshot...", "E2E screenshot captured", E2E_WIDGET_TOOL_META),
       inputSchema: {
@@ -4308,12 +5519,30 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       return withErrorMapping(ctx, "e2e_screenshot", input, async () => {
         await requireProjectLease(ctx, input.projectId, "verify");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const result = await captureE2eScreenshot(entry.root, {
-          label: input.label,
-          waitMs: input.waitMs,
-          openAfterCapture: input.openAfterCapture,
+        const result = isRemoteProject(entry)
+          ? await materializeRemoteE2eScreenshot(
+              ctx,
+              await dispatchExecutorJob<RemoteE2eScreenshotResult>(
+                ctx.stateDir,
+                entry.executorId,
+                "e2e_screenshot",
+                remotePayload(entry, {
+                  label: input.label,
+                  waitMs: input.waitMs,
+                  openAfterCapture: input.openAfterCapture,
+                }),
+              ),
+            )
+          : await captureE2eScreenshot(entry.root, {
+              label: input.label,
+              waitMs: input.waitMs,
+              openAfterCapture: input.openAfterCapture,
+            });
+        await ctx.ledger.append({
+          type: "e2e.screenshot.captured",
+          projectId: input.projectId,
+          path: "remotePath" in result ? result.remotePath : result.path,
         });
-        await ctx.ledger.append({ type: "e2e.screenshot.captured", projectId: input.projectId, path: result.path });
         const screenshot = await attachE2eInlineShare(ctx, result, "E2E screenshot");
         return withE2eImageContent(makeResult({ ...screenshot }, `Captured E2E screenshot.\n${screenshot.markdown}`), [screenshot]);
       });
@@ -4329,6 +5558,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Opening URL and capturing screenshot...", "E2E screenshot captured", E2E_WIDGET_TOOL_META),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         url: z.string(),
         label: z.string().optional(),
         waitMs: z.number().int().min(0).max(30_000).optional(),
@@ -4337,10 +5567,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
     async (input) => {
       return withErrorMapping(ctx, "e2e_open_url_screenshot", input, async () => {
-        if (!isLocalHttpUrl(input.url)) {
+        const approvedExternalHttp = !isLocalHttpUrl(input.url) && /^https?:\/\//i.test(input.url)
+          ? await hasTaskNetworkVerificationApproval(ctx, input.projectId, input.workSessionId)
+          : false;
+        if (!isLocalHttpUrl(input.url) && !approvedExternalHttp) {
           throw new DomainError(
             ErrorCode.APPROVAL_REQUIRED,
-            "URL screenshots only open local loopback http(s) URLs; external/file/chrome URLs require local approval.",
+            "URL screenshots only open local loopback URLs unless the active task has an approved external-http verification grant.",
           );
         }
         await requireProjectLease(ctx, input.projectId, "verify");
@@ -4350,6 +5583,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           label: input.label ?? "url",
           waitMs: input.waitMs ?? 1800,
           openAfterCapture: input.openAfterCapture,
+          approvedExternalHttp,
         });
         await ctx.ledger.append({
           type: "e2e.url.screenshot.captured",
@@ -4420,7 +5654,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         await requireProjectLease(ctx, input.projectId, "remote");
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const result = await gitSyncStart(entry.root);
+        const result = isRemoteProject(entry)
+          ? await dispatchExecutorJob<Awaited<ReturnType<typeof gitSyncStart>>>(
+              ctx.stateDir,
+              entry.executorId,
+              "git_sync_start",
+              remotePayload(entry, {}),
+              150_000,
+            )
+          : await gitSyncStart(entry.root);
         await ctx.ledger.append({
           type: "git.sync.started",
           projectId: input.projectId,
@@ -4436,11 +5678,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             fastForwarded: result.fastForwarded,
             before: result.before,
             after: result.after,
-            sourceOfTruth: "configured upstream (GitHub)",
+            sourceOfTruth: "GitHub",
             windowsAutoPull: false,
-            windowsUpdatePolicy: "manual-only",
-            ociSyncPolicy: "clean + fast-forward-only from upstream",
-            finishPolicy: "verify -> inspect diff -> git_sync_finish; deployment followers may follow upstream automatically; Windows remains untouched unless explicitly synced",
+            finishPolicy: "verify -> inspect diff -> git_sync_finish; Windows updates only on explicit pull",
           },
           `Remote-worker checkout ${result.branch} is clean and aligned with ${result.upstream}${result.fastForwarded ? " after fast-forward" : ""}.`,
         );
@@ -4839,12 +6079,11 @@ console.log(JSON.stringify({stdout:String(r.stdout||''),stderr:String(r.stderr||
         return makeResult(
           {
             ...result,
-            sourceOfTruth: "configured upstream (GitHub)",
+            sourceOfTruth: "GitHub",
             windowsAutoPull: false,
-            windowsUpdatePolicy: "manual-only",
-            ociSyncPolicy: "clean + fast-forward-only from upstream",
+            localPcNextCommand: "manual pull only when explicitly requested",
           },
-          `Published ${result.commit} to ${result.remote}/${result.branch}. Deployment followers may follow the upstream automatically; Windows stays unchanged unless the user explicitly requests a manual sync.`,
+          `Published ${result.commit} to ${result.remote}/${result.branch}. Windows is not auto-updated; pull there only when explicitly requested.`,
         );
       });
     },

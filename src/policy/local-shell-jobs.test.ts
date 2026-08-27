@@ -1,90 +1,226 @@
-import { promises as fs } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { listRecentLocalShellJobs, readLocalShellJob, reconcileLocalShellJobs, type LocalShellJobRecord } from "./local-shell-jobs.js";
+import type { LocalShellApprovalRecord } from "./local-approvals.js";
+import {
+  findReusableLocalShellJob,
+  listRecentLocalShellJobs,
+  localShellRunnerInstanceId,
+  queueLocalShellJob,
+  readLocalShellJob,
+  updateLocalShellJob,
+} from "./local-shell-jobs.js";
 
 const tempDirs: string[] = [];
 
-async function makeStateDir(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jk-shell-jobs-"));
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+async function stateDir(): Promise<string> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "jk-shell-job-"));
   tempDirs.push(dir);
   return dir;
 }
 
-async function writeJob(stateDir: string, record: LocalShellJobRecord): Promise<void> {
-  const dir = path.join(stateDir, "approvals", "shell", "jobs");
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, `${record.id}.json`), `${JSON.stringify(record)}\n`, "utf8");
+function approval(idChar = "a"): LocalShellApprovalRecord {
+  const now = Date.now();
+  return {
+    id: idChar.repeat(64),
+    projectId: "proj",
+    commandPreview: "echo approved",
+    cwd: null,
+    reason: "restart recovery test",
+    taskIdentity: "task:restart-recovery",
+    needsNetwork: false,
+    destructive: false,
+    createdAt: now,
+    expiresAt: now + 5 * 60_000,
+    status: "approved",
+  };
 }
 
-afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
-});
+const jobInput = {
+  command: "echo approved",
+  reason: "restart recovery test",
+  taskIdentity: "task:restart-recovery",
+  needsNetwork: false,
+  destructive: false,
+  writesWorkspace: false,
+};
 
-describe("reconcileLocalShellJobs", () => {
-  it("expires pending jobs, fails stale running jobs, and removes old terminal records", async () => {
-    const stateDir = await makeStateDir();
-    const now = 1_000_000;
-    const base = {
-      projectId: "p",
-      command: "echo ok",
-      cwd: null,
-      reason: null,
-      needsNetwork: false,
-      destructive: false,
-      timeoutSec: 30,
-      writesWorkspace: false,
-      createdAt: 100,
-      expiresAt: 900_000,
-    };
-    const pendingId = "a".repeat(64);
-    const runningId = "b".repeat(64);
-    const oldId = "c".repeat(64);
-    const recentId = "d".repeat(64);
+const fingerprintInput = {
+  projectId: "proj",
+  ...jobInput,
+};
 
-    await writeJob(stateDir, { ...base, id: pendingId, status: "pending" });
-    await writeJob(stateDir, { ...base, id: runningId, status: "running", startedAt: 800_000, expiresAt: 2_000_000 });
-    await writeJob(stateDir, { ...base, id: oldId, status: "succeeded", finishedAt: 100_000, expiresAt: 2_000_000 });
-    await writeJob(stateDir, { ...base, id: recentId, status: "succeeded", finishedAt: 990_000, expiresAt: 2_000_000 });
+describe("local shell job restart recovery", () => {
+  it("reuses the same job when only the human-readable reason changes", async () => {
+    const dir = await stateDir();
+    const queued = await queueLocalShellJob(dir, approval("d"), jobInput);
+    await updateLocalShellJob(dir, queued.id, (current) => ({
+      ...current,
+      status: "succeeded",
+      finishedAt: Date.now(),
+      exitCode: 0,
+      stdoutSummary: "already-done",
+    }));
 
-    const result = await reconcileLocalShellJobs(stateDir, { now, retentionMs: 100_000, runningGraceMs: 10_000 });
-
-    expect(result).toEqual({ expired: 1, failed: 1, removed: 1 });
-    expect((await readLocalShellJob(stateDir, pendingId))?.status).toBe("expired");
-    expect(await readLocalShellJob(stateDir, runningId)).toMatchObject({ status: "failed", finishedAt: 840_000 });
-    expect(await readLocalShellJob(stateDir, oldId)).toBeNull();
-    expect((await readLocalShellJob(stateDir, recentId))?.status).toBe("succeeded");
+    const reused = await findReusableLocalShellJob(dir, {
+      ...fingerprintInput,
+      reason: "same operation, but the assistant phrased the explanation differently",
+    });
+    expect(reused).toMatchObject({ id: queued.id, status: "succeeded", stdoutSummary: "already-done" });
   });
 
-  it("does not promote an old reconciled stale failure above genuinely recent jobs", async () => {
-    const stateDir = await makeStateDir();
-    const now = Date.now();
-    const base = {
-      projectId: "p",
-      command: "echo ok",
-      cwd: null,
-      reason: null,
-      needsNetwork: false,
-      destructive: false,
-      timeoutSec: 30,
-      writesWorkspace: false,
-      createdAt: now - 180_000,
-      expiresAt: now + 300_000,
-    };
-    const staleId = "e".repeat(64);
-    const recentId = "f".repeat(64);
-    await writeJob(stateDir, {
-      ...base,
-      id: staleId,
-      status: "failed",
-      startedAt: now - 120_000,
-      finishedAt: now,
-      error: "Interrupted or stale running job reconciled after timeout",
-    });
-    await writeJob(stateDir, { ...base, id: recentId, status: "succeeded", finishedAt: now - 10_000 });
+  it("does not reuse a job when the exact command or risk changes", async () => {
+    const dir = await stateDir();
+    const queued = await queueLocalShellJob(dir, approval("e"), jobInput);
+    await updateLocalShellJob(dir, queued.id, (current) => ({
+      ...current,
+      status: "succeeded",
+      finishedAt: Date.now(),
+      exitCode: 0,
+    }));
 
-    const jobs = await listRecentLocalShellJobs(stateDir, 10);
-    expect(jobs.map((job) => job.id).slice(0, 2)).toEqual([recentId, staleId]);
+    expect(await findReusableLocalShellJob(dir, { ...fingerprintInput, command: "echo different" })).toBeNull();
+    expect(await findReusableLocalShellJob(dir, { ...fingerprintInput, destructive: true })).toBeNull();
+  });
+
+  it("persists distinct idempotent jobs for commands consumed from one approved bundle", async () => {
+    const dir = await stateDir();
+    const bundleApproval = approval("9");
+    const authorization = {
+      approvalId: bundleApproval.id,
+      bundleFingerprint: "8".repeat(64),
+      workSessionId: "ws_release_bundle",
+    };
+    const first = await queueLocalShellJob(dir, bundleApproval, {
+      ...jobInput,
+      ...authorization,
+      command: "echo first",
+    });
+    const second = await queueLocalShellJob(dir, bundleApproval, {
+      ...jobInput,
+      ...authorization,
+      command: "echo second",
+    });
+    const repeatedSecond = await queueLocalShellJob(dir, bundleApproval, {
+      ...jobInput,
+      ...authorization,
+      command: "echo second",
+    });
+
+    expect(first.id).not.toBe(second.id);
+    expect(repeatedSecond.id).toBe(second.id);
+    expect(second).toMatchObject(authorization);
+
+    await updateLocalShellJob(dir, second.id, (current) => ({
+      ...current,
+      status: "succeeded",
+      finishedAt: Date.now(),
+      exitCode: 0,
+      stdoutSummary: "second-ran-once",
+    }));
+    const reused = await findReusableLocalShellJob(dir, {
+      ...fingerprintInput,
+      command: "echo second",
+      workSessionId: authorization.workSessionId,
+    });
+    expect(reused).toMatchObject({
+      id: second.id,
+      status: "succeeded",
+      stdoutSummary: "second-ran-once",
+      ...authorization,
+    });
+  });
+
+  it("reuses a pinned command_run when optional policy hints change", async () => {
+    const dir = await stateDir();
+    const command = 'command_run {"commandId":"npm:deploy","args":[],"manifestFingerprint":"abc"}';
+    const queued = await queueLocalShellJob(dir, approval("f"), {
+      ...jobInput,
+      executionKind: "command-run",
+      command,
+      needsNetwork: true,
+      writesWorkspace: true,
+    });
+    await updateLocalShellJob(dir, queued.id, (current) => ({
+      ...current,
+      status: "succeeded",
+      finishedAt: Date.now(),
+      exitCode: 0,
+      stdoutSummary: "deployed-once",
+    }));
+
+    const reused = await findReusableLocalShellJob(dir, {
+      projectId: "proj",
+      executionKind: "command-run",
+      command,
+      reason: "same pinned command lookup",
+      taskIdentity: jobInput.taskIdentity,
+      needsNetwork: false,
+      destructive: true,
+      writesWorkspace: false,
+    });
+    expect(reused).toMatchObject({ id: queued.id, status: "succeeded", stdoutSummary: "deployed-once" });
+  });
+
+  it("turns a running job from a previous JK process into a terminal unknown-outcome failure", async () => {
+    const dir = await stateDir();
+    const queued = await queueLocalShellJob(dir, approval(), jobInput);
+    await updateLocalShellJob(dir, queued.id, (current) => ({
+      ...current,
+      status: "running",
+      runnerInstanceId: "previous-runtime-instance",
+      startedAt: Date.now() - 1_000,
+    }));
+
+    const reused = await findReusableLocalShellJob(dir, fingerprintInput);
+    expect(reused).toMatchObject({
+      id: queued.id,
+      status: "failed",
+      interruptedByRestart: true,
+    });
+    expect(reused?.error).toContain("execution outcome is unknown");
+
+    const persisted = await readLocalShellJob(dir, queued.id);
+    expect(persisted).toMatchObject({ status: "failed", interruptedByRestart: true });
+    expect(persisted?.finishedAt).toEqual(expect.any(Number));
+  });
+
+  it("keeps a running job owned by the current JK process running", async () => {
+    const dir = await stateDir();
+    const queued = await queueLocalShellJob(dir, approval("b"), jobInput);
+    await updateLocalShellJob(dir, queued.id, (current) => ({
+      ...current,
+      status: "running",
+      runnerInstanceId: localShellRunnerInstanceId(),
+      startedAt: Date.now(),
+    }));
+
+    const reused = await findReusableLocalShellJob(dir, fingerprintInput);
+    expect(reused).toMatchObject({ id: queued.id, status: "running" });
+    expect(reused?.interruptedByRestart).not.toBe(true);
+  });
+
+  it("reconciles orphaned running jobs in recent-job listings without exposing the runner id", async () => {
+    const dir = await stateDir();
+    const queued = await queueLocalShellJob(dir, approval("c"), jobInput);
+    await updateLocalShellJob(dir, queued.id, (current) => ({
+      ...current,
+      status: "running",
+      runnerInstanceId: "old-runtime",
+      startedAt: Date.now() - 1_000,
+    }));
+
+    const recent = await listRecentLocalShellJobs(dir, 10);
+    expect(recent[0]).toMatchObject({
+      id: queued.id,
+      status: "failed",
+      interruptedByRestart: true,
+    });
+    expect(recent[0]).not.toHaveProperty("runnerInstanceId");
   });
 });

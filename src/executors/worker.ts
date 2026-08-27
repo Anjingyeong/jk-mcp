@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { applyPatch, createFile } from "../code/patch.js";
 import { codeSearch } from "../code/search.js";
 import { readSlice } from "../code/read-slice.js";
@@ -9,9 +9,10 @@ import { resolveInProject } from "../policy/paths.js";
 import { isSecretPath, redact } from "../policy/secrets.js";
 import { listCommands, runCommand } from "../exec/command-runner.js";
 import { runLocalShell } from "../exec/local-shell.js";
+import { captureE2eScreenshot } from "../e2e/local-e2e.js";
 import { nestedProjectRoots, scanWorkspaceWithRuntimeSelf } from "../workspace/registry.js";
 import { createCheckpoint } from "../state/checkpoints.js";
-import { gitDiffSummary, gitRepositoryStatus, gitStatus } from "../git/git.js";
+import { gitDiffSummary, gitRepositoryStatus, gitStatus, gitSyncStart } from "../git/git.js";
 import type { ProjectRegistryEntry } from "../types.js";
 import type { ExecutorHeartbeat, ExecutorJob, ExecutorToolName } from "./broker.js";
 
@@ -20,6 +21,7 @@ const DEFAULT_CAPABILITIES: ExecutorToolName[] = [
   "project_rules",
   "repo_status",
   "repo_diff_summary",
+  "git_sync_start",
   "code_search",
   "file_read_slice",
   "file_apply_patch",
@@ -27,8 +29,11 @@ const DEFAULT_CAPABILITIES: ExecutorToolName[] = [
   "command_list",
   "command_run",
   "local_shell_run",
+  "e2e_screenshot",
   "executor_restart",
 ];
+const EXECUTOR_INSTANCE_ID = randomUUID();
+const EXECUTOR_STARTED_AT_MS = Date.now();
 
 export interface ExecutorWorkerOptions {
   hubUrl: string;
@@ -116,6 +121,8 @@ async function executeWorkerJob(registry: ProjectRegistryEntry[], job: ExecutorJ
       return await gitRepositoryStatus(entry.root);
     case "repo_diff_summary":
       return await gitDiffSummary(entry.root);
+    case "git_sync_start":
+      return await gitSyncStart(entry.root);
     case "project_status": {
       const [status, commands] = await Promise.all([gitStatus(entry.root), listCommands(entry.root)]);
       const ruleFiles: string[] = [];
@@ -233,6 +240,8 @@ async function executeWorkerJob(registry: ProjectRegistryEntry[], job: ExecutorJ
         String(payload.commandId ?? ""),
         Array.isArray(payload.args) ? payload.args.map(String) : undefined,
         typeof payload.timeoutSec === "number" ? payload.timeoutSec : undefined,
+        typeof payload.expectedManifestFingerprint === "string" ? payload.expectedManifestFingerprint : undefined,
+        Boolean(payload.approvedRisky),
       );
     case "local_shell_run":
       return await runLocalShell(
@@ -245,6 +254,19 @@ async function executeWorkerJob(registry: ProjectRegistryEntry[], job: ExecutorJ
           destructive: Boolean(payload.approvedDestructive),
         },
       );
+    case "e2e_screenshot": {
+      const screenshot = await captureE2eScreenshot(entry.root, {
+        label: typeof payload.label === "string" ? payload.label : undefined,
+        waitMs: typeof payload.waitMs === "number" ? payload.waitMs : undefined,
+        openAfterCapture: Boolean(payload.openAfterCapture),
+      });
+      const image = await fs.readFile(screenshot.path);
+      const maxRemoteScreenshotBytes = 6 * 1024 * 1024;
+      if (image.length > maxRemoteScreenshotBytes) {
+        throw new Error(`Remote E2E screenshot is too large to return (${image.length} bytes)`);
+      }
+      return { ...screenshot, imageBase64: image.toString("base64"), mimeType: "image/png" };
+    }
     default:
       throw new Error(`Unsupported executor tool: ${String(job.tool)}`);
   }
@@ -263,6 +285,8 @@ async function heartbeat(
     workspaceRoot: path.resolve(options.workspaceRoot),
     projects: registry.map(publicProjectSnapshot),
     capabilities: DEFAULT_CAPABILITIES,
+    instanceId: EXECUTOR_INSTANCE_ID,
+    startedAtMs: EXECUTOR_STARTED_AT_MS,
   };
   await requestJson(`${hub}/api/executors/heartbeat`, token, { method: "POST", body: JSON.stringify(body) });
 }

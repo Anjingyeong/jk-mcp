@@ -12,25 +12,34 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node scripts/write-runtime-schema-manifest.mjs",
     "chatgpt": "bash start-chatgpt.sh",
     "chatgpt:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File start-chatgpt.ps1",
     "chatgpt:linux": "bash linux/start-chatgpt2codex.sh",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
+    "windows:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File windows/Build-ChatGPTToCodexExe.ps1",
+    "windows:package": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1",
+    "windows:portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-app.ps1",
+    "windows:install": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1",
+    "windows:launcher:test": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-dev-launcher.ps1",
+    "windows:e2e": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e-windows-installer.ps1",
+    "windows:e2e:browser": "node src/e2e/capture-fixture.mjs single && node src/e2e/capture-fixture.mjs set && node src/e2e/capture-fixture.mjs diagnostics",
+    "linux:package": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-linux-installer.ps1",
+    "linux:e2e": "bash scripts/e2e-linux-installer.sh",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "express": "^5.2.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
-    "tsx": "^4.16.0",
     "typescript": "^5.5.0",
-    "vitest": "^3.2.7"
+    "tsx": "^4.16.0",
+    "vitest": "^2.0.0"
   }
 }

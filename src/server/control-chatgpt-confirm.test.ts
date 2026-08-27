@@ -33,6 +33,20 @@ vi.mock("../e2e/local-e2e.js", () => ({
 const macInput = await import("../control/mac-input.js");
 const { createServer } = await import("./mcp-server.js");
 
+/**
+ * The request-action handler's frontmost/dry-run/executor gates are
+ * darwin-gated in production code; mac-input is fully mocked here, so stub
+ * the platform to darwin for the whole suite to exercise the real gating
+ * logic on Windows/Linux CI hosts too.
+ */
+const ORIGINAL_PLATFORM = Object.getOwnPropertyDescriptor(process, "platform")!;
+beforeEach(function stubDarwinPlatform() {
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+});
+afterEach(function restorePlatform() {
+  Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
+});
+
 interface RegisteredToolLike {
   handler?: (input: Record<string, unknown>) => Promise<{
     structuredContent?: Record<string, unknown>;
@@ -312,7 +326,8 @@ describe("computer_request_action immediate execution (CHATGPT2CODEX_CONTROL_CHA
     // Rate limiting falls back to the normal queue — it never hard-fails or
     // silently drops the request.
     expect(macInput.clickAtPoint).toHaveBeenCalledTimes(RATE_LIMIT_MAX);
-  }, 20_000);
+    // 20 sequential enqueue+approve+execute cycles; slow under parallel CI load.
+    }, 60_000);
 
   it("project_select still grants preset=control for a local (non-remote) session even when control is exposed to ChatGPT", async () => {
     process.env.CHATGPT2CODEX_CONTROL_CHATGPT = "1";

@@ -87,6 +87,26 @@ const TaskContinuationSchema = z.object({
   deliveredAt: z.number().int().nonnegative().optional(),
 }).nullable().default(null);
 
+const TaskSafetyStatusSchema = z.enum(["unknown", "pass", "fail", "not-required"]);
+const TaskExecutionSafetySchema = z.object({
+  executionKind: z.enum(["workspace", "live-runtime", "release-deploy"]).default("workspace"),
+  preflightStatus: TaskSafetyStatusSchema.default("not-required"),
+  preflightEvidence: z.array(z.string().min(1).max(2000)).max(30).default([]),
+  executionTarget: z.object({
+    machine: z.string().max(200).nullable().default(null),
+    projectRoot: z.string().max(1000).nullable().default(null),
+    branch: z.string().max(200).nullable().default(null),
+    dirty: z.boolean().nullable().default(null),
+    runtimeTarget: z.string().max(500).nullable().default(null),
+  }).default({}),
+  approvalPlan: z.array(z.string().min(1).max(2000)).max(20).default([]),
+  rollbackStatus: TaskSafetyStatusSchema.default("not-required"),
+  releaseCollisionStatus: TaskSafetyStatusSchema.default("not-required"),
+  runtimeProofStatus: TaskSafetyStatusSchema.default("not-required"),
+  runtimeProofEvidence: z.array(z.string().min(1).max(2000)).max(30).default([]),
+  operationalDrift: z.array(z.string().min(1).max(2000)).max(30).default([]),
+}).default({});
+
 const TaskStateSchema = z.object({
   goalId: z.string().nullable().default(null),
   loopId: z.string().nullable().default(null),
@@ -97,6 +117,7 @@ const TaskStateSchema = z.object({
   pending: z.array(z.string().min(1).max(500)).max(50).default([]),
   decisions: z.array(TaskDecisionSchema).max(30).default([]),
   continuation: TaskContinuationSchema,
+  executionSafety: TaskExecutionSafetySchema,
   updatedAt: z.number().int().nonnegative().default(0),
 });
 
