@@ -18,7 +18,7 @@ This fork focuses on making the local coding loop more durable and practical on 
 
 ## Easiest Windows setup for friends
 
-Your friends do **not** need an OCI server to use JK. The default distribution runs `JK.exe` on each user's own PC. When ChatGPT on the web needs to reach that local runtime, JK can use the bundled Cloudflare Quick Tunnel path.
+Your friends do **not** need a cloud server to use JK. The default distribution runs `JK.exe` on each user's own PC. When ChatGPT on the web needs to reach that local runtime, JK can use the bundled Cloudflare Quick Tunnel path.
 
 GitHub Releases publish two Windows packages:
 
@@ -39,7 +39,7 @@ First-time setup:
 8. When prompted for approval, use the **Owner Token** shown by your local JK app.
 9. Start with a natural-language request such as `@jk inspect this project and explain its structure`.
 
-> **No OCI required** means no Oracle Cloud VM, personal always-on server, or maintainer-owned `jk.maintainer.example` / `mcp.maintainer.example` endpoint is needed. ChatGPT web still needs an HTTPS route to the local PC, so the beginner path uses a temporary Cloudflare Quick Tunnel. That URL may change after restart. A personal domain / Named Tunnel or another user-managed HTTPS reverse proxy is optional for a stable URL.
+> **No cloud server required:** ChatGPT web still needs an HTTPS route to the local PC, so the beginner path uses a temporary Cloudflare Quick Tunnel. That URL may change after restart. A personal domain, Named Tunnel, or another user-managed HTTPS reverse proxy is optional for a stable URL.
 
 The Windows packages may be unsigned development builds, so SmartScreen can appear. Only run a binary obtained from this repository's GitHub Release. Treat the Owner Token like a password and never share it.
 

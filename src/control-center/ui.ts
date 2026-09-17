@@ -361,10 +361,10 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
   function executorInfo() { return state.status && state.status.executors || {local:null,items:[],routes:{}}; }
   function executorSummaryHtml() {
     const info = executorInfo();
-    const local = info.local || {executorId:'oci-main',label:'OCI Hub',online:true,platform:'unknown',projectCount:0};
+    const local = info.local || {executorId:'local',label:'Local runtime',online:true,platform:'unknown',projectCount:0};
     const workers = info.items || [];
-    const row = (item, localRow=false) => '<div class="project-row"><div><div class="project-name"><span class="badge ' + (item.online ? 'ok' : 'warn') + '">' + (item.online ? '● ONLINE' : '○ OFFLINE') + '</span> ' + esc(item.label || item.executorId) + '</div><div class="mono">' + esc(item.platform || 'unknown') + '</div><div class="sub">' + esc(localRow ? ((item.projectCount || 0) + ' OCI project(s)') : (((item.projects || []).length) + ' project(s) · heartbeat ' + fmtAge(item.lastSeenAtMs))) + '</div></div><div class="badges"><span class="badge">' + esc(item.executorId) + '</span>' + (localRow ? '<span class="badge default">Hub</span>' : '<span class="badge">Outbound worker</span>') + '</div></div>';
-    return '<div class="panel" style="margin-top:12px"><div class="role-head"><div><h2 class="section-title">Executors</h2><div class="sub">OCI는 Hub로 유지되고 PC는 outbound worker로 연결됩니다. 같은 프로젝트의 OCI 사본이 있으면 worker offline 시 로컬로 fallback합니다.</div></div><div class="toolbar"><span class="badge ' + (workers.some(x=>x.online) ? 'ok' : 'default') + '">' + esc(workers.filter(x=>x.online).length + ' remote online') + '</span><button class="btn small" id="pair-windows-executor">Windows 연결</button></div></div><div class="project-list" style="margin-top:12px">' + row(local, true) + workers.map(w => row(w, false)).join('') + '</div></div>';
+    const row = (item, localRow=false) => '<div class="project-row"><div><div class="project-name"><span class="badge ' + (item.online ? 'ok' : 'warn') + '">' + (item.online ? '● ONLINE' : '○ OFFLINE') + '</span> ' + esc(item.label || item.executorId) + '</div><div class="mono">' + esc(item.platform || 'unknown') + '</div><div class="sub">' + esc(localRow ? ((item.projectCount || 0) + ' local project(s)') : (((item.projects || []).length) + ' project(s) · heartbeat ' + fmtAge(item.lastSeenAtMs))) + '</div></div><div class="badges"><span class="badge">' + esc(item.executorId) + '</span>' + (localRow ? '<span class="badge default">Local</span>' : '<span class="badge">Outbound worker</span>') + '</div></div>';
+    return '<div class="panel" style="margin-top:12px"><div class="role-head"><div><h2 class="section-title">Executors</h2><div class="sub">현재 JK runtime을 기본 실행 위치로 사용하고, 필요하면 프로젝트별 outbound worker를 선택할 수 있습니다.</div></div><div class="toolbar"><span class="badge ' + (workers.some(x=>x.online) ? 'ok' : 'default') + '">' + esc(workers.filter(x=>x.online).length + ' remote online') + '</span><button class="btn small" id="pair-windows-executor">Windows 연결</button></div></div><div class="project-list" style="margin-top:12px">' + row(local, true) + workers.map(w => row(w, false)).join('') + '</div></div>';
   }
   async function pairWindowsExecutor() {
     const workspace = window.prompt('Windows에서 JK가 접근할 workspace 경로를 입력하세요.', 'C:\\workspace');
@@ -383,13 +383,12 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     const routes = info.routes || {};
     const selected = routes[p.projectId] || 'local';
     const workers = (info.items || []).filter(w => (w.projects || []).some(r => r.projectId === p.projectId));
-    const options = '<option value="oci-main" ' + (selected === 'local' || selected === 'oci-main' ? 'selected' : '') + '>OCI Hub</option>' + workers.map(w => '<option value="' + esc(w.executorId) + '" ' + (selected === w.executorId ? 'selected' : '') + '>' + esc((w.label || w.executorId) + (w.online ? ' · online' : ' · offline')) + '</option>').join('');
+    const options = '<option value="local" ' + (selected === 'local' ? 'selected' : '') + '>Local runtime</option>' + workers.map(w => '<option value="' + esc(w.executorId) + '" ' + (selected === w.executorId ? 'selected' : '') + '>' + esc((w.label || w.executorId) + (w.online ? ' · online' : ' · offline')) + '</option>').join('');
     return '<label class="sub">Executor <select class="select" data-executor-route-project="' + esc(p.projectId) + '" style="width:170px;margin-left:6px">' + options + '</select></label>';
   }
   function quickLinksHtml() {
     const custom = state.status && Array.isArray(state.status.quickLinks) ? state.status.quickLinks : [];
-    const hiddenQuickLinkTitles = ['CleanTube APK', 'Gecko QA APK'];
-    const links = custom.filter(link => !hiddenQuickLinkTitles.includes(String(link.title || '')));
+    const links = custom;
     const items = links.map(link => '<a class="quick-link" href="' + esc(link.href) + '" target="_blank" rel="noopener noreferrer"><div class="quick-link-copy"><div class="quick-link-title">' + esc(link.title) + '</div><div class="quick-link-note">' + esc(link.note) + '</div><div class="badges" style="margin-top:8px"><span class="badge ' + esc(link.badgeClass) + '">' + esc(link.badge) + '</span></div></div><span class="quick-link-arrow" aria-hidden="true">↗</span></a>').join('');
     return '<div class="panel quick-links-panel"><div class="quick-links-head"><div><h2 class="section-title" style="margin-bottom:4px">Quick Links</h2><div class="sub">별도 서비스와 배포 진입점만 모았습니다.</div></div><span class="badge">' + esc(links.length) + ' links</span></div><div class="quick-links">' + items + '</div></div>';
   }
@@ -400,14 +399,6 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     const synced = d.state === 'synced';
     const stateClass = synced ? 'ok' : (d.state === 'drift' || d.state === 'dirty') ? 'warn' : 'default';
     return '<div class="panel" style="margin-top:12px"><div class="role-head"><div><h2 class="section-title">Deployment</h2><div class="sub"><span class="mono">Upstream ' + esc(short(d.upstreamSha)) + '</span> → <span class="mono">Runtime ' + esc(short(d.deployedSha)) + '</span> · 마지막 배포 ' + esc(fmtAge(d.lastSyncAtMs)) + '</div></div><span class="badge ' + stateClass + '">' + esc((d.state || 'unknown').toUpperCase()) + '</span></div><div class="badges" style="margin-top:10px"><span class="badge ' + (d.build === 'pass' ? 'ok' : 'default') + '">Build ' + esc((d.build || 'unknown').toUpperCase()) + '</span><span class="badge ' + (d.health === 'pass' ? 'ok' : 'warn') + '">Health ' + esc((d.health || 'unknown').toUpperCase()) + '</span><span class="badge ' + (d.tunnel === 'pass' ? 'ok' : 'warn') + '">Network ' + esc((d.tunnel || 'unknown').toUpperCase()) + '</span></div></div>';
-  }
-  function deploymentActionHtml() {
-    const command = 'bash scripts/sync-jk-oci.sh --reload-current';
-    const approval = state.approvals.find(a => a.commandPreview === command);
-    const job = state.jobs.find(j => j.commandPreview === command && (j.status === 'pending' || j.status === 'running'));
-    const status = job && job.status || (approval ? 'pending' : 'ready');
-    const label = status === 'pending' ? '승인 대기 중' : status === 'running' ? '동기화 중' : '서버 동기화 · 재시작';
-    return '<div class="panel" style="margin-top:12px"><div class="role-head"><div><h2 class="section-title">JK Runtime</h2><div class="sub">Git upstream 확인 → fast-forward → build 검증 → runtime reload → health/tunnel QA를 한 작업으로 실행합니다. 고위험 단계는 승인 1회만 필요합니다.</div></div><span class="badge ' + (status === 'running' ? 'active' : status === 'pending' ? 'warn' : 'ok') + '">' + esc(status.toUpperCase()) + '</span></div><div class="actions" style="margin-top:12px"><button class="btn primary" id="sync-jk-runtime"' + (status === 'running' ? ' disabled' : '') + '>' + esc(label) + '</button><button class="btn" id="open-runtime-approvals">승인 보기</button></div></div>';
   }
   function dashboard() {
     const runtimeCtx = state.status && state.status.roleContext || {};
@@ -427,7 +418,6 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
         metric('승인 대기', state.approvals.length ? state.approvals.length + '건' : '없음', state.approvals.length ? '확인 후 작업이 계속됩니다' : '고위험 작업만 중단', 'approvals') +
       '</div>' +
       deploymentStatusHtml() +
-      deploymentActionHtml() +
       quickLinksHtml() +
       executorSummaryHtml() +
       '<div id="dashboard-approvals-root">' + pendingApprovalsBanner() + '</div>' +
@@ -542,7 +532,7 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
   function projectsPage() {
     const activeId = state.status && state.status.session.activeProjectId;
     return '<div class="page-head"><div><h1>Projects</h1><div class="sub">보통은 ChatGPT 요청에 맞춰 JK가 권한과 실행 위치를 자동으로 선택합니다. Windows 우선 프로젝트만 Executor를 바꾸면 됩니다.</div></div><div class="toolbar"><label class="sub" for="activation-preset">Manual activation</label><select class="select" id="activation-preset" style="width:150px"><option value="read-only" ' + (state.activationPreset==='read-only'?'selected':'') + '>Read Only</option><option value="tests-only" ' + (state.activationPreset==='tests-only'?'selected':'') + '>Tests Only</option><option value="full-write" ' + (state.activationPreset==='full-write'?'selected':'') + '>Full Write</option><option value="image-only" ' + (state.activationPreset==='image-only'?'selected':'') + '>Image Only</option></select></div></div><div class="project-list">' + state.projects.map(p =>
-      '<div class="project-row"><div><div class="project-name">' + esc(p.name) + ' ' + (p.projectId === activeId ? '<span class="badge active">ACTIVE</span>' : '') + '</div><div class="mono">' + esc(p.root) + '</div><div class="badges" style="margin-top:7px"><span class="badge">' + esc(p.branch || 'no branch') + '</span>' + (p.dirty ? '<span class="badge warn">dirty</span>' : '<span class="badge ok">clean</span>') + (p.executorKind === 'remote' ? '<span class="badge active">' + esc(p.executorId) + '</span>' : '<span class="badge default">OCI</span>') + '</div></div><div class="actions">' + projectExecutorControl(p) + '<button class="btn small" data-view-project="' + esc(p.projectId) + '">Advanced</button><button class="btn small primary" data-activate-project="' + esc(p.projectId) + '">Activate</button></div></div>'
+      '<div class="project-row"><div><div class="project-name">' + esc(p.name) + ' ' + (p.projectId === activeId ? '<span class="badge active">ACTIVE</span>' : '') + '</div><div class="mono">' + esc(p.root) + '</div><div class="badges" style="margin-top:7px"><span class="badge">' + esc(p.branch || 'no branch') + '</span>' + (p.dirty ? '<span class="badge warn">dirty</span>' : '<span class="badge ok">clean</span>') + (p.executorKind === 'remote' ? '<span class="badge active">' + esc(p.executorId) + '</span>' : '<span class="badge default">Local</span>') + '</div></div><div class="actions">' + projectExecutorControl(p) + '<button class="btn small" data-view-project="' + esc(p.projectId) + '">Advanced</button><button class="btn small primary" data-activate-project="' + esc(p.projectId) + '">Activate</button></div></div>'
     ).join('') + '</div>' + executorSummaryHtml();
   }
   function rolesPage() {
@@ -557,7 +547,7 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
   }
   function guidePage() {
     return '<div class="guide-hero">' +
-      '<div class="panel guide-hero-copy"><div><span class="badge active">START HERE</span></div><div><h1>JK 시작 가이드</h1><div class="sub">프로젝트를 고르고 → ChatGPT에서 @jk로 요청하면 됩니다. Role·권한·실행 위치는 작업 의도와 연결 상태에 맞춰 선택됩니다.</div></div><div class="badges"><span class="badge ok">OCI Hub + Workers</span><span class="badge">Auto role</span><span class="badge">Least privilege</span></div></div>' +
+      '<div class="panel guide-hero-copy"><div><span class="badge active">START HERE</span></div><div><h1>JK 시작 가이드</h1><div class="sub">프로젝트를 고르고 → ChatGPT에서 @jk로 요청하면 됩니다. Role·권한·실행 위치는 작업 의도와 연결 상태에 맞춰 선택됩니다.</div></div><div class="badges"><span class="badge ok">Local + Workers</span><span class="badge">Auto role</span><span class="badge">Least privilege</span></div></div>' +
       '<div class="panel guide-flow"><svg viewBox="0 0 420 210" role="img" aria-label="Project에서 @jk 요청 후 JK가 자동으로 실행 방식을 선택하는 흐름"><defs><marker id="g-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#596270"/></marker></defs><rect x="20" y="70" width="100" height="70" rx="10" fill="#171b21" stroke="#323944"/><path d="M43 91h20l8 8h25v25H43z" fill="none" stroke="#f97316" stroke-width="2"/><text x="70" y="158" text-anchor="middle" fill="#cfd5de" font-size="12">Project</text><line x1="126" y1="105" x2="157" y2="105" stroke="#596270" stroke-width="2" marker-end="url(#g-arrow)"/><rect x="164" y="70" width="92" height="70" rx="10" fill="#171b21" stroke="#323944"/><path d="M180 90h58v27h-29l-13 10v-10h-16z" fill="none" stroke="#60a5fa" stroke-width="2"/><text x="210" y="158" text-anchor="middle" fill="#cfd5de" font-size="12">@jk 요청</text><line x1="262" y1="105" x2="293" y2="105" stroke="#596270" stroke-width="2" marker-end="url(#g-arrow)"/><rect x="300" y="70" width="100" height="70" rx="10" fill="#171b21" stroke="#323944"/><path d="M350 86l20 8v13c0 14-9 24-20 30-11-6-20-16-20-30V94z" fill="none" stroke="#22c55e" stroke-width="2"/><path d="M340 107l7 7 14-17" fill="none" stroke="#22c55e" stroke-width="2"/><text x="350" y="158" text-anchor="middle" fill="#cfd5de" font-size="12">Auto JK</text></svg></div>' +
       '</div>' +
       '<div class="guide-steps"><div class="guide-step"><div class="num">1</div><strong>프로젝트 고르기</strong><p>Projects에서 작업할 코드베이스를 선택합니다. Dashboard의 Active Project와 같은지 확인하세요.</p></div><div class="guide-step"><div class="num">2</div><strong>@jk로 요청</strong><p>“@jk 이 버그 수정해줘”, “QA 해줘”처럼 목적만 자연어로 말하면 됩니다.</p></div><div class="guide-step"><div class="num">3</div><strong>자동 Role · 권한</strong><p>JK가 Builder, Reviewer, QA, Researcher 등을 고르고 필요한 범위로 권한을 낮춥니다.</p></div><div class="guide-step"><div class="num">4</div><strong>필요할 때만 Override</strong><p>고정 Role이 필요하면 Projects의 Manage에서 수동 적용할 수 있으며 이후 자동 선택보다 우선합니다.</p></div></div>' +
@@ -652,13 +642,6 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
   async function disablePush() { const r=await api('/api/jk/control/notifications',{method:'POST',body:JSON.stringify({enabled:false})}); state.notifications=r.notifications; render(); toast('푸시 알림 꺼짐'); }
   async function testPush() { const r=await api('/api/jk/control/notifications/test',{method:'POST',body:'{}'}); toast(r.delivered ? '테스트 푸시 전송됨' : '푸시 전송 실패'); }
   async function copyPushTopic() { const topic=state.notifications && state.notifications.topic; if (!topic) return; try { await navigator.clipboard.writeText(topic); toast('토픽 복사됨'); } catch { window.prompt('ntfy에서 이 토픽을 구독하세요.',topic); } }
-  async function requestDeploymentSync() {
-    const r = await api('/api/jk/control/deployment/sync', {method:'POST', body:'{}'});
-    await loadAll({quiet:true});
-    if (r.status === 'running') { toast('JK runtime 동기화가 이미 실행 중입니다.'); return; }
-    navigate('approvals');
-    toast(r.reused ? '기존 승인 요청을 그대로 사용합니다.' : '승인 1회 후 동기화 · 재시작이 자동 실행됩니다.');
-  }
   function bindPage() {
     document.querySelectorAll('[data-nav-page]').forEach(b => b.addEventListener('click', () => navigate(b.dataset.navPage)));
     const ps = document.getElementById('project-context-select'); if (ps) ps.addEventListener('change', e => selectContext(e.target.value));
@@ -683,8 +666,6 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
     const pd = document.getElementById('push-disable'); if (pd) pd.addEventListener('click', () => disablePush().catch(e=>toast(e.message)));
     const pt = document.getElementById('push-test'); if (pt) pt.addEventListener('click', () => testPush().catch(e=>toast(e.message)));
     const pc = document.getElementById('push-copy-topic'); if (pc) pc.addEventListener('click', () => copyPushTopic().catch(e=>toast(e.message)));
-    const syncRuntime = document.getElementById('sync-jk-runtime'); if (syncRuntime) syncRuntime.addEventListener('click', () => requestDeploymentSync().catch(e=>toast(e.message)));
-    const runtimeApprovals = document.getElementById('open-runtime-approvals'); if (runtimeApprovals) runtimeApprovals.addEventListener('click', () => navigate('approvals'));
     document.querySelectorAll('[data-approval-decision]').forEach(b => b.addEventListener('click', async () => { try { const approval=state.approvals.find(a=>a.id===b.dataset.approvalId); const decision=b.dataset.approvalDecision; await api('/api/jk/control/approvals/' + encodeURIComponent(b.dataset.approvalId), {method:'POST', body:JSON.stringify({decision})}); await loadAll({quiet:true}); toast(decision === 'supervise' ? '승인됨 · 요청한 작업을 자동 실행합니다.' : decision === 'approve' ? (approval && approval.scopeLabel ? '조회 승인됨 · 요청한 조회를 자동 실행합니다.' : '승인됨 · 이 명령을 자동 실행합니다.') : 'Approval denied.'); } catch (e) { toast(e.message); } }));
   }
   function navigate(page) { if (!allowedPages.includes(page)) return; state.page=page; history.replaceState(null, '', page === 'dashboard' ? '/' : page === 'approvals' ? '/approvals' : '/?page=' + encodeURIComponent(page)); render(); }

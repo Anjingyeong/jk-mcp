@@ -106,17 +106,15 @@ JK는 commit이나 push를 자동으로 해버리는 것보다 **사용자가 �
 
 단순히 "고쳐줘"라고 말한 경우에는 보통 수정과 검증까지만 기대하는 것이 안전합니다.
 
-### G. Windows / GitHub / OCI 동기화
+### G. 로컬 / Remote executor 선택
 
-하이브리드 프로젝트의 기본 흐름은 **`Windows -> GitHub -> OCI` 단방향**입니다.
+프로젝트는 **로컬 실행이 기본값**이며, 사용자가 별도 executor를 연결하고 선택한 경우에만 원격 실행을 사용합니다.
 
-- GitHub가 코드의 기준점입니다.
-- Windows는 자동 pull하지 않습니다. 사용자가 명시적으로 요청할 때만 pull합니다.
-- 평소 개발과 Windows 전용 작업은 Windows에서 수행합니다.
-- OCI는 GitHub `main`을 주기적으로 확인하고, clean 상태에서 fast-forward 가능한 경우에만 반영합니다.
-- OCI 반영 후에는 build -> JK reload -> health/auth/tunnel QA를 수행합니다.
-- OCI가 dirty/diverged 상태이거나 OCI에만 있는 commit이 있으면 자동 동기화는 중단되고 기존 작업을 보존합니다.
-- 자동 stash/reset/rebase/force-update는 하지 않습니다.
+- 현재 PC의 JK runtime이 기본 실행 위치입니다.
+- 다른 OS나 머신이 필요한 작업에만 remote executor를 선택적으로 연결합니다.
+- 머신 간 Git 동기화는 사용자가 관리하며 JK가 임의로 pull/reset/rebase/force-update하지 않습니다.
+- 공유 프로젝트는 하나의 기준 저장소를 정하고 여러 머신에서 같은 브랜치를 동시에 독립 수정하지 않는 것을 권장합니다.
+- 특정 클라우드의 상시 서버/자동 배포 구성은 공개판 기본 설치 범위에 포함하지 않습니다.
 
 ## 3. 추천 프롬프트 구조
 

@@ -13,6 +13,7 @@ dist/
 .chatgpt2codex/
 .gpt2codex/
 .omo/
+/.jk/
 /.local-tools/
 /build/
 /bin/

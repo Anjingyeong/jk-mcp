@@ -59,8 +59,6 @@ ChatGPT 웹
 
 - Oracle Cloud VM
 - AWS EC2
-- `jk.maintainer.example`
-- `mcp.maintainer.example`
 - 유지보수자의 개인 서버
 
 다만 ChatGPT 웹은 사용자 PC의 `127.0.0.1`에 직접 접속할 수 없으므로 **웹에서 사용할 때는 인터넷에서 접근 가능한 HTTPS 경로**가 필요합니다.
@@ -69,7 +67,7 @@ JK의 Windows 패키지는 초보자용으로 Cloudflare Quick Tunnel 경로를 
 
 ### Quick Tunnel의 특징
 
-- OCI나 개인 서버가 필요 없습니다.
+- 별도 클라우드 VM이나 개인 서버가 필요 없습니다.
 - 별도 도메인이 없어도 시작할 수 있습니다.
 - 앱/터널을 재시작하면 URL이 바뀔 수 있습니다.
 - URL이 바뀌면 ChatGPT Connector도 새 URL로 갱신해야 합니다.
@@ -185,23 +183,23 @@ npm run windows:portable
 
 릴리스 태그(`v*`)를 push하거나 Windows Release workflow를 수동 실행하면 GitHub Actions가 Windows installer와 Portable ZIP을 Release에 게시하도록 구성되어 있습니다.
 
-## OCI / Remote executor는 언제 필요한가요?
+## Remote executor는 언제 필요한가요?
 
 일반 사용자에게는 필요 없습니다.
 
-OCI 같은 상시 control plane은 다음과 같은 고급 운영 상황에서만 고려할 수 있습니다.
+별도 머신이나 상시 runtime은 다음과 같은 고급 운영 상황에서만 고려하면 됩니다.
 
 - PC가 꺼져 있어도 항상 같은 endpoint를 유지하고 싶을 때
 - 여러 머신을 remote executor로 묶을 때
 - 개인 도메인과 상시 tunnel을 직접 운영할 때
 
-이 경우에도 개인 인프라 설정은 공개 기본 설치 흐름과 분리하는 것을 권장합니다. 호스트별 확장은 [LOCAL_OVERRIDES.md](LOCAL_OVERRIDES.md), 실행 정책은 [EXECUTION_POLICY.md](EXECUTION_POLICY.md)를 참고하세요.
+이 경우에도 개인 인프라 설정은 공개 기본 설치 흐름과 분리하는 것을 권장합니다. 호스트별 확장은 [LOCAL_OVERRIDES.md](LOCAL_OVERRIDES.md)를 사용하세요. 특정 클라우드 제공자용 프로비저닝과 자동 배포는 공개판 기본 기능이 아닙니다.
 
 ---
 
 # English quick install
 
-For normal Windows users, **OCI is not required**. Download either `JK-<version>-Windows-Setup.exe` or `JK-<version>-Windows-Portable.zip` from this repository's GitHub Releases.
+For normal Windows users, **no cloud server is required**. Download either `JK-<version>-Windows-Setup.exe` or `JK-<version>-Windows-Portable.zip` from this repository's GitHub Releases.
 
 Launch JK, select a project folder, enable **ChatGPT web connector**, leave the hostname blank for a temporary Quick Tunnel, click **Start MCP**, copy the `/mcp` Connector URL, and add it in ChatGPT **Apps / Connectors**. Use the local Owner Token when approval is requested.
 

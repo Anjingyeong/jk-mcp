@@ -4,7 +4,7 @@ import { CONTROL_CENTER_HTML } from "./ui.js";
 describe("Control Center dashboard links and mobile layout", () => {
   it("keeps Quick Links limited to external service entry points", () => {
     expect(CONTROL_CENTER_HTML).toContain("Quick Links");
-    expect(CONTROL_CENTER_HTML).toContain("hiddenQuickLinkTitles = ['CleanTube APK', 'Gecko QA APK']");
+    expect(CONTROL_CENTER_HTML).not.toContain("hiddenQuickLinkTitles");
     expect(CONTROL_CENTER_HTML).not.toContain("{title:'JK Dashboard'");
     expect(CONTROL_CENTER_HTML).not.toContain("href:location.origin + '/approvals'");
     expect(CONTROL_CENTER_HTML).toContain("별도 서비스와 배포 진입점만 모았습니다.");
@@ -31,12 +31,13 @@ describe("Control Center dashboard links and mobile layout", () => {
     expect(CONTROL_CENTER_HTML).toContain("Network ");
   });
 
-  it("offers a bounded one-click JK runtime sync that still requires one owner approval", () => {
-    expect(CONTROL_CENTER_HTML).toContain('id="sync-jk-runtime"');
-    expect(CONTROL_CENTER_HTML).toContain("서버 동기화 · 재시작");
-    expect(CONTROL_CENTER_HTML).toContain("승인 1회만 필요합니다.");
-    expect(CONTROL_CENTER_HTML).toContain("/api/jk/control/deployment/sync");
-    expect(CONTROL_CENTER_HTML).toContain("bash scripts/sync-jk-oci.sh --reload-current");
+  it("keeps maintainer-specific deployment actions out of the public control center", () => {
+    expect(CONTROL_CENTER_HTML).not.toContain('id="sync-jk-runtime"');
+    expect(CONTROL_CENTER_HTML).not.toContain("/api/jk/control/deployment/sync");
+    expect(CONTROL_CENTER_HTML).not.toContain("sync-jk-oci.sh");
+    expect(CONTROL_CENTER_HTML).toContain("Local + Workers");
+    expect(CONTROL_CENTER_HTML).toContain('<span class="badge default">Local</span>');
+    expect(CONTROL_CENTER_HTML).not.toContain('<span class="badge default">OCI</span>');
   });
 
   it("labels reconciled stale approval history separately from live failures", () => {

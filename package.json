@@ -1,11 +1,13 @@
 {
-  "name": "chatgpt2codex",
-  "version": "0.2.1",
-  "description": "Local MCP coding runtime that lets GPT/ChatGPT act as a Codex-like coding agent over a multi-project workspace.",
-  "author": "ezBuilder",
+  "name": "jk-mcp",
+  "version": "0.2.2",
+  "description": "JK local MCP coding runtime with project-scoped safety, persistent work sessions, Git, E2E, and optional remote executors.",
+  "author": "Anjingyeong",
+  "contributors": ["ezBuilder (upstream original author)"],
   "copyright": "Original work Copyright 2026 ezBuilder. All rights reserved.",
   "type": "module",
   "bin": {
+    "jk": "dist/cli.js",
     "chatgpt2codex": "dist/cli.js"
   },
   "engines": {

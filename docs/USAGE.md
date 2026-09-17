@@ -104,19 +104,15 @@ JK treats commit and push as explicit user actions rather than something to do s
 
 If you only say "fix it," the safe expectation is usually implementation plus verification, not an automatic push.
 
-### G. Choose Windows vs OCI
+### G. Choose local vs remote execution
 
-Projects stay **local-only by default**. A project becomes **hybrid** only after the user explicitly asks to use it from OCI or another executor.
+Projects stay **local by default**. A project uses a remote executor only after the user explicitly configures and selects one.
 
-For hybrid projects, GitHub is the shared source of truth and synchronization is intentionally one-way for normal operation: `Windows -> GitHub -> OCI`.
-
-- Windows never auto-pulls. Pull there only when the user explicitly asks.
-- Windows is the normal interactive development workspace and is required for Windows-specific tooling, GUI/device access, signing, Android Studio/emulators, and packaging.
-- OCI follows GitHub `main` only through the guarded clean + fast-forward-only path, then builds, reloads JK, and runs health/auth/tunnel QA.
-- If OCI is dirty, diverged, or has local-only commits, automatic synchronization stops without stash/reset/rebase/force-update.
-- Do not independently modify the same branch on OCI and Windows at the same time.
-
-See `docs/EXECUTION_POLICY.md` for the durable policy.
+- The local JK runtime is the default execution target.
+- Remote executors are optional and are useful when a task needs another machine or OS.
+- Git synchronization between machines is user-managed; JK does not silently pull, reset, rebase, or force-update a checkout.
+- Keep one durable source of truth for shared projects and avoid independently editing the same branch on multiple machines at the same time.
+- Provider-specific cloud deployment and always-on infrastructure are outside the public distribution's default setup.
 
 ## 3. Recommended prompt structure
 

@@ -1,4 +1,4 @@
-import { chmod, open, readFile, stat, writeFile } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { json } from "express";
 import type { Express, Response } from "express";
@@ -624,67 +624,6 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
     }
   });
 
-  app.get("/oci-auth", pageAccess, async (_req, res) => {
-    setLocalPageHeaders(res);
-    try {
-      const secretsDir = path.join(process.cwd(), "oci-jk-bootstrap", ".secrets");
-      const publicKey = (await readFile(path.join(secretsDir, "oci_api_key_public.pem"), "utf8"))
-        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const fingerprint = (await readFile(path.join(secretsDir, "fingerprint.txt"), "utf8")).trim();
-      res.type("html").send(`<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JK · OCI API Key 설정</title><style>
-body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d10;color:#f2f4f7;margin:0;display:grid;place-items:center;min-height:100vh}
-main{width:min(760px,calc(100% - 40px));background:#111419;border:1px solid #262c35;border-radius:12px;padding:28px}
-h1{font-size:22px;margin:0 0 10px}p{color:#9aa3b2;line-height:1.55}label{display:block;margin:22px 0 8px;font-weight:650}
-textarea{box-sizing:border-box;width:100%;min-height:150px;padding:12px 14px;border-radius:9px;border:1px solid #343b46;background:#0b0d10;color:#fff;font:13px ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical}
-button{margin-top:14px;width:100%;padding:12px 14px;border:0;border-radius:9px;background:#f97316;color:#fff;font-weight:750;font-size:15px;cursor:pointer}
-small,.hint{display:block;margin-top:10px;color:#788291;line-height:1.5}.fp{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#f2f4f7}.status{margin-top:14px}</style></head>
-<body><main><h1>OCI API Key 설정</h1>
-<p>1) OCI Console → User settings → API Keys → Add API Key → <b>Paste Public Key</b>에서 아래 공개키를 등록하세요.</p>
-<label>Public key</label><textarea readonly onclick="this.select()">${publicKey}</textarea>
-<div class="hint">Fingerprint: <span class="fp">${fingerprint}</span></div>
-<p>2) 등록 직후 OCI가 보여주는 <b>Configuration File Preview</b> 전체를 아래에 붙여넣으세요. 개인키는 JK OCI 서버에만 있고 브라우저로 전송되지 않습니다.</p>
-<label for="preview">Configuration File Preview</label><textarea id="preview" placeholder="[DEFAULT]\nuser=ocid1.user...\nfingerprint=...\ntenancy=ocid1.tenancy...\nregion=ap-chuncheon-1"></textarea>
-<button id="save">JK에 OCI 설정 저장</button><div id="status" class="status hint"></div>
-<script>
-document.getElementById('save').onclick=async()=>{const status=document.getElementById('status');status.textContent='검증 중...';
-const r=await fetch('/api/jk/oci-auth/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({configPreview:document.getElementById('preview').value})});
-const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니다.'}));status.textContent=j.ok?'저장 완료. 이제 preflight를 실행할 수 있습니다.':('오류: '+(j.error||r.status));};
-</script></main></body></html>`);
-    } catch (err) {
-      res.status(409).type("text/plain").send(`OCI API key setup is not ready: ${redact((err as Error).message)}`);
-    }
-  });
-
-  app.post("/api/jk/oci-auth/config", apiAccess, json({ limit: "32kb" }), async (req, res) => {
-    try {
-      const preview = typeof req.body?.configPreview === "string" ? req.body.configPreview : "";
-      const fields = new Map<string, string>();
-      for (const match of preview.matchAll(/^\s*(user|fingerprint|tenancy|region)\s*=\s*([^\r\n]+)\s*$/gmi)) {
-        fields.set(match[1].toLowerCase(), match[2].trim());
-      }
-      const user = fields.get("user") ?? "";
-      const tenancy = fields.get("tenancy") ?? "";
-      const fingerprint = fields.get("fingerprint") ?? "";
-      const region = fields.get("region") ?? "";
-      if (!user.startsWith("ocid1.user.")) throw new Error("Configuration Preview의 user OCID가 없습니다.");
-      if (!tenancy.startsWith("ocid1.tenancy.")) throw new Error("Configuration Preview의 tenancy OCID가 없습니다.");
-      if (region !== "ap-chuncheon-1") throw new Error(`region은 ap-chuncheon-1이어야 합니다. 현재: ${region || "없음"}`);
-      const secretsDir = path.join(process.cwd(), "oci-jk-bootstrap", ".secrets");
-      const expectedFingerprint = (await readFile(path.join(secretsDir, "fingerprint.txt"), "utf8")).trim().toLowerCase();
-      if (fingerprint.toLowerCase() !== expectedFingerprint) throw new Error("등록된 API Key fingerprint가 JK OCI 공개키와 일치하지 않습니다.");
-      const keyFile = path.join(secretsDir, "oci_api_key.pem");
-      const config = `[OCI_GRABBER]\nuser=${user}\nfingerprint=${fingerprint}\ntenancy=${tenancy}\nregion=${region}\nkey_file=${keyFile}\n`;
-      const configPath = path.join(secretsDir, "config");
-      await writeFile(configPath, config, { encoding: "utf8", mode: 0o600 });
-      await chmod(configPath, 0o600);
-      res.json({ ok: true, profile: "OCI_GRABBER", region });
-    } catch (err) {
-      res.status(400).json({ ok: false, error: redact((err as Error).message) });
-    }
-  });
-
   app.use("/api/jk/control", apiAccess, json({ limit: "128kb" }));
 
   app.get("/api/jk/control/status", async (_req, res) => {
@@ -742,8 +681,8 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
         },
         executors: {
           local: {
-            executorId: "oci-main",
-            label: "OCI Hub",
+            executorId: "local",
+            label: "Local runtime",
             online: true,
             platform: `${process.platform}/${process.arch}`,
             workspaceRoot: ctx.workspaceRoot,
@@ -827,7 +766,7 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
       const projectId = typeof req.body?.projectId === "string" ? req.body.projectId.trim() : "";
       const executorId = typeof req.body?.executorId === "string" ? req.body.executorId.trim() : "";
       if (!projectId || !executorId) throw new Error("projectId and executorId are required");
-      await setProjectExecutorRoute(ctx.stateDir, projectId, executorId === "oci-main" ? null : executorId);
+      await setProjectExecutorRoute(ctx.stateDir, projectId, executorId === "local" ? null : executorId);
       res.json({ ok: true, projectId, executorId });
     } catch (err) {
       sendApiError(res, err);
@@ -909,71 +848,6 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
       ]);
       res.setHeader("Cache-Control", "no-store");
       res.json({ ok: true, approvals, jobs });
-    } catch (err) {
-      sendApiError(res, err);
-    }
-  });
-
-  app.post("/api/jk/control/deployment/sync", async (_req, res) => {
-    try {
-      if (process.platform === "win32") {
-        throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "JK deployment sync is available only on the Linux/OCI hub runtime");
-      }
-
-      const deploymentRoot = path.resolve(process.env.JK_DEPLOYMENT_PROJECT_ROOT?.trim() || process.cwd());
-      const project = ctx.registry.find((entry) => entry.executorKind !== "remote" && path.resolve(entry.root) === deploymentRoot) ?? null;
-      if (!project) {
-        throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, "The local JK deployment checkout was not found");
-      }
-      try {
-        await Promise.all([
-          stat(path.join(project.root, "src", "server", "tools.ts")),
-          stat(path.join(project.root, "scripts", "sync-jk-oci.sh")),
-          stat(path.join(project.root, "scripts", "reload-jk-runtime.sh")),
-        ]);
-      } catch {
-        throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "The configured JK deployment checkout is missing its fixed runtime sync scripts");
-      }
-
-      const command = "bash scripts/sync-jk-oci.sh --reload-current";
-      const reason = "Sync the OCI JK runtime from its configured upstream, verify the build, then reload through JK's health-checked rollback-capable runtime path";
-      const jobInput = {
-        projectId: project.projectId,
-        command,
-        reason,
-        needsNetwork: true,
-        destructive: true,
-        writesWorkspace: true,
-      };
-      const reusable = await findReusableLocalShellJob(ctx.stateDir, jobInput);
-      if (reusable && (reusable.status === "pending" || reusable.status === "running")) {
-        res.status(reusable.status === "pending" ? 202 : 200).json({
-          ok: true,
-          status: reusable.status,
-          approvalId: reusable.id,
-          job: publicLocalShellJob(reusable),
-          reused: true,
-        });
-        return;
-      }
-
-      const approval = await requestLocalShellApproval(ctx.stateDir, {
-        projectId: project.projectId,
-        command,
-        reason,
-        needsNetwork: true,
-        destructive: true,
-      });
-      const job = await queueLocalShellJob(ctx.stateDir, approval, {
-        command,
-        reason,
-        needsNetwork: true,
-        destructive: true,
-        writesWorkspace: true,
-        timeoutSec: 300,
-      });
-      await ctx.ledger.append({ type: "deployment.sync.queued", projectId: project.projectId, approvalId: approval.id });
-      res.status(202).json({ ok: true, status: "pending", approvalId: approval.id, job: publicLocalShellJob(job), reused: false });
     } catch (err) {
       sendApiError(res, err);
     }

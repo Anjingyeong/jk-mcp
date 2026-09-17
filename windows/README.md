@@ -37,7 +37,7 @@ ChatGPT web
   -> selected project folder
 ```
 
-따라서 Oracle Cloud VM, AWS, `jk.maintainer.example`, `mcp.maintainer.example` 같은 유지보수자 인프라는 일반 사용자에게 필요하지 않습니다.
+따라서 Oracle Cloud VM, AWS 같은 별도 클라우드 인프라나 유지보수자 개인 서버는 일반 사용자에게 필요하지 않습니다.
 
 ChatGPT 웹은 localhost에 직접 접근할 수 없기 때문에 웹 커넥터에는 HTTPS 경로가 필요합니다. 가장 쉬운 방법은 임시 Quick Tunnel입니다. 앱을 재시작하면 주소가 바뀔 수 있으므로 그때 ChatGPT Connector URL도 갱신합니다.
 

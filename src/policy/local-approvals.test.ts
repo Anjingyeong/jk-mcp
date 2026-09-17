@@ -132,19 +132,19 @@ describe("local shell approvals", () => {
 
   it("reuses a task bundle only for predeclared command and risk hashes", async () => {
     const dir = await stateDir();
-    const workSessionId = "ws_cleantube_release";
-    const taskIdentity = `goal:cleantube-release:work-session:${workSessionId}`;
-    const releaseUpload = "gh release upload android-channel CleanTube-Android-0.1.12.apk --clobber";
+    const workSessionId = "ws_sampleapp_release";
+    const taskIdentity = `goal:sampleapp-release:work-session:${workSessionId}`;
+    const releaseUpload = "gh release upload android-channel SampleApp-Android-0.1.12.apk --clobber";
     const manifestUpload = "gh release upload android-channel android-latest.json --clobber";
     const verify = "curl -I https://updates.example.com/android/latest.apk";
     const first = {
       ...input({
       command: releaseUpload,
-      reason: "Publish CleanTube Android stable release",
+      reason: "Publish SampleApp Android stable release",
       taskIdentity,
       destructive: true,
       bundle: {
-        label: "CleanTube v0.1.12 stable release",
+        label: "SampleApp v0.1.12 stable release",
         entries: [
           { command: releaseUpload, needsNetwork: true, destructive: true },
           { command: manifestUpload, needsNetwork: true, destructive: true },
@@ -155,7 +155,7 @@ describe("local shell approvals", () => {
       workSessionId,
     } satisfies LocalShellApprovalInput & { workSessionId: string };
     const requested = await requestLocalShellApproval(dir, first);
-    expect(requested.bundleLabel).toBe("CleanTube v0.1.12 stable release");
+    expect(requested.bundleLabel).toBe("SampleApp v0.1.12 stable release");
     expect(requested.bundleCommandKeys).toHaveLength(3);
     expect(requested).toMatchObject({
       workSessionId,
@@ -205,18 +205,18 @@ describe("local shell approvals", () => {
 
   it("reuses one pending release bundle for predeclared upload, deploy, and verify commands", async () => {
     const dir = await stateDir();
-    const taskIdentity = "goal:cleantube-friends-release";
+    const taskIdentity = "goal:sampleapp-friends-release";
     const upload = "gh release upload friends-assets YouTube-Music.apk --clobber";
     const deploy = "npx wrangler deploy --config update-proxy/wrangler.jsonc";
     const verify = "curl -I https://updates.example.com/android/latest.apk";
     const musicVerify = "curl -I https://updates.example.com/music/youtube-music.apk";
     const first = await requestLocalShellApproval(dir, input({
       command: upload,
-      reason: "Finish CleanTube friends release",
+      reason: "Finish SampleApp friends release",
       taskIdentity,
       destructive: true,
       bundle: {
-        label: "CleanTube friends release",
+        label: "SampleApp friends release",
         entries: [
           { command: upload, needsNetwork: true, destructive: true },
           { command: deploy, needsNetwork: true, destructive: true },
@@ -424,9 +424,9 @@ describe("local shell approvals", () => {
   it("reuses a supervised grant by stable task identity even when the reason text changes", async () => {
     const dir = await stateDir();
     const first = input({
-      command: "npx wrangler pages deploy dist --project-name jingyeong-vibe",
-      reason: "Deploy the vibe portfolio",
-      taskIdentity: "loop:vibe-release",
+      command: "npx wrangler pages deploy dist --project-name sample-portfolio",
+      reason: "Deploy the sample portfolio",
+      taskIdentity: "loop:sample-portfolio-release",
     });
     const requested = await requestLocalShellApproval(dir, first);
     await resolveLocalShellApproval(dir, requested.id, "supervise");
@@ -435,9 +435,9 @@ describe("local shell approvals", () => {
       await consumeLocalShellApproval(
         dir,
         input({
-          command: "curl -I https://vibe.example.com",
+          command: "curl -I https://portfolio.example.com",
           reason: "Verify the live portfolio",
-          taskIdentity: "loop:vibe-release",
+          taskIdentity: "loop:sample-portfolio-release",
         }),
       ),
     ).toBe(true);
@@ -446,8 +446,8 @@ describe("local shell approvals", () => {
       await consumeLocalShellApproval(
         dir,
         input({
-          command: "curl -I https://vibe.example.com",
-          reason: "Deploy the vibe portfolio",
+          command: "curl -I https://portfolio.example.com",
+          reason: "Deploy the sample portfolio",
           taskIdentity: "loop:other-release",
         }),
       ),

@@ -18,7 +18,7 @@ JK는 [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)를 �
 
 ## 지인에게 배포할 때 가장 쉬운 방법 (Windows)
 
-지인이 JK를 쓰는 데 **OCI 서버는 필요하지 않습니다.** 기본 배포 방식은 각자 PC에서 `JK.exe`가 로컬 런타임을 실행하고, ChatGPT 웹 연결이 필요할 때만 앱에 포함된 Cloudflare Quick Tunnel을 사용하는 방식입니다.
+지인이 JK를 쓰는 데 **클라우드 서버는 필요하지 않습니다.** 기본 배포 방식은 각자 PC에서 `JK.exe`가 로컬 런타임을 실행하고, ChatGPT 웹 연결이 필요할 때만 앱에 포함된 Cloudflare Quick Tunnel을 사용하는 방식입니다.
 
 GitHub Releases에는 두 파일을 배포합니다.
 
@@ -39,7 +39,7 @@ GitHub Releases에는 두 파일을 배포합니다.
 8. 승인 요청이 나오면 JK 앱의 **Owner Token**으로 본인 PC 연결임을 확인합니다.
 9. 이후 채팅에서 `@jk 이 프로젝트 구조를 확인해줘`처럼 자연어로 요청합니다.
 
-> **OCI 없이 사용한다는 뜻:** 별도의 Oracle Cloud VM, 개인 서버, `jk.maintainer.example`, `mcp.maintainer.example`가 필요 없다는 뜻입니다. 다만 ChatGPT 웹이 집 PC의 localhost에 직접 접속할 수 없으므로 웹 커넥터를 켜면 인터넷을 통한 HTTPS 경로가 필요합니다. JK의 기본 초보자 경로는 임시 Cloudflare Quick Tunnel이며, 주소는 재시작 시 바뀔 수 있습니다. 고정 주소가 필요할 때만 본인 도메인/Named Tunnel 또는 직접 관리하는 HTTPS reverse proxy를 선택하면 됩니다.
+> **클라우드 서버 없이 사용:** ChatGPT 웹이 집 PC의 localhost에 직접 접속할 수 없으므로 웹 커넥터를 켜면 인터넷을 통한 HTTPS 경로가 필요합니다. JK의 기본 초보자 경로는 임시 Cloudflare Quick Tunnel이며, 주소는 재시작 시 바뀔 수 있습니다. 고정 주소가 필요할 때만 본인 도메인, Named Tunnel 또는 직접 관리하는 HTTPS reverse proxy를 선택하면 됩니다.
 
 설치 파일은 현재 코드 서명이 없는 개발 배포판일 수 있어 Windows SmartScreen 경고가 나타날 수 있습니다. 반드시 이 저장소의 GitHub Release에서 받은 파일인지 확인한 뒤 실행하세요. Owner Token은 비밀번호처럼 다루고 다른 사람과 공유하지 마세요.
 

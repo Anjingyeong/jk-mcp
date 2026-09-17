@@ -226,8 +226,8 @@ export function nestedProjectRoots(
 /**
  * Scan the configured workspace and, only for a source/development JK runtime,
  * also expose JK's own checkout as a separately leased project. This keeps
- * self-maintenance available when the launcher workspace is a selected app
- * such as CleanTube, without allowing arbitrary paths outside the workspace.
+ * self-maintenance available when the launcher workspace is a selected app,
+ * without allowing arbitrary paths outside the workspace.
  */
 export async function scanWorkspaceWithRuntimeSelf(
   root: string,

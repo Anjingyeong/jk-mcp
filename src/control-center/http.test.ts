@@ -372,38 +372,13 @@ describe("JK Control Center", () => {
     expect(status.deployment).toMatchObject(deployment);
   });
 
-  it.skipIf(process.platform === "win32")("queues one fixed JK deployment sync approval and reuses it on repeated dashboard clicks", async () => {
-    process.env.JK_DEPLOYMENT_PROJECT_ROOT = projectRoot;
-    await mkdir(path.join(projectRoot, "src", "server"), { recursive: true });
-    await mkdir(path.join(projectRoot, "scripts"), { recursive: true });
-    await writeFile(path.join(projectRoot, "src", "server", "tools.ts"), "// marker\n");
-    await writeFile(path.join(projectRoot, "scripts", "sync-jk-oci.sh"), "#!/usr/bin/env bash\n");
-    await writeFile(path.join(projectRoot, "scripts", "reload-jk-runtime.sh"), "#!/usr/bin/env bash\n");
-
-    const firstResponse = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
+  it("does not expose the maintainer-only deployment sync endpoint", async () => {
+    const response = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ command: "systemctl restart anything" }),
+      body: "{}",
     });
-    expect(firstResponse.status).toBe(202);
-    const first = await firstResponse.json() as any;
-    expect(first).toMatchObject({ ok: true, status: "pending", reused: false });
-    expect(first.job.commandPreview).toBe("bash scripts/sync-jk-oci.sh --reload-current");
-    expect(first.job.needsNetwork).toBe(true);
-    expect(first.job.destructive).toBe(true);
-
-    const secondResponse = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ command: "rm -rf /" }),
-    });
-    expect(secondResponse.status).toBe(202);
-    const second = await secondResponse.json() as any;
-    expect(second).toMatchObject({ ok: true, status: "pending", reused: true, approvalId: first.approvalId });
-
-    const approvals = await (await fetch(`${app!.baseUrl}/api/jk/control/approvals`)).json() as any;
-    const deploymentApprovals = approvals.approvals.filter((item: any) => item.commandPreview === "bash scripts/sync-jk-oci.sh --reload-current");
-    expect(deploymentApprovals).toHaveLength(1);
+    expect(response.status).toBe(404);
   });
 
   it("loads sanitized host-local quick links without hardcoding them in the public UI", async () => {
