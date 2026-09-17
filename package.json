@@ -5,16 +5,44 @@
   "author": "Anjingyeong",
   "contributors": ["ezBuilder (upstream original author)"],
   "copyright": "Original work Copyright 2026 ezBuilder. All rights reserved.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "chatgpt",
+    "coding",
+    "developer-tools",
+    "local-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Anjingyeong/jk-mcp.git"
+  },
+  "homepage": "https://github.com/Anjingyeong/jk-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Anjingyeong/jk-mcp/issues"
+  },
   "type": "module",
   "bin": {
     "jk": "dist/cli.js",
     "chatgpt2codex": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "assets/readme-hero.png",
+    "docs/INSTALL.md",
+    "docs/ATTRIBUTION_AND_COMPLIANCE.md",
+    "docs/NPM_PUBLISHING.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node scripts/write-runtime-schema-manifest.mjs",
+    "postbuild": "node -e \"if(process.platform!=='win32')require('node:fs').chmodSync('dist/cli.js',0o755)\"",
+    "prepack": "npm run build",
     "chatgpt": "bash start-chatgpt.sh",
     "chatgpt:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File start-chatgpt.ps1",
     "chatgpt:linux": "bash linux/start-chatgpt2codex.sh",

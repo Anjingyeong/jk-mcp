@@ -30,11 +30,11 @@ Relevant sources:
 
 ### Practical consequence for this fork
 
-This repository should **not** describe the upstream code as MIT/Apache/open-source unless ezBuilder publishes an applicable license or grants permission.
+The JK maintainer has obtained direct permission from ezBuilder to redistribute this modified fork. The private permission correspondence is retained by the maintainer and is not reproduced in this public repository.
 
-A GitHub fork can remain visible as a fork under GitHub's platform terms, but independent redistribution of the upstream-derived code or modified binary installers/releases is not clearly licensed by the upstream repository as currently published. Before treating this fork as an independently redistributable product, publishing new binary releases, relicensing the combined code, or commercializing the derivative work, obtain permission from ezBuilder or confirm an applicable upstream license with qualified legal counsel.
+That permission addresses JK's redistribution of the modified fork; it does **not** change the upstream repository's public license status, does not make the upstream code MIT/Apache/open source, and should not be presented as a general relicensing grant to third parties. Attribution to the upstream author remains in package and repository metadata.
 
-The upstream project currently publishes its own v0.2.0 macOS and Windows binaries. That demonstrates the upstream maintainer's own distribution practice, but it does not by itself grant downstream forks permission to redistribute modified binaries.
+The npm distribution and optional binary releases should therefore retain the upstream attribution and this compliance notice. If the scope of distribution changes materially (for example, commercial sublicensing or relicensing), re-check the permission terms before making that change.
 
 ## 3. OpenAI / ChatGPT / MCP usage
 

@@ -10,10 +10,11 @@
  *   chatgpt2codex doctor
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
@@ -71,6 +72,49 @@ function defaultStateDir(): string {
   const override = process.env.CHATGPT2CODEX_STATE_DIR;
   if (override && override.trim()) return path.resolve(override.trim());
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
+}
+
+interface SavedSetupConfig {
+  workspaceRoot: string;
+}
+
+function setupConfigPath(stateDir = defaultStateDir()): string {
+  return path.join(stateDir, "setup.json");
+}
+
+async function saveSetupConfig(workspaceRoot: string): Promise<void> {
+  const stateDir = defaultStateDir();
+  await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(
+    setupConfigPath(stateDir),
+    `${JSON.stringify({ workspaceRoot } satisfies SavedSetupConfig, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+}
+
+async function loadSetupWorkspace(): Promise<string | undefined> {
+  let parsed: SavedSetupConfig;
+  try {
+    parsed = JSON.parse(await fs.readFile(setupConfigPath(), "utf8")) as SavedSetupConfig;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return undefined;
+    throw new Error("JK could not read its saved setup. Run `jk setup` again.");
+  }
+  if (!parsed || typeof parsed.workspaceRoot !== "string" || !parsed.workspaceRoot.trim()) {
+    throw new Error("JK's saved setup is invalid. Run `jk setup` again.");
+  }
+  const workspaceRoot = path.resolve(parsed.workspaceRoot);
+  const stat = await fs.stat(workspaceRoot).catch(() => null);
+  if (!stat?.isDirectory()) {
+    throw new Error(`The saved JK folder no longer exists: ${workspaceRoot}. Run \`jk setup\` again.`);
+  }
+  return workspaceRoot;
+}
+
+async function resolveRuntimeWorkspace(flags: Record<string, string | boolean>): Promise<string> {
+  if (typeof flags.workspace === "string") return flags.workspace;
+  return (await loadSetupWorkspace()) ?? process.cwd();
 }
 
 function defaultConfig(workspaceRoot: string, stateDir: string): Config {
@@ -170,14 +214,76 @@ async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<v
   console.error(`chatgpt2codex serve: listening on stdio (workspace=${ctx.workspaceRoot})`);
 }
 
+interface QuickTunnelHandle {
+  child: ChildProcess;
+  publicUrl: string;
+}
+
+interface HttpReadyInfo {
+  connectorUrl: string;
+  workspaceRoot: string;
+}
+
+const QUICK_TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i;
+
+async function startQuickTunnel(port: number): Promise<QuickTunnelHandle> {
+  return await new Promise<QuickTunnelHandle>((resolve, reject) => {
+    const child = spawn(
+      "cloudflared",
+      ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${port}`],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let settled = false;
+    let recentOutput = "";
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGTERM");
+      reject(new Error("Timed out waiting for Cloudflare Quick Tunnel. Run `cloudflared --version` and retry."));
+    }, 20_000);
+
+    const finishError = (message: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.kill("SIGTERM");
+      reject(new Error(message));
+    };
+    const inspect = (chunk: Buffer | string) => {
+      if (settled) return;
+      recentOutput = `${recentOutput}${String(chunk)}`.slice(-12_000);
+      const match = recentOutput.match(QUICK_TUNNEL_URL_RE);
+      if (!match) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ child, publicUrl: match[0] });
+    };
+
+    child.stdout?.on("data", inspect);
+    child.stderr?.on("data", inspect);
+    child.once("error", (error) => {
+      finishError(
+        `Could not start cloudflared (${error.message}). Install the official Cloudflare package first, then retry ` +
+          "`jk start --quick-tunnel`.",
+      );
+    });
+    child.once("exit", (code) => {
+      if (!settled) finishError(`cloudflared exited before a Quick Tunnel URL was issued (exit=${code ?? "unknown"}).`);
+    });
+  });
+}
+
 /**
  * HTTP mode (PRD §4 Transport Gateway, §5 CLI): `chatgpt2codex serve --http
  * [--port 7979] [--public-url <origin>]`. Exposes the SAME registerTools(ctx)
  * catalog as stdio mode over a Streamable HTTP `/mcp` endpoint, gated by
  * OAuth 2.1 (see src/server/http.ts, src/auth/oauth-provider.ts).
  */
-async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<void> {
-  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
+async function cmdServeHttp(
+  flags: Record<string, string | boolean>,
+  onReady?: (info: HttpReadyInfo) => void,
+): Promise<void> {
+  const workspace = await resolveRuntimeWorkspace(flags);
   const ctx = await buildToolContext(workspace);
 
   if (!(await hasOwnerToken(ctx.stateDir))) {
@@ -190,8 +296,19 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
 
   const port = typeof flags.port === "string" ? Number.parseInt(flags.port, 10) : 7979;
   const host = typeof flags.host === "string" ? flags.host : "127.0.0.1";
-  const publicUrl =
+  const quickTunnelRequested = flags["quick-tunnel"] === true;
+  if (quickTunnelRequested && typeof flags["public-url"] === "string") {
+    throw new Error("Use either --quick-tunnel or --public-url, not both.");
+  }
+  let quickTunnelProcess: ChildProcess | undefined;
+  let publicUrl =
     typeof flags["public-url"] === "string" ? (flags["public-url"] as string) : `http://${host}:${port}`;
+  if (quickTunnelRequested) {
+    const tunnel = await startQuickTunnel(port);
+    quickTunnelProcess = tunnel.child;
+    publicUrl = tunnel.publicUrl;
+    console.error(`jk start: Quick Tunnel ready: ${publicUrl}/mcp`);
+  }
   ctx.config.publicUrl = publicUrl;
   const idleShutdownMinutes =
     typeof flags["idle-shutdown-minutes"] === "string" ? Number.parseFloat(flags["idle-shutdown-minutes"]) : 0;
@@ -207,6 +324,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
     if (shuttingDown) return;
     shuttingDown = true;
     const finish = () => {
+      quickTunnelProcess?.kill("SIGTERM");
       closeHttpServer();
       process.exit(exitCode);
     };
@@ -241,6 +359,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
     if (idleShutdownMs !== undefined) {
       console.error(`chatgpt2codex serve --http: idle shutdown after ${idleShutdownMinutes} minute(s) without sessions`);
     }
+    onReady?.({ connectorUrl: `${publicUrl}/mcp`, workspaceRoot: ctx.workspaceRoot });
   });
 
   await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot, transport: "http" });
@@ -260,6 +379,299 @@ async function cmdServe(flags: Record<string, string | boolean>): Promise<void> 
     return;
   }
   await cmdServeStdio(flags);
+}
+
+type SetupPrompt = ReturnType<typeof createInterface>;
+
+interface SetupDependency {
+  label: string;
+  command: string;
+  args: string[];
+  wingetId: string;
+}
+
+const SETUP_DEPENDENCIES: SetupDependency[] = [
+  { label: "Git", command: "git", args: ["--version"], wingetId: "Git.Git" },
+  { label: "ripgrep", command: "rg", args: ["--version"], wingetId: "BurntSushi.ripgrep.MSVC" },
+  {
+    label: "Cloudflare Quick Tunnel",
+    command: "cloudflared",
+    args: ["--version"],
+    wingetId: "Cloudflare.cloudflared",
+  },
+];
+
+function setupIsInteractive(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function expandUserPath(value: string): string {
+  const trimmed = value.trim().replace(/^['"]|['"]$/g, "");
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith(`~${path.sep}`) || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return path.join(os.homedir(), trimmed.slice(2));
+  }
+  return trimmed;
+}
+
+async function validateWorkspaceDirectory(value: string): Promise<string> {
+  const resolved = path.resolve(expandUserPath(value));
+  const stat = await fs.stat(resolved).catch(() => null);
+  if (!stat?.isDirectory()) throw new Error(`Folder does not exist: ${resolved}`);
+  return resolved;
+}
+
+async function askYesNo(prompt: SetupPrompt, question: string, defaultYes: boolean): Promise<boolean> {
+  const suffix = defaultYes ? " [Y/n] " : " [y/N] ";
+  const answer = (await prompt.question(`${question}${suffix}`)).trim().toLowerCase();
+  if (!answer) return defaultYes;
+  return answer === "y" || answer === "yes";
+}
+
+async function browseForWorkspaceWindows(initialDirectory: string): Promise<string | undefined> {
+  const escapedInitial = initialDirectory.replace(/'/g, "''");
+  const script = [
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+    "$dialog.Description = 'Choose the folder JK is allowed to work in'",
+    `$dialog.SelectedPath = '${escapedInitial}'`,
+    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }",
+  ].join("; ");
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-STA", "-Command", script], {
+      timeout: 120_000,
+      windowsHide: false,
+    });
+    const selected = stdout.trim();
+    return selected || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function chooseSetupWorkspace(
+  flags: Record<string, string | boolean>,
+  prompt: SetupPrompt | null,
+): Promise<string> {
+  if (typeof flags.workspace === "string") return await validateWorkspaceDirectory(flags.workspace);
+  const remembered = await loadSetupWorkspace();
+  if (remembered) {
+    console.error(`✓ Using saved allowed folder: ${remembered}`);
+    return remembered;
+  }
+  const current = process.cwd();
+  if (!prompt) return await validateWorkspaceDirectory(current);
+
+  console.error("");
+  console.error("Choose the folder ChatGPT is allowed to work in.");
+  while (true) {
+    const browseHint = process.platform === "win32" ? ", B = browse" : "";
+    const answer = await prompt.question(`Folder (Enter = ${current}${browseHint}): `);
+    let candidate = answer.trim();
+    if (!candidate) candidate = current;
+    if (process.platform === "win32" && candidate.toLowerCase() === "b") {
+      const selected = await browseForWorkspaceWindows(current);
+      if (!selected) {
+        console.error("No folder selected. You can type or paste a folder path instead.");
+        continue;
+      }
+      candidate = selected;
+    }
+    try {
+      return await validateWorkspaceDirectory(candidate);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+    }
+  }
+}
+
+async function refreshWindowsPath(): Promise<void> {
+  if (process.platform !== "win32") return;
+  try {
+    const script = [
+      "$m=[Environment]::GetEnvironmentVariable('Path','Machine')",
+      "$u=[Environment]::GetEnvironmentVariable('Path','User')",
+      "[Console]::Out.Write($m + ';' + $u)",
+    ].join("; ");
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-Command", script], { timeout: 10_000 });
+    const refreshed = stdout.trim();
+    if (refreshed) process.env.PATH = `${refreshed};${process.env.PATH ?? ""}`;
+  } catch {
+    // A fresh terminal will pick up PATH changes even if the current process cannot.
+  }
+}
+
+async function runVisibleProcess(command: string, args: string[]): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: "inherit", windowsHide: false });
+    child.once("error", reject);
+    child.once("exit", (code) => resolve(code ?? 1));
+  });
+}
+
+async function missingSetupDependencies(includeCloudflared: boolean): Promise<SetupDependency[]> {
+  const dependencies = includeCloudflared
+    ? SETUP_DEPENDENCIES
+    : SETUP_DEPENDENCIES.filter((dependency) => dependency.command !== "cloudflared");
+  const missing: SetupDependency[] = [];
+  for (const dependency of dependencies) {
+    if (!(await checkCommand(dependency.command, dependency.args))) missing.push(dependency);
+  }
+  return missing;
+}
+
+async function ensureSetupDependencies(prompt: SetupPrompt | null, includeCloudflared: boolean): Promise<boolean> {
+  const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
+  if (!Number.isFinite(nodeMajor) || nodeMajor < 22) {
+    console.error(`Node.js 22 or newer is required (current: ${process.version}).`);
+    console.error("Install the current Node.js LTS release, open a new terminal, then run `npx -y jk-mcp setup` again.");
+    return false;
+  }
+
+  let missing = await missingSetupDependencies(includeCloudflared);
+  if (missing.length === 0) {
+    console.error("✓ Required helper tools are ready.");
+    return true;
+  }
+
+  console.error(`Missing helper tools: ${missing.map((dependency) => dependency.label).join(", ")}`);
+  if (process.platform !== "win32") {
+    console.error("Install the missing tools from their official package source, then run setup again.");
+    return false;
+  }
+
+  const wingetReady = await checkCommand("winget", ["--version"]);
+  if (!prompt || !wingetReady) {
+    console.error("On Windows, install the missing tools with Windows Package Manager (winget), then run setup again:");
+    for (const dependency of missing) console.error(`  winget install --id ${dependency.wingetId} -e`);
+    return false;
+  }
+
+  console.error("Windows Package Manager will be asked to install only these fixed package IDs:");
+  for (const dependency of missing) console.error(`  ${dependency.label}: ${dependency.wingetId}`);
+
+  const approved = await askYesNo(
+    prompt,
+    "Install the missing tools now with Windows Package Manager? JK will only request the official package IDs shown above.",
+    true,
+  );
+  if (!approved) {
+    console.error("No changes were made. Install the missing tools when ready, then run setup again.");
+    return false;
+  }
+
+  for (const dependency of missing) {
+    console.error(`\nInstalling ${dependency.label} (${dependency.wingetId})...`);
+    const exitCode = await runVisibleProcess("winget", [
+      "install",
+      "--id",
+      dependency.wingetId,
+      "-e",
+      "--accept-package-agreements",
+      "--accept-source-agreements",
+    ]);
+    if (exitCode !== 0) {
+      console.error(`${dependency.label} installation did not complete (exit=${exitCode}).`);
+      return false;
+    }
+  }
+
+  await refreshWindowsPath();
+  missing = await missingSetupDependencies(includeCloudflared);
+  if (missing.length > 0) {
+    console.error(`Installed, but this terminal cannot see: ${missing.map((dependency) => dependency.label).join(", ")}.`);
+    console.error("Close this terminal, open a new PowerShell window, and run `npx -y jk-mcp setup` again.");
+    return false;
+  }
+  console.error("✓ Required helper tools are ready.");
+  return true;
+}
+
+function printSetupReady(info: HttpReadyInfo, connectionCode: string | undefined): void {
+  console.error("");
+  console.error("============================================================");
+  console.error("JK is ready for ChatGPT");
+  console.error("============================================================");
+  console.error("1. Keep this window open while you use JK.");
+  console.error("2. In ChatGPT, open Apps / Connectors and add a custom MCP connector.");
+  console.error("3. Paste this address:");
+  console.error("");
+  console.error(`   ${info.connectorUrl}`);
+  console.error("");
+  if (connectionCode) {
+    console.error("If ChatGPT asks for your private connection code, use this once and save it somewhere private:");
+    console.error("");
+    console.error(`   ${connectionCode}`);
+    console.error("");
+  } else {
+    console.error("Your existing private connection code is still active.");
+    console.error("If you no longer have it, stop JK with Ctrl+C and run `npx -y jk-mcp setup --reset-code`.");
+    console.error("");
+  }
+  console.error(`Allowed folder: ${info.workspaceRoot}`);
+  console.error("After connecting, you can simply ask ChatGPT: `@jk inspect this project`.");
+  console.error("Next time, run the same command again: `npx -y jk-mcp setup`.");
+  console.error("============================================================");
+}
+
+async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> {
+  const interactive = setupIsInteractive();
+  const prompt = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  let workspaceRoot: string;
+  let connectionCode: string | undefined;
+  const noStart = flags["no-start"] === true;
+  const useQuickTunnel = typeof flags["public-url"] !== "string";
+
+  try {
+    console.error("JK first-time setup");
+    console.error("You do not need to understand MCP, OAuth, or Cloudflare to continue.");
+    console.error("");
+
+    if (!(await ensureSetupDependencies(prompt, useQuickTunnel && !noStart))) {
+      process.exitCode = 1;
+      return;
+    }
+
+    workspaceRoot = await chooseSetupWorkspace(flags, prompt);
+    const stateDir = defaultStateDir();
+    const store = new Store(stateDir);
+    const ledger = new Ledger(stateDir);
+    const registry = await scanWorkspace(workspaceRoot);
+    await store.saveProjects(registry);
+    await store.setSession({ activeProjectId: null, mode: "observe", lease: null });
+    await ledger.append({ type: "workspace.opened", workspaceRoot });
+    await saveSetupConfig(workspaceRoot);
+    console.error(`✓ Allowed folder: ${workspaceRoot}`);
+
+    const tokenExists = await hasOwnerToken(stateDir);
+    const resetCode = flags["reset-code"] === true || flags["rotate-owner-token"] === true;
+    if (!tokenExists || resetCode) {
+      connectionCode = generateOwnerToken();
+      await storeOwnerToken(stateDir, connectionCode);
+      if (tokenExists) await new JsonOAuthStore(stateDir).clearAll();
+      console.error(`✓ ${tokenExists ? "New" : "Private"} connection code created.`);
+    } else {
+      console.error("✓ Existing private connection code kept.");
+    }
+  } finally {
+    prompt?.close();
+  }
+
+  if (noStart) {
+    console.error("");
+    console.error("Setup saved. Start JK later with: `npx -y jk-mcp setup`");
+    if (connectionCode) {
+      console.error("Private connection code (shown once):");
+      console.error(connectionCode);
+    }
+    return;
+  }
+
+  const serveFlags: Record<string, string | boolean> = { ...flags, workspace: workspaceRoot };
+  if (useQuickTunnel) serveFlags["quick-tunnel"] = true;
+  delete serveFlags["no-start"];
+  delete serveFlags["reset-code"];
+  await cmdServeHttp(serveFlags, (info) => printSetupReady(info, connectionCode));
 }
 
 async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
@@ -539,6 +951,7 @@ async function cmdDoctor(): Promise<void> {
   const nodeVersion = process.version;
   const rgVersion = await checkCommand("rg", ["--version"]);
   const gitVersion = await checkCommand("git", ["--version"]);
+  const cloudflaredVersion = await checkCommand("cloudflared", ["--version"]);
   const workspacePath = process.cwd();
 
   let toolCount = "unknown";
@@ -563,6 +976,7 @@ async function cmdDoctor(): Promise<void> {
   console.log(`node: ${nodeVersion}`);
   console.log(`ripgrep: ${rgVersion ?? "not found"}`);
   console.log(`git: ${gitVersion ?? "not found"}`);
+  console.log(`cloudflared: ${cloudflaredVersion ?? "not found — only required for --quick-tunnel"}`);
   console.log(`workspace: ${workspacePath}`);
   console.log(`state dir: ${stateDir}`);
   console.log(`registered tools: ${toolCount}`);
@@ -610,6 +1024,12 @@ async function cmdExecutor(flags: Record<string, string | boolean>): Promise<voi
 async function main(): Promise<void> {
   const { command, flags, positional } = parseArgs(process.argv.slice(2));
   switch (command) {
+    case "start":
+      await cmdServeHttp(flags);
+      break;
+    case "setup":
+      await cmdSetup(flags);
+      break;
     case "serve":
       await cmdServe(flags);
       break;
@@ -628,9 +1048,17 @@ async function main(): Promise<void> {
     case "executor":
       await cmdExecutor(flags);
       break;
+    case "help":
+    case "--help":
+    case "-h":
+    case undefined:
+      console.error(
+        "usage: jk <setup|start|serve|init|doctor|owner-token|control|executor> [--workspace <path>] [--quick-tunnel | --public-url <origin>] [--port 7979] [--no-start]",
+      );
+      break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|executor> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: jk <setup|start|serve|init|doctor|owner-token|control|executor> [--workspace <path>] [--quick-tunnel | --public-url <origin>] [--port 7979] [--no-start]",
       );
       process.exitCode = 1;
   }

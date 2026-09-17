@@ -14,34 +14,31 @@ JK는 [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)를 �
 
 > **비공식 프로젝트:** JK는 OpenAI와 제휴·후원·승인·공식 파트너 관계가 없습니다. ChatGPT, GPT, Codex 및 기타 OpenAI 상표는 OpenAI에 귀속됩니다.
 >
-> **라이선스 주의:** 원본 저장소에는 현재 루트 소프트웨어 `LICENSE`가 보이지 않고, 패키지 메타데이터에는 `Copyright 2026 ezBuilder. All rights reserved.`라고 적혀 있습니다. 따라서 JK는 원본 기반 코드를 MIT, Apache 등의 오픈소스 라이선스라고 주장하지 않습니다. 파생 소스나 바이너리를 재배포하기 전 [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 확인하세요.
+> **라이선스 주의:** 원본 저장소에는 현재 루트 소프트웨어 `LICENSE`가 보이지 않고, 패키지 메타데이터에는 `Copyright 2026 ezBuilder. All rights reserved.`라고 적혀 있습니다. JK 유지보수자는 원저자에게 이 수정 포크의 재배포 허가를 직접 받았습니다. 이 허가가 원본 코드를 MIT, Apache 등의 오픈소스 라이선스로 변경하는 것은 아닙니다. 자세한 내용은 [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 확인하세요.
 
-## 지인에게 배포할 때 가장 쉬운 방법 (Windows)
+## 처음 설치: 3단계면 됩니다
 
-지인이 JK를 쓰는 데 **클라우드 서버는 필요하지 않습니다.** 기본 배포 방식은 각자 PC에서 `JK.exe`가 로컬 런타임을 실행하고, ChatGPT 웹 연결이 필요할 때만 앱에 포함된 Cloudflare Quick Tunnel을 사용하는 방식입니다.
+처음 쓰는 사람은 MCP, OAuth, 도메인, Cloudflare 설정을 이해할 필요가 없습니다. **Node.js 22 이상만 먼저 설치**한 뒤 아래 순서로 진행합니다.
 
-GitHub Releases에는 두 파일을 배포합니다.
+### 1. PowerShell에 한 줄 입력
 
-| 파일 | 추천 대상 | 사용법 |
-| --- | --- | --- |
-| `JK-<version>-Windows-Setup.exe` | 대부분의 사용자 | 설치 후 시작 메뉴/트레이에서 JK 실행 |
-| `JK-<version>-Windows-Portable.zip` | 설치 없이 쓰고 싶은 사용자 | 압축 해제 후 `JK.exe` 실행 |
+```powershell
+npx -y jk-mcp setup
+```
 
-처음 사용하는 사람은 다음 순서만 따라 하면 됩니다.
+### 2. JK가 묻는 것만 선택
 
-1. GitHub **Releases**에서 `JK-<version>-Windows-Setup.exe`를 다운로드합니다.
-2. 설치 후 **JK**를 실행하고 시스템 트레이의 JK 아이콘에서 **Settings...**를 엽니다.
-3. **Project folder**에 ChatGPT가 작업할 프로젝트 폴더를 지정합니다.
-4. ChatGPT 웹에서 쓸 경우 **ChatGPT web connector**를 켭니다.
-5. 개인 도메인이 없다면 hostname은 **비워둡니다.** JK가 임시 Quick Tunnel URL을 만들 수 있습니다.
-6. **Start MCP**를 누른 뒤 **Copy Connector URL**을 누릅니다. URL은 `/mcp`로 끝납니다.
-7. ChatGPT의 **Apps / Connectors**에서 새 커넥터를 만들고 복사한 URL을 등록합니다.
-8. 승인 요청이 나오면 JK 앱의 **Owner Token**으로 본인 PC 연결임을 확인합니다.
-9. 이후 채팅에서 `@jk 이 프로젝트 구조를 확인해줘`처럼 자연어로 요청합니다.
+설치 마법사가 필요한 도구를 확인하고, Windows에서는 Git/ripgrep/Cloudflare 도구가 없을 때 **공식 winget 패키지를 설치해도 되는지 먼저 물어봅니다.** 동의하기 전에는 시스템 패키지를 설치하지 않습니다. 그다음 ChatGPT가 작업해도 되는 폴더를 선택하거나 경로를 붙여넣으면 됩니다.
 
-> **클라우드 서버 없이 사용:** ChatGPT 웹이 집 PC의 localhost에 직접 접속할 수 없으므로 웹 커넥터를 켜면 인터넷을 통한 HTTPS 경로가 필요합니다. JK의 기본 초보자 경로는 임시 Cloudflare Quick Tunnel이며, 주소는 재시작 시 바뀔 수 있습니다. 고정 주소가 필요할 때만 본인 도메인, Named Tunnel 또는 직접 관리하는 HTTPS reverse proxy를 선택하면 됩니다.
+JK는 첫 연결에 필요한 **개인 연결 코드**도 자동으로 만듭니다. 내부적으로는 Owner Token이지만 처음 쓰는 사람은 그 용어를 알 필요가 없습니다.
 
-설치 파일은 현재 코드 서명이 없는 개발 배포판일 수 있어 Windows SmartScreen 경고가 나타날 수 있습니다. 반드시 이 저장소의 GitHub Release에서 받은 파일인지 확인한 뒤 실행하세요. Owner Token은 비밀번호처럼 다루고 다른 사람과 공유하지 마세요.
+### 3. 마지막에 나온 주소를 ChatGPT에 붙여넣기
+
+설정이 끝나면 JK가 `https://....trycloudflare.com/mcp` 형태의 **ChatGPT 연결 주소 하나**를 크게 보여줍니다. ChatGPT의 **Apps / Connectors**에서 Custom MCP 연결을 추가하고 그 주소를 붙여넣으세요. 연결 과정에서 개인 연결 코드를 요구하면 JK가 보여준 코드를 입력합니다.
+
+JK를 사용하는 동안에는 setup을 실행한 PowerShell 창을 열어 두면 됩니다. 개인 도메인, OCI/VPS, unsigned `JK.exe`는 기본 사용에 필요하지 않습니다. Quick Tunnel 주소는 JK를 다시 시작하면 바뀔 수 있습니다.
+
+다음에 다시 켤 때도 **같은 명령 `npx -y jk-mcp setup`을 실행하면 됩니다.** JK가 이전에 고른 폴더와 개인 연결 코드를 자동으로 재사용합니다. 전역 설치를 원하는 고급 사용자는 `npm install -g jk-mcp` 후 `jk start --quick-tunnel`을 사용할 수 있고, 고정 도메인/Named Tunnel/`--public-url`/`--no-start` 옵션도 그대로 제공됩니다.
 
 ## 30초 사용법
 

@@ -2,46 +2,53 @@
 
 JK의 기본 배포 방식은 **사용자 PC에서 직접 실행하는 로컬 런타임**입니다. 지인이 JK를 사용하기 위해 OCI, AWS, 개인 VPS 같은 상시 서버를 운영할 필요는 없습니다.
 
-> 재배포 전에는 [Attribution & Compliance](ATTRIBUTION_AND_COMPLIANCE.md)를 먼저 확인하세요. 이 문서는 기술적인 설치/배포 절차를 설명하며 upstream 라이선스 문제를 해결하거나 별도 재배포 권한을 부여하지 않습니다.
+> 유지보수자는 원저자에게 이 수정 포크의 재배포 허가를 직접 받았습니다. 이 문서는 기술적인 설치/배포 절차를 설명하며 원본 코드를 별도 오픈소스 라이선스로 재허가하지 않습니다. 자세한 내용은 [Attribution & Compliance](ATTRIBUTION_AND_COMPLIANCE.md)를 확인하세요.
 
-## 가장 쉬운 설치: Windows
+## 처음 설치: Windows 3단계
 
-GitHub Releases에서 다음 둘 중 하나를 받습니다.
+기본 권장 경로는 unsigned Windows 실행 파일이 아니라 **npm setup wizard**입니다.
 
-| 파일 | 추천 대상 | 설명 |
-| --- | --- | --- |
-| `JK-<version>-Windows-Setup.exe` | 대부분의 사용자 | 설치형. 가장 쉬운 경로 |
-| `JK-<version>-Windows-Portable.zip` | 설치 없이 사용 | 압축 해제 후 `JK.exe` 실행 |
+### 1. Node.js 22+ 설치
 
-### 설치형
+Node.js 공식 설치 프로그램이나 Windows Package Manager를 사용합니다. Node.js가 준비되면 새 PowerShell 창을 엽니다.
 
-1. 이 저장소의 GitHub **Releases**에서 `JK-<version>-Windows-Setup.exe`를 다운로드합니다.
-2. 파일을 실행합니다.
-3. SmartScreen이 나타나면 파일이 이 저장소의 공식 Release에서 받은 것인지 다시 확인합니다.
-4. 설치 후 **JK**를 실행합니다.
-5. 시계 근처 시스템 트레이에 JK 아이콘이 보이는지 확인합니다.
+### 2. 아래 한 줄 실행
 
-### Portable
+```powershell
+npx -y jk-mcp setup
+```
 
-1. `JK-<version>-Windows-Portable.zip`을 다운로드합니다.
-2. 원하는 폴더에 압축을 풉니다.
-3. 폴더 안의 `JK.exe`를 실행합니다.
+설치 마법사가 다음을 순서대로 처리합니다.
 
-Portable은 소스 저장소가 필요 없고, 패키지에 포함된 런타임을 사용합니다.
+- Node.js 버전 확인
+- Git / ripgrep / `cloudflared` 확인
+- Windows에서 누락 도구가 있으면 공식 `winget` package ID를 보여주고 **설치 동의를 먼저 받음**
+- ChatGPT가 작업 가능한 폴더 선택 또는 직접 경로 입력
+- 최초 개인 연결 코드 생성, 기존 사용자는 코드 재사용 또는 분실 시 재발급 선택
+- Cloudflare Quick Tunnel 시작
+- 최종 ChatGPT Connector URL 표시
 
-## 첫 설정
+### 3. ChatGPT에 마지막 주소 등록
 
-1. 시스템 트레이의 **JK** 아이콘을 누릅니다.
-2. **Settings...**를 엽니다.
-3. **Project folder**에서 ChatGPT가 작업할 폴더를 선택합니다.
-4. ChatGPT 웹에서 사용할 경우 **ChatGPT web connector**를 켭니다.
-5. 개인 도메인이 없다면 hostname은 비워둡니다.
-6. **Start MCP**를 누릅니다.
-7. **Copy Connector URL**을 누릅니다. URL은 `/mcp`로 끝나야 합니다.
-8. ChatGPT의 **Apps / Connectors** 설정에서 새 커넥터를 추가하고 URL을 붙여넣습니다.
-9. 연결 승인 시 JK 앱에 표시되는 **Owner Token**을 사용합니다.
+setup 마지막 화면에 나온 `https://....trycloudflare.com/mcp` 주소를 ChatGPT **Apps / Connectors**의 Custom MCP 연결에 붙여넣습니다. 연결 과정에서 코드 입력을 요구하면 setup이 보여준 **개인 연결 코드**를 사용하세요.
 
-Owner Token은 비밀번호처럼 취급하세요. 메신저, Issue, 스크린샷, 로그에 공개하지 마세요.
+이 코드는 내부적으로 Owner Token이며 비밀번호처럼 다뤄야 합니다. 메신저, Issue, 스크린샷, 로그에 공개하지 마세요. JK를 사용하는 동안에는 setup을 실행한 PowerShell 창을 열어 둡니다.
+
+개인 도메인과 OCI/VPS는 기본 사용에 필요하지 않습니다. Quick Tunnel URL은 재시작 시 바뀔 수 있습니다.
+
+## 다시 시작하기
+
+초보자는 다음에도 **처음과 똑같은 명령 한 줄**만 실행하면 됩니다.
+
+```powershell
+npx -y jk-mcp setup
+```
+
+JK가 이전에 허용한 폴더와 기존 개인 연결 코드를 자동으로 재사용하고 새 Quick Tunnel 주소를 보여줍니다. 전역 명령을 원하는 사용자는 `npm install -g jk-mcp` 후 `jk start --quick-tunnel`을 사용할 수 있습니다. 설정만 저장하고 서버를 시작하지 않는 `--no-start`, 개인 도메인/Named Tunnel/`--public-url`은 고급 사용자용입니다.
+
+## 선택 사항: Windows GUI 패키지
+
+GitHub Release의 Setup/Portable 패키지는 트레이 GUI가 필요한 사용자를 위한 보조 경로입니다. 코드 서명이 없는 빌드는 SmartScreen 경고가 발생할 수 있으므로 일반 배포에서는 npm setup wizard를 우선합니다.
 
 ## OCI 없이 어떻게 연결되나요?
 
@@ -63,7 +70,7 @@ ChatGPT 웹
 
 다만 ChatGPT 웹은 사용자 PC의 `127.0.0.1`에 직접 접속할 수 없으므로 **웹에서 사용할 때는 인터넷에서 접근 가능한 HTTPS 경로**가 필요합니다.
 
-JK의 Windows 패키지는 초보자용으로 Cloudflare Quick Tunnel 경로를 포함합니다. hostname을 비워두면 임시 URL을 사용할 수 있습니다.
+npm 설치판은 `cloudflared` 바이너리를 번들하지 않습니다. `jk start --quick-tunnel`은 공식 경로로 별도 설치된 `cloudflared`를 호출해 임시 URL을 가져옵니다.
 
 ### Quick Tunnel의 특징
 
@@ -134,7 +141,7 @@ JK 트레이에서 **Restart MCP**를 먼저 사용하세요. 개발 환경에�
 
 ### SmartScreen 경고
 
-현재 Windows 배포 파일은 코드 서명이 없는 개발 빌드일 수 있습니다. 반드시 이 저장소의 Release에서 받은 파일인지 확인하세요.
+기본 npm 설치 경로는 별도 JK 설치 EXE를 실행하지 않습니다. 선택적으로 Windows GUI 패키지를 사용할 경우 코드 서명이 없는 개발 빌드에는 SmartScreen 경고가 나타날 수 있습니다.
 
 ### E2E 스크린샷이 안 나옴
 
@@ -142,9 +149,13 @@ Windows 웹 E2E는 설치된 Microsoft Edge 또는 Google Chrome을 사용합니
 
 ## 업데이트
 
-설치형 사용자는 새 GitHub Release의 `JK-<version>-Windows-Setup.exe`를 받아 다시 설치하는 경로가 가장 단순합니다.
+npm 사용자는 다음 명령으로 업데이트합니다.
 
-Portable 사용자는 새 ZIP을 별도 폴더에 풀고 실행한 뒤, 필요한 로컬 설정만 옮기는 방식을 권장합니다. 오래된 `dist`나 `JK.exe`를 새 버전 폴더와 섞지 마세요.
+```bash
+npm install -g jk-mcp@latest
+```
+
+GUI Setup/Portable 사용자는 기존 Release 업데이트 방식을 계속 사용할 수 있습니다.
 
 ## 개발자: 소스에서 실행
 
@@ -199,10 +210,10 @@ npm run windows:portable
 
 # English quick install
 
-For normal Windows users, **no cloud server is required**. Download either `JK-<version>-Windows-Setup.exe` or `JK-<version>-Windows-Portable.zip` from this repository's GitHub Releases.
+For normal users, **no cloud server is required**. Install Node.js 22+ and the normal Git/ripgrep prerequisites, then run `npm install -g jk-mcp`.
 
-Launch JK, select a project folder, enable **ChatGPT web connector**, leave the hostname blank for a temporary Quick Tunnel, click **Start MCP**, copy the `/mcp` Connector URL, and add it in ChatGPT **Apps / Connectors**. Use the local Owner Token when approval is requested.
+Run `jk setup --workspace /path/to/projects`, then `jk start --workspace /path/to/projects --quick-tunnel`. The Quick Tunnel mode uses an separately installed official `cloudflared` binary and prints the `/mcp` Connector URL. Add that URL in ChatGPT **Apps / Connectors** and use the local Owner Token when approval is requested.
 
 The default local port is `7979`. Quick Tunnel URLs can change after restart; a personal domain or Named Tunnel is optional and only needed for a stable URL.
 
-Source builds require Node.js 22+ and npm.
+The legacy Windows GUI packages remain optional. Source builds require Node.js 22+ and npm.

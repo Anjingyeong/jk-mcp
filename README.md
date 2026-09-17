@@ -14,34 +14,31 @@ This fork focuses on making the local coding loop more durable and practical on 
 
 > **Unofficial project:** JK is not affiliated with, endorsed by, sponsored by, or partnered with OpenAI. ChatGPT, GPT, Codex, and other OpenAI marks belong to OpenAI.
 >
-> **Licensing notice:** the upstream repository currently does not expose a root software `LICENSE` and its package metadata states `Copyright 2026 ezBuilder. All rights reserved.` This repository therefore does **not** claim that the upstream-derived code is MIT, Apache, or otherwise open-source licensed. See [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md) before redistributing derived source or binaries.
+> **Licensing notice:** the upstream repository currently does not expose a root software `LICENSE` and its package metadata states `Copyright 2026 ezBuilder. All rights reserved.` The JK maintainer has obtained direct permission from the upstream author to redistribute this modified fork. That permission does **not** relicense the upstream code as MIT, Apache, or another open-source license. See [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md).
 
-## Easiest Windows setup for friends
+## First install: only 3 steps
 
-Your friends do **not** need a cloud server to use JK. The default distribution runs `JK.exe` on each user's own PC. When ChatGPT on the web needs to reach that local runtime, JK can use the bundled Cloudflare Quick Tunnel path.
+First-time users do not need to understand MCP, OAuth, domains, or Cloudflare configuration. **Install Node.js 22+ first**, then follow this flow.
 
-GitHub Releases publish two Windows packages:
+### 1. Run one PowerShell command
 
-| File | Best for | Usage |
-| --- | --- | --- |
-| `JK-<version>-Windows-Setup.exe` | most users | install, then launch JK from Windows |
-| `JK-<version>-Windows-Portable.zip` | no-install use | extract, then run `JK.exe` |
+```powershell
+npx -y jk-mcp setup
+```
 
-First-time setup:
+### 2. Answer the setup wizard
 
-1. Download `JK-<version>-Windows-Setup.exe` from this repository's **Releases** page.
-2. Launch **JK**, open the tray icon, then open **Settings...**.
-3. Choose the **Project folder** ChatGPT is allowed to work in.
-4. Enable **ChatGPT web connector** when using ChatGPT in the browser.
-5. If you do not own a domain, leave the hostname blank so JK can create a temporary Quick Tunnel URL.
-6. Click **Start MCP**, then **Copy Connector URL**. The URL should end in `/mcp`.
-7. Add that URL under ChatGPT **Apps / Connectors**.
-8. When prompted for approval, use the **Owner Token** shown by your local JK app.
-9. Start with a natural-language request such as `@jk inspect this project and explain its structure`.
+JK checks the helper tools it needs. On Windows, if Git, ripgrep, or the Cloudflare tunnel helper is missing, JK first asks for permission before installing the official package IDs through `winget`. It never installs those system packages before you confirm. Then choose or paste the folder ChatGPT is allowed to work in.
 
-> **No cloud server required:** ChatGPT web still needs an HTTPS route to the local PC, so the beginner path uses a temporary Cloudflare Quick Tunnel. That URL may change after restart. A personal domain, Named Tunnel, or another user-managed HTTPS reverse proxy is optional for a stable URL.
+JK also creates the **private connection code** needed for the first connection. Internally this is the Owner Token, but a first-time user does not need to know that terminology.
 
-The Windows packages may be unsigned development builds, so SmartScreen can appear. Only run a binary obtained from this repository's GitHub Release. Treat the Owner Token like a password and never share it.
+### 3. Paste the final address into ChatGPT
+
+When setup finishes, JK prominently prints one address such as `https://....trycloudflare.com/mcp`. In ChatGPT, open **Apps / Connectors**, add a Custom MCP connector, and paste that address. If ChatGPT asks for the private connection code, enter the code shown by JK.
+
+Keep the PowerShell window open while using JK. A personal domain, OCI/VPS, and an unsigned `JK.exe` are not required for the default path. The temporary Quick Tunnel address can change when JK restarts.
+
+Next time, run **the same `npx -y jk-mcp setup` command again**. JK automatically reuses the previously allowed folder and private connection code. Advanced users who prefer a global command can run `npm install -g jk-mcp` and then use `jk start --quick-tunnel`; stable domains, Named Tunnels, `--public-url`, and `--no-start` remain available too.
 
 ## 30-Second Usage
 
