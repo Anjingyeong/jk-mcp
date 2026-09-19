@@ -3,7 +3,9 @@
   "version": "0.2.2",
   "description": "JK local MCP coding runtime with project-scoped safety, persistent work sessions, Git, E2E, and optional remote executors.",
   "author": "Anjingyeong",
-  "contributors": ["ezBuilder (upstream original author)"],
+  "contributors": [
+    "ezBuilder (upstream original author)"
+  ],
   "copyright": "Original work Copyright 2026 ezBuilder. All rights reserved.",
   "keywords": [
     "mcp",
@@ -68,8 +70,9 @@
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.5.0",
     "tsx": "^4.16.0",
-    "vitest": "^2.0.0"
+    "typescript": "^5.5.0",
+    "vite": "^6.4.3",
+    "vitest": "^4.1.11"
   }
 }
