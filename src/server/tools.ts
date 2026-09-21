@@ -947,7 +947,35 @@ async function resolveOrThrow(
       candidates: (result.candidates ?? []).map((c) => c.projectId),
     });
   }
-  throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, `Project not found: ${q.projectId ?? q.name}`);
+  const requested = q.projectId ?? q.name;
+  if (q.name && !q.projectId) {
+    const candidate = path.resolve(ctx.workspaceRoot, q.name);
+    const relative = path.relative(ctx.workspaceRoot, candidate);
+    const insideWorkspace =
+      relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+    if (insideWorkspace) {
+      const stat = await fs.stat(candidate).catch(() => null);
+      if (stat?.isDirectory()) {
+        throw new DomainError(
+          ErrorCode.PROJECT_NOT_FOUND,
+          `Folder exists but is not registered as a JK project: ${q.name}`,
+          {
+            folder: candidate,
+            hint:
+              "Add a project marker inside the folder (.git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .chatgpt2codex), then run workspace_refresh_index.",
+          },
+        );
+      }
+    }
+  }
+  throw new DomainError(
+    ErrorCode.PROJECT_NOT_FOUND,
+    `Project not found: ${requested}`,
+    {
+      hint:
+        "Use workspace_list_projects to see registered projects. Plain folders need a project marker such as .git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .chatgpt2codex.",
+    },
+  );
 }
 
 function isRemoteProject(entry: ProjectRegistryEntry): entry is ProjectRegistryEntry & { executorId: string } {
