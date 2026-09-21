@@ -20,13 +20,17 @@ npx -y jk-mcp setup
 
 설치 마법사가 다음을 순서대로 처리합니다.
 
-- Node.js 버전 확인
-- Git / ripgrep / `cloudflared` 확인
-- Windows에서 누락 도구가 있으면 공식 `winget` package ID를 보여주고 **설치 동의를 먼저 받음**
 - ChatGPT가 작업 가능한 폴더 선택 또는 직접 경로 입력
-- 최초 개인 연결 코드 생성, 기존 사용자는 코드 재사용 또는 분실 시 재발급 선택
-- Cloudflare Quick Tunnel 시작
-- 최종 ChatGPT Connector URL 표시
+- 연결 방식 선택
+  - **Quick Tunnel (추천):** 도메인 없이 바로 사용, 재시작 시 주소가 바뀔 수 있음
+  - **고정 HTTPS 도메인:** 이미 Cloudflare Named Tunnel 또는 HTTPS reverse proxy를 구성한 사용자를 위한 선택지
+- Node.js 버전과 Git / ripgrep / 필요한 경우 `cloudflared` 확인
+- Windows에서 누락 도구가 있으면 공식 `winget` package ID를 보여주고 **설치 동의를 먼저 받음**
+- 선택한 폴더에서 JK 프로젝트를 몇 개 찾았는지 안내
+- 일반 폴더만 있고 프로젝트가 0개라면 `.git`, `package.json`, `.chatgpt2codex` 같은 프로젝트 표시 파일을 안내
+- 최초 개인 연결 코드 생성
+- 기존 코드가 있으면 **기존 코드 유지** 또는 **새 코드를 발급해 지금 화면에 표시** 중 선택
+- 최종 ChatGPT Connector URL과 필요한 경우 새 개인 연결 코드 표시
 
 ### 3. ChatGPT에 마지막 주소 등록
 
@@ -36,6 +40,10 @@ setup 마지막 화면에 나온 `https://....trycloudflare.com/mcp` 주소를 C
 
 개인 도메인과 OCI/VPS는 기본 사용에 필요하지 않습니다. Quick Tunnel URL은 재시작 시 바뀔 수 있습니다.
 
+고정 도메인을 선택할 경우 도메인 이름만 입력한다고 자동으로 연결되는 것은 아닙니다. 해당 HTTPS 주소가 **이미** 사용자 PC의 JK(`http://127.0.0.1:7979`)로 전달되도록 Cloudflare Named Tunnel이나 다른 HTTPS reverse proxy를 구성해 두어야 합니다. setup은 이 고정 주소를 저장해 다음 실행에서도 재사용합니다.
+
+JK의 개인 연결 코드는 평문으로 저장되지 않고 해시만 저장됩니다. 따라서 기존 코드를 잃어버렸다면 같은 코드를 다시 표시할 수 없고, setup에서 새 코드를 발급해야 합니다.
+
 ## 다시 시작하기
 
 초보자는 다음에도 **처음과 똑같은 명령 한 줄**만 실행하면 됩니다.
@@ -44,7 +52,7 @@ setup 마지막 화면에 나온 `https://....trycloudflare.com/mcp` 주소를 C
 npx -y jk-mcp setup
 ```
 
-JK가 이전에 허용한 폴더와 기존 개인 연결 코드를 자동으로 재사용하고 새 Quick Tunnel 주소를 보여줍니다. 전역 명령을 원하는 사용자는 `npm install -g jk-mcp` 후 `jk start --quick-tunnel`을 사용할 수 있습니다. 설정만 저장하고 서버를 시작하지 않는 `--no-start`, 개인 도메인/Named Tunnel/`--public-url`은 고급 사용자용입니다.
+JK가 이전에 허용한 폴더와 연결 방식을 재사용합니다. Quick Tunnel 사용자는 새 임시 주소를 받고, 고정 도메인 사용자는 저장된 HTTPS 주소를 다시 사용할 수 있습니다. 기존 개인 연결 코드는 유지할 수 있고, 코드가 없으면 setup에서 새 코드를 발급해 한 번 표시할 수 있습니다. 전역 명령을 원하는 사용자는 `npm install -g jk-mcp` 후 `jk start --quick-tunnel`을 사용할 수 있습니다. 설정만 저장하고 서버를 시작하지 않는 `--no-start`도 지원합니다.
 
 ## 선택 사항: Windows GUI 패키지
 
