@@ -1,6 +1,6 @@
 {
   "name": "jk-mcp",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "JK local MCP coding runtime with project-scoped safety, persistent work sessions, Git, E2E, and optional remote executors.",
   "author": "Anjingyeong",
   "contributors": [
