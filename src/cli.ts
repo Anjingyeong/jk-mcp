@@ -449,6 +449,29 @@ async function browseForWorkspaceWindows(initialDirectory: string): Promise<stri
   }
 }
 
+async function defaultSetupWorkspace(): Promise<string> {
+  const current = path.resolve(process.cwd());
+  const filesystemRoot = path.parse(current).root;
+  let unsafeDefault = current === filesystemRoot;
+
+  if (process.platform === "win32") {
+    const windowsDir = process.env.WINDIR ?? process.env.SystemRoot;
+    if (windowsDir) {
+      const relativeToWindows = path.relative(path.resolve(windowsDir), current);
+      if (relativeToWindows === "" || (!relativeToWindows.startsWith("..") && !path.isAbsolute(relativeToWindows))) {
+        unsafeDefault = true;
+      }
+    }
+  }
+
+  if (!unsafeDefault) return current;
+
+  const documents = path.join(os.homedir(), "Documents");
+  const documentsStat = await fs.stat(documents).catch(() => null);
+  if (documentsStat?.isDirectory()) return documents;
+  return os.homedir();
+}
+
 async function chooseSetupWorkspace(
   flags: Record<string, string | boolean>,
   prompt: SetupPrompt | null,
@@ -459,7 +482,7 @@ async function chooseSetupWorkspace(
     console.error(`✓ Using saved allowed folder: ${remembered}`);
     return remembered;
   }
-  const current = process.cwd();
+  const current = await defaultSetupWorkspace();
   if (!prompt) return await validateWorkspaceDirectory(current);
 
   console.error("");
