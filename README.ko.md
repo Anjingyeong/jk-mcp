@@ -28,15 +28,17 @@ npx -y jk-mcp setup
 
 ### 2. JK가 묻는 것만 선택
 
-설치 마법사가 필요한 도구를 확인하고, Windows에서는 Git/ripgrep/Cloudflare 도구가 없을 때 **공식 winget 패키지를 설치해도 되는지 먼저 물어봅니다.** 동의하기 전에는 시스템 패키지를 설치하지 않습니다. 그다음 ChatGPT가 작업해도 되는 폴더를 선택하거나 경로를 붙여넣으면 됩니다.
+먼저 ChatGPT가 작업해도 되는 폴더를 선택하거나 경로를 붙여넣습니다. JK는 그 안에서 발견한 프로젝트 수를 알려주고, 프로젝트가 0개라면 `.git`, `package.json`, `.chatgpt2codex` 같은 프로젝트 표시 파일이 필요하다는 안내를 보여줍니다.
 
-JK는 첫 연결에 필요한 **개인 연결 코드**도 자동으로 만듭니다. 내부적으로는 Owner Token이지만 처음 쓰는 사람은 그 용어를 알 필요가 없습니다.
+그다음 연결 방식을 고릅니다. **Quick Tunnel**은 도메인 없이 바로 쓸 수 있는 추천 경로이고, **고정 HTTPS 도메인**은 이미 Cloudflare Named Tunnel 또는 HTTPS reverse proxy를 구성한 사용자용입니다. 필요한 도구가 없으면 Windows에서는 공식 winget 패키지를 설치해도 되는지 먼저 물어봅니다.
+
+JK는 첫 연결에 필요한 **개인 연결 코드**도 자동으로 만듭니다. 기존 코드가 있으면 유지하거나 새 코드를 발급해 화면에 한 번 표시할 수 있습니다. 코드는 평문으로 저장되지 않으므로 잃어버린 기존 코드를 다시 표시하는 대신 새 코드로 교체합니다.
 
 ### 3. 마지막에 나온 주소를 ChatGPT에 붙여넣기
 
 설정이 끝나면 JK가 `https://....trycloudflare.com/mcp` 형태의 **ChatGPT 연결 주소 하나**를 크게 보여줍니다. ChatGPT의 **Apps / Connectors**에서 Custom MCP 연결을 추가하고 그 주소를 붙여넣으세요. 연결 과정에서 개인 연결 코드를 요구하면 JK가 보여준 코드를 입력합니다.
 
-JK를 사용하는 동안에는 setup을 실행한 PowerShell 창을 열어 두면 됩니다. 개인 도메인, OCI/VPS, unsigned `JK.exe`는 기본 사용에 필요하지 않습니다. Quick Tunnel 주소는 JK를 다시 시작하면 바뀔 수 있습니다.
+JK를 사용하는 동안에는 setup을 실행한 PowerShell 창을 열어 두면 됩니다. 개인 도메인, OCI/VPS, unsigned `JK.exe`는 기본 사용에 필요하지 않습니다. Quick Tunnel 주소는 JK를 다시 시작하면 바뀔 수 있습니다. 고정 도메인을 선택했다면 그 주소가 미리 `http://127.0.0.1:7979`의 JK로 전달되도록 구성되어 있어야 하며, setup은 해당 주소를 저장해 재사용합니다.
 
 다음에 다시 켤 때도 **같은 명령 `npx -y jk-mcp setup`을 실행하면 됩니다.** JK가 이전에 고른 폴더와 개인 연결 코드를 자동으로 재사용합니다. 전역 설치를 원하는 고급 사용자는 `npm install -g jk-mcp` 후 `jk start --quick-tunnel`을 사용할 수 있고, 고정 도메인/Named Tunnel/`--public-url`/`--no-start` 옵션도 그대로 제공됩니다.
 
