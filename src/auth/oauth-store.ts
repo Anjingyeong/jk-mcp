@@ -272,6 +272,15 @@ export class JsonOAuthStore {
     });
   }
 
+  async clearTokens(): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.load();
+      doc.accessTokens = [];
+      doc.refreshTokens = [];
+      await this.persist(doc);
+    });
+  }
+
   async clearAll(): Promise<void> {
     await this.locked(async () => {
       await this.persist(emptyFile());
