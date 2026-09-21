@@ -709,7 +709,15 @@ function printSetupReady(info: HttpReadyInfo, connectionCode: string | undefined
     console.error("");
   }
   console.error(`Allowed folder: ${info.workspaceRoot}`);
-  console.error("After connecting, you can simply ask ChatGPT: `@jk inspect this project`.");
+  console.error("");
+  console.error("Connection test:");
+  console.error("  In a new ChatGPT chat, try: @jk 프로젝트 목록 보여줘");
+  console.error("  Then try: @jk <project-name> 상태 확인해줘");
+  console.error("");
+  console.error("If a folder exists but JK cannot find it as a project, add a project marker such as");
+  console.error("  .git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .chatgpt2codex");
+  console.error("  inside that folder, then ask JK to refresh the workspace index.");
+  console.error("");
   console.error("Next time, run the same command again: `npx -y jk-mcp setup`.");
   console.error("============================================================");
 }
