@@ -671,7 +671,7 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
     if (!tokenExists || resetCode) {
       connectionCode = generateOwnerToken();
       await storeOwnerToken(stateDir, connectionCode);
-      if (tokenExists) await new JsonOAuthStore(stateDir).clearAll();
+      if (tokenExists) await new JsonOAuthStore(stateDir).clearTokens();
       console.error(`✓ ${tokenExists ? "New" : "Private"} connection code created.`);
     } else {
       console.error("✓ Existing private connection code kept.");
@@ -760,7 +760,7 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
   if (flags["set-stdin"]) {
     const token = (await readStdin()).trim();
     await storeOwnerToken(stateDir, token);
-    await new JsonOAuthStore(stateDir).clearAll();
+    await new JsonOAuthStore(stateDir).clearTokens();
     console.log(JSON.stringify({ configured: true, rotated: true, stateDir }));
     return;
   }
@@ -768,7 +768,7 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
   if (flags.generate || flags.rotate) {
     const ownerToken = generateOwnerToken();
     await storeOwnerToken(stateDir, ownerToken);
-    await new JsonOAuthStore(stateDir).clearAll();
+    await new JsonOAuthStore(stateDir).clearTokens();
     console.log(JSON.stringify({ configured: true, rotated: true, ownerToken, stateDir }));
     return;
   }
