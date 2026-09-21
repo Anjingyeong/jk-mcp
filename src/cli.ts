@@ -76,40 +76,53 @@ function defaultStateDir(): string {
 
 interface SavedSetupConfig {
   workspaceRoot: string;
+  publicUrl?: string;
 }
 
 function setupConfigPath(stateDir = defaultStateDir()): string {
   return path.join(stateDir, "setup.json");
 }
 
-async function saveSetupConfig(workspaceRoot: string): Promise<void> {
+async function saveSetupConfig(workspaceRoot: string, publicUrl?: string): Promise<void> {
   const stateDir = defaultStateDir();
   await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  const saved: SavedSetupConfig = publicUrl ? { workspaceRoot, publicUrl } : { workspaceRoot };
   await fs.writeFile(
     setupConfigPath(stateDir),
-    `${JSON.stringify({ workspaceRoot } satisfies SavedSetupConfig, null, 2)}\n`,
+    `${JSON.stringify(saved, null, 2)}\n`,
     { mode: 0o600 },
   );
 }
 
-async function loadSetupWorkspace(): Promise<string | undefined> {
-  let parsed: SavedSetupConfig;
+async function loadSavedSetupConfig(): Promise<SavedSetupConfig | undefined> {
   try {
-    parsed = JSON.parse(await fs.readFile(setupConfigPath(), "utf8")) as SavedSetupConfig;
+    const parsed = JSON.parse(await fs.readFile(setupConfigPath(), "utf8")) as SavedSetupConfig;
+    if (!parsed || typeof parsed.workspaceRoot !== "string" || !parsed.workspaceRoot.trim()) {
+      throw new Error("JK's saved setup is invalid. Run `jk setup` again.");
+    }
+    return parsed;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return undefined;
-    throw new Error("JK could not read its saved setup. Run `jk setup` again.");
+    throw error instanceof Error ? error : new Error(String(error));
   }
-  if (!parsed || typeof parsed.workspaceRoot !== "string" || !parsed.workspaceRoot.trim()) {
-    throw new Error("JK's saved setup is invalid. Run `jk setup` again.");
-  }
+}
+
+async function loadSetupWorkspace(): Promise<string | undefined> {
+  const parsed = await loadSavedSetupConfig();
+  if (!parsed) return undefined;
   const workspaceRoot = path.resolve(parsed.workspaceRoot);
   const stat = await fs.stat(workspaceRoot).catch(() => null);
   if (!stat?.isDirectory()) {
     throw new Error(`The saved JK folder no longer exists: ${workspaceRoot}. Run \`jk setup\` again.`);
   }
   return workspaceRoot;
+}
+
+async function loadSetupPublicUrl(): Promise<string | undefined> {
+  const parsed = await loadSavedSetupConfig();
+  const value = parsed?.publicUrl;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 async function resolveRuntimeWorkspace(flags: Record<string, string | boolean>): Promise<string> {
@@ -428,6 +441,70 @@ async function askYesNo(prompt: SetupPrompt, question: string, defaultYes: boole
   return answer === "y" || answer === "yes";
 }
 
+function normalizeSetupPublicUrl(value: string): string {
+  const raw = value.trim().replace(/^['"]|['"]$/g, "");
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(withScheme);
+  } catch {
+    throw new Error("Enter a valid HTTPS address, for example: https://jk.example.com");
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error("A fixed ChatGPT connector address must use HTTPS.");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("Use only the public HTTPS origin, for example: https://jk.example.com");
+  }
+  const pathname = parsed.pathname.replace(/\/+$/, "");
+  if (pathname && pathname !== "/mcp") {
+    throw new Error("Use the domain only (or a trailing /mcp), for example: https://jk.example.com");
+  }
+  return parsed.origin;
+}
+
+async function chooseSetupPublicUrl(
+  flags: Record<string, string | boolean>,
+  prompt: SetupPrompt | null,
+): Promise<string | undefined> {
+  if (flags["quick-tunnel"] === true) return undefined;
+  if (typeof flags["public-url"] === "string") return normalizeSetupPublicUrl(flags["public-url"]);
+
+  const remembered = await loadSetupPublicUrl();
+  if (remembered) {
+    console.error("");
+    console.error(`Saved fixed HTTPS address: ${remembered}/mcp`);
+    if (!prompt || (await askYesNo(prompt, "Use this fixed address again?", true))) return remembered;
+  }
+
+  if (!prompt) return undefined;
+
+  console.error("");
+  console.error("Choose how ChatGPT will reach JK:");
+  console.error("  1. Quick Tunnel (recommended) - no domain needed; address can change after restart.");
+  console.error("  2. Fixed HTTPS domain - for users who already configured a Named Tunnel or HTTPS reverse proxy.");
+  while (true) {
+    const mode = (await prompt.question("Connection mode (Enter = 1, or type 2): ")).trim();
+    if (!mode || mode === "1") return undefined;
+    if (mode !== "2") {
+      console.error("Type 1 for Quick Tunnel or 2 for a fixed HTTPS domain.");
+      continue;
+    }
+
+    console.error("");
+    console.error("Your domain must already forward HTTPS traffic to JK at http://127.0.0.1:7979.");
+    console.error("A domain name by itself is not enough; configure Cloudflare Named Tunnel or another HTTPS reverse proxy first.");
+    while (true) {
+      const answer = await prompt.question("Fixed HTTPS address (example: https://jk.example.com): ");
+      try {
+        return normalizeSetupPublicUrl(answer);
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+}
+
 async function browseForWorkspaceWindows(initialDirectory: string): Promise<string | undefined> {
   const escapedInitial = initialDirectory.replace(/'/g, "''");
   const script = [
@@ -642,20 +719,23 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
   const prompt = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
   let workspaceRoot: string;
   let connectionCode: string | undefined;
+  let publicUrl: string | undefined;
   const noStart = flags["no-start"] === true;
-  const useQuickTunnel = typeof flags["public-url"] !== "string";
 
   try {
     console.error("JK first-time setup");
     console.error("You do not need to understand MCP, OAuth, or Cloudflare to continue.");
     console.error("");
 
+    workspaceRoot = await chooseSetupWorkspace(flags, prompt);
+    publicUrl = await chooseSetupPublicUrl(flags, prompt);
+    const useQuickTunnel = !publicUrl;
+
     if (!(await ensureSetupDependencies(prompt, useQuickTunnel && !noStart))) {
       process.exitCode = 1;
       return;
     }
 
-    workspaceRoot = await chooseSetupWorkspace(flags, prompt);
     const stateDir = defaultStateDir();
     const store = new Store(stateDir);
     const ledger = new Ledger(stateDir);
@@ -663,16 +743,36 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
     await store.saveProjects(registry);
     await store.setSession({ activeProjectId: null, mode: "observe", lease: null });
     await ledger.append({ type: "workspace.opened", workspaceRoot });
-    await saveSetupConfig(workspaceRoot);
+    await saveSetupConfig(workspaceRoot, publicUrl);
     console.error(`✓ Allowed folder: ${workspaceRoot}`);
 
+    if (registry.length > 0) {
+      const visible = registry.slice(0, 5).map((entry) => entry.name).join(", ");
+      const extra = registry.length > 5 ? ` (+${registry.length - 5} more)` : "";
+      console.error(`✓ Found ${registry.length} project(s): ${visible}${extra}`);
+    } else {
+      console.error("! No projects were detected inside the allowed folder.");
+      console.error("  JK detects folders containing .git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .chatgpt2codex.");
+      console.error("  To register a plain folder, create an empty .chatgpt2codex file inside that folder, then run setup again.");
+    }
+
     const tokenExists = await hasOwnerToken(stateDir);
-    const resetCode = flags["reset-code"] === true || flags["rotate-owner-token"] === true;
+    let resetCode = flags["reset-code"] === true || flags["rotate-owner-token"] === true;
+    if (tokenExists && !resetCode && prompt) {
+      console.error("");
+      console.error("A private connection code already exists. For security, JK stores only its hash and cannot display the old code again.");
+      resetCode = await askYesNo(
+        prompt,
+        "Create and show a new connection code now? Existing authorized sessions will need to reconnect.",
+        false,
+      );
+    }
+
     if (!tokenExists || resetCode) {
       connectionCode = generateOwnerToken();
       await storeOwnerToken(stateDir, connectionCode);
       if (tokenExists) await new JsonOAuthStore(stateDir).clearTokens();
-      console.error(`✓ ${tokenExists ? "New" : "Private"} connection code created.`);
+      console.error(`✓ ${tokenExists ? "New" : "Private"} connection code created. It will be shown below once.`);
     } else {
       console.error("✓ Existing private connection code kept.");
     }
@@ -683,17 +783,22 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
   if (noStart) {
     console.error("");
     console.error("Setup saved. Start JK later with: `npx -y jk-mcp setup`");
+    if (publicUrl) console.error(`Saved fixed connector address: ${publicUrl}/mcp`);
     if (connectionCode) {
       console.error("Private connection code (shown once):");
       console.error(connectionCode);
+    } else {
+      console.error("Existing private connection code kept. Run setup with --reset-code if you need a new visible code.");
     }
     return;
   }
 
   const serveFlags: Record<string, string | boolean> = { ...flags, workspace: workspaceRoot };
-  if (useQuickTunnel) serveFlags["quick-tunnel"] = true;
+  if (publicUrl) serveFlags["public-url"] = publicUrl;
+  else serveFlags["quick-tunnel"] = true;
   delete serveFlags["no-start"];
   delete serveFlags["reset-code"];
+  delete serveFlags["rotate-owner-token"];
   await cmdServeHttp(serveFlags, (info) => printSetupReady(info, connectionCode));
 }
 
