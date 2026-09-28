@@ -67,7 +67,7 @@ describe("tool catalog", () => {
         };
       };
 
-      expect(result.structuredContent?.scopePath).toBe("src/feature/file.ts");
+      expect(result.structuredContent?.scopePath, JSON.stringify(result).slice(0, 1500)).toBe("src/feature/file.ts");
       expect(result.structuredContent?.hierarchical).toBe(true);
       expect(result.structuredContent?.rules?.map((rule) => rule.file)).toEqual([
         ".codex/config.toml",
