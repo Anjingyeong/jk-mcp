@@ -8,7 +8,7 @@
 
 [English](README.md) | [한국어](README.ko.md)
 
-JK is a free local MCP app designed and built by **Anjingyeong**. Install it, pick a project folder, and connect it to ChatGPT. From then on the chat you already use can work on your real project instead of only talking about it.
+JK is a free local MCP app designed and built by **Anjingyeong**, originally started from [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex). Install it, pick a project folder, and connect it to ChatGPT. From then on the chat you already use can work on your real project instead of only talking about it.
 
 > JK is an independent project and is not affiliated with or endorsed by OpenAI. OpenAI, ChatGPT, GPT, and Codex are marks or products of OpenAI.
 
@@ -192,6 +192,10 @@ assets/           JK public assets
 
 ## Author
 
-JK is designed, built, and maintained by **Anjingyeong**. Issues and feedback are welcome on the [issue tracker](https://github.com/Anjingyeong/jk-mcp/issues).
+JK is designed, built, and maintained by **Anjingyeong**. Issues, feedback, and pull requests are welcome on the [issue tracker](https://github.com/Anjingyeong/jk-mcp/issues); see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The earliest codebase incorporated work from another project, used with the original author's permission. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) and [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md).
+JK started from **[ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)**, used with the original author's permission. Thanks to ezBuilder for the original work. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) and [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md).
+
+## License
+
+[MIT](LICENSE) © 2026 Anjingyeong. If you fork or redistribute JK, please keep the credit to the original repository ([NOTICE](NOTICE)).

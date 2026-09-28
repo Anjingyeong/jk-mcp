@@ -3,6 +3,7 @@
   "version": "0.2.9",
   "description": "JK local MCP coding runtime with persistent work sessions, guarded edits, orchestration, Git, E2E, and optional OMO delegation.",
   "author": "Anjingyeong",
+  "license": "MIT",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -30,6 +31,9 @@
     "README.md",
     "README.ko.md",
     "ACKNOWLEDGEMENTS.md",
+    "LICENSE",
+    "NOTICE",
+    "assets/screenshots/",
     "docs/INSTALL.md",
     "docs/ATTRIBUTION_AND_COMPLIANCE.md"
   ],

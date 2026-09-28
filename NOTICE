@@ -1,0 +1,22 @@
+JK
+Copyright (c) 2026 Anjingyeong
+Licensed under the MIT License (see LICENSE).
+
+Origin
+------
+JK started from the chatgpt2codex project by ezBuilder:
+
+    https://github.com/ezBuilder/chatgpt2codex
+
+The original author permitted free use of that work on the condition that
+the original GitHub repository is credited. Please keep this notice (or an
+equivalent credit linking to the repository above) in copies and forks of JK.
+
+Bundled third-party tools
+-------------------------
+Packaged installers bundle Node.js, cloudflared, and ripgrep. Each is
+distributed under its own license; see the license/notice files shipped
+alongside those binaries in the installer.
+
+OpenAI, ChatGPT, GPT, and Codex are marks or products of OpenAI. JK is an
+independent project and is not affiliated with or endorsed by OpenAI.

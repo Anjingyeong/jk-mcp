@@ -8,7 +8,7 @@
 
 [English](README.md) | [한국어](README.ko.md)
 
-JK는 **Anjingyeong**이 설계하고 만든 무료 로컬 MCP 앱입니다. 설치하고 프로젝트 폴더를 고른 뒤 ChatGPT에 연결하면, 평소 쓰던 대화창이 코드에 대해 말만 하는 게 아니라 실제 프로젝트에서 직접 일합니다.
+JK는 **Anjingyeong**이 설계하고 만든 무료 로컬 MCP 앱입니다([ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)에서 시작). 설치하고 프로젝트 폴더를 고른 뒤 ChatGPT에 연결하면, 평소 쓰던 대화창이 코드에 대해 말만 하는 게 아니라 실제 프로젝트에서 직접 일합니다.
 
 > JK는 OpenAI와 제휴·후원·승인 관계가 없는 독립 프로젝트입니다. OpenAI, ChatGPT, GPT, Codex는 OpenAI의 상표 또는 제품입니다.
 
@@ -192,6 +192,10 @@ assets/           JK 공개 리소스
 
 ## 만든 사람
 
-JK는 **Anjingyeong**이 설계하고 만들고 유지보수합니다. 문제나 의견은 [issue tracker](https://github.com/Anjingyeong/jk-mcp/issues)에 남겨주세요.
+JK는 **Anjingyeong**이 설계하고 만들고 유지보수합니다. 문제, 의견, PR은 [issue tracker](https://github.com/Anjingyeong/jk-mcp/issues)에 남겨주세요. 기여 방법은 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
 
-초기 코드베이스에는 원저작자의 허락을 받아 다른 프로젝트의 코드가 포함되었습니다. [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)와 [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 참고하세요.
+JK는 **[ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)**에서 시작했고, 원저작자의 허락을 받아 사용했습니다. 원본을 만들어 주신 ezBuilder님께 감사드립니다. [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)와 [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 참고하세요.
+
+## 라이선스
+
+[MIT](LICENSE) © 2026 Anjingyeong. 포크하거나 재배포할 때는 원본 저장소 표기([NOTICE](NOTICE))를 유지해 주세요.

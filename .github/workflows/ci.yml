@@ -1,0 +1,96 @@
+name: PR checks
+
+# Runs on pull requests (including forks) with a read-only token and no
+# secrets. Release and npm publishing live in separate workflows that only
+# run on maintainer tags / published releases.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check Signed-off-by on every commit
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$sha" | grep -qiE '^Signed-off-by: .+ <.+>'; then
+              echo "::error::Commit $sha is missing a Signed-off-by line (use git commit -s)."
+              missing=1
+            fi
+          done
+          exit $missing
+
+  secrets-scan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject added secret-looking values
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Only newly added lines; redaction fixtures under src/policy and
+          # src/server tests intentionally contain fake patterns.
+          added=$(git diff --unified=0 "$BASE" "$HEAD" -- . \
+            ':!src/policy/secrets*.ts' ':!src/server/*redaction*.test.ts' ':!src/server/control-screenshot.test.ts' \
+            | grep -E '^\+[^+]' || true)
+          if echo "$added" | grep -qE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{36,}\b|\bAKIA[0-9A-Z]{16}\b|\bxox[baprs]-[A-Za-z0-9-]{10,}\b|\bnpm_[A-Za-z0-9]{36}\b'; then
+            echo "::error::The diff adds something that looks like a secret. Remove it and rotate the credential."
+            exit 1
+          fi
