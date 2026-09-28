@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALLER="$ROOT/build/linux/chatgpt2codex-linux-x64.run"
+INSTALLER="$ROOT/build/linux/jk-linux-x64.run"
 SKIP_TUNNEL=0
 TIMEOUT_SEC=180
 
@@ -32,7 +32,7 @@ if [ "$(uname -s)" != "Linux" ]; then
   exit 1
 fi
 
-RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt2codex-linux-e2e.XXXXXX")"
+RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/jk-linux-e2e.XXXXXX")"
 PREFIX="$RUN_ROOT/install"
 HOME_DIR="$RUN_ROOT/home"
 WORKSPACE="$RUN_ROOT/workspace"
@@ -133,7 +133,7 @@ JSON
   if command -v git >/dev/null 2>&1; then
     git -C "$PROJECT" init -q
     git -C "$PROJECT" config user.email "e2e@example.invalid"
-    git -C "$PROJECT" config user.name "chatgpt2codex e2e"
+    git -C "$PROJECT" config user.name "jk e2e"
   fi
   echo "workspace=$WORKSPACE"
 }
@@ -144,8 +144,8 @@ install_app() {
   test -x "$PREFIX/bin/node"
   test -x "$PREFIX/bin/cloudflared"
   test -f "$PREFIX/dist/cli.js"
-  test -x "$PREFIX/chatgpt2codex"
-  test -x "$PREFIX/start-chatgpt2codex.sh"
+  test -x "$PREFIX/jk"
+  test -x "$PREFIX/start-jk.sh"
   echo "installed=$PREFIX"
 }
 
@@ -208,7 +208,7 @@ async function oauthToken() {
   const redirect = "https://chatgpt.com/chatgpt2codex-e2e/callback";
   const resource = `${baseUrl}/mcp`;
   const registered = await json("POST", `${baseUrl}/register`, {
-    client_name: "chatgpt2codex-linux-e2e",
+    client_name: "jk-linux-e2e",
     redirect_uris: [redirect],
     token_endpoint_auth_method: "none",
     grant_types: ["authorization_code", "refresh_token"],
@@ -343,7 +343,7 @@ const initialized = await mcp(accessToken, {
   params: {
     protocolVersion: "2024-11-05",
     capabilities: {},
-    clientInfo: { name: "chatgpt2codex-linux-e2e", version: "1.0.0" },
+    clientInfo: { name: "jk-linux-e2e", version: "1.0.0" },
   },
 });
 const sessionId = initialized.res.headers.get("mcp-session-id");
@@ -378,11 +378,11 @@ http_feature_tests() {
 launcher_test() {
   local port
   port="$(get_free_port)"
-  HOME="$HOME_DIR" "$PREFIX/start-chatgpt2codex.sh" --no-tunnel --port "$port" --workspace "$WORKSPACE" >"$RUN_ROOT/launcher.out.log" 2>"$RUN_ROOT/launcher.err.log" &
+  HOME="$HOME_DIR" "$PREFIX/start-jk.sh" --no-tunnel --port "$port" --workspace "$WORKSPACE" >"$RUN_ROOT/launcher.out.log" 2>"$RUN_ROOT/launcher.err.log" &
   local pid="$!"
   PROCS+=("$pid")
   wait_http "http://127.0.0.1:$port/healthz" "$TIMEOUT_SEC"
-  grep -q "chatgpt2codex is ready" "$RUN_ROOT/launcher.out.log"
+  grep -q "jk is ready" "$RUN_ROOT/launcher.out.log"
   kill "$pid" 2>/dev/null || true
   echo "port=$port"
 }
@@ -394,14 +394,14 @@ tunnel_test() {
   fi
   local port pid url deadline body
   port="$(get_free_port)"
-  HOME="$HOME_DIR" "$PREFIX/start-chatgpt2codex.sh" --port "$port" --workspace "$WORKSPACE" >"$RUN_ROOT/tunnel.out.log" 2>"$RUN_ROOT/tunnel.err.log" &
+  HOME="$HOME_DIR" "$PREFIX/start-jk.sh" --port "$port" --workspace "$WORKSPACE" >"$RUN_ROOT/tunnel.out.log" 2>"$RUN_ROOT/tunnel.err.log" &
   pid="$!"
   PROCS+=("$pid")
   deadline=$((SECONDS + TIMEOUT_SEC))
   url=""
   while [ "$SECONDS" -lt "$deadline" ]; do
     url="$(grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' "$RUN_ROOT/tunnel.out.log" 2>/dev/null | head -n 1 || true)"
-    if [ -n "$url" ] && grep -q "chatgpt2codex is ready" "$RUN_ROOT/tunnel.out.log"; then
+    if [ -n "$url" ] && grep -q "jk is ready" "$RUN_ROOT/tunnel.out.log"; then
       break
     fi
     sleep 1
@@ -418,7 +418,7 @@ mac_trace_check() {
   local terms=("osa""script" "apple ""events" "j""xa" "/usr/bin/""open" "/usr/bin/""which" "png""paste")
   local term
   for term in "${terms[@]}"; do
-    if grep -R -I -n -i -F "$term" "$PREFIX/README.md" "$PREFIX/browser" "$PREFIX/dist" "$PREFIX/start-chatgpt2codex.sh" "$PREFIX/install-linux.sh"; then
+    if grep -R -I -n -i -F "$term" "$PREFIX/README.md" "$PREFIX/browser" "$PREFIX/dist" "$PREFIX/start-jk.sh" "$PREFIX/install-linux.sh"; then
       echo "forbidden trace found: $term" >&2
       return 1
     fi

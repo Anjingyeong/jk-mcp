@@ -50,6 +50,26 @@ async function completedLaneFixture(stateDir: string, loopId: string, durableOut
 }
 
 describe("MASS ULW completed-output recovery", () => {
+  it("native-evolution R12 interrupted final verifier returns authorized recovery guidance without restoration or replay", async () => {
+    const stateDir = await temporaryExecutorRoot("native-evolution-B-unknown-");
+    const { plan, store } = await completedLaneFixture(stateDir, "unknown-final", true);
+    await store.claimIntegrationVerification("unknown-final", "unknown-attempt", "integration-before-crash");
+    const events: string[] = [];
+    const result = await new MassUlwExecutor({ stateDir, repositoryRoot: stateDir,
+      laneEngine: {
+        async restore() { events.push("restore"); },
+        async execute(request) { events.push("execute"); return { outputFingerprint: request.lane.id, approachFingerprint: "initial" }; },
+      },
+      verificationEngine: passVerification(events),
+      workspaceFactory: async () => { events.push("workspace"); return fakeWorkspace(plan, events, () => undefined); },
+    }).execute({ loopId: "unknown-final", plan });
+    expect(result).toMatchObject({ status: "blocked", recovery: {
+      reason: "final-verification-outcome-unknown", attemptId: "unknown-attempt", automaticReplay: false,
+      authorizationRequired: true, nextAction: "inspect-outcome-and-start-new-approved-run",
+    } });
+    expect(events).toEqual([]);
+    expect((await store.load("unknown-final")).integrationVerification.status).toBe("unknown-after-interruption");
+  });
   it("rejects recovery when the lane engine omits a durable restore adapter", async () => {
     // Given
     const stateDir = await temporaryExecutorRoot("mass-ulw-restore-adapter-");

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_PATH="${1:-$ROOT/build/macos/ChatGPT To Codex.app}"
-APP_NAME="ChatGPT To Codex"
+APP_PATH="${1:-$ROOT/build/macos/JK.app}"
+APP_NAME="JK"
 
 if [[ ! -d "$APP_PATH" ]]; then
   echo "error: app bundle not found: $APP_PATH" >&2
@@ -12,15 +12,15 @@ if [[ ! -d "$APP_PATH" ]]; then
 fi
 
 # Keep the proof target native: close the status-bar app only, never Chrome.
-osascript -e 'tell application "ChatGPT To Codex" to quit' >/dev/null 2>&1 || true
-pkill -x "ChatGPTToCodexStatusBar" >/dev/null 2>&1 || true
+osascript -e 'tell application "JK" to quit' >/dev/null 2>&1 || true
+pkill -x "JKStatusBar" >/dev/null 2>&1 || true
 sleep 1
 
 open -n "$APP_PATH"
 
 # Wait for the status-bar process, then open its menu through Accessibility.
 for _ in {1..30}; do
-  if pgrep -x "ChatGPTToCodexStatusBar" >/dev/null 2>&1; then
+  if pgrep -x "JKStatusBar" >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
@@ -29,15 +29,15 @@ done
 osascript <<'APPLESCRIPT'
 tell application "System Events"
   repeat 20 times
-    if exists process "ChatGPT To Codex" then exit repeat
+    if exists process "JK" then exit repeat
     delay 0.2
   end repeat
 
-  if not (exists process "ChatGPT To Codex") then
-    error "ChatGPT To Codex process did not appear"
+  if not (exists process "JK") then
+    error "JK process did not appear"
   end if
 
-  tell process "ChatGPT To Codex"
+  tell process "JK"
     set openedMenu to false
     repeat with mb in menu bars
       if (count of menu bar items of mb) > 0 then
@@ -48,7 +48,7 @@ tell application "System Events"
         end try
       end if
     end repeat
-    if openedMenu is false then error "Could not open ChatGPT To Codex status-bar menu"
+    if openedMenu is false then error "Could not open JK status-bar menu"
   end tell
 end tell
 APPLESCRIPT

@@ -12,10 +12,11 @@ const browserExecutable =
   process.env.JK_QA_BROWSER ??
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const requiredLabels = [
-  "Current MASS ULW wave",
-  "Running MASS ULW lanes",
-  "Blocked MASS ULW dependencies",
-  "MASS ULW verification",
+  "MASS ULW 작업 그래프",
+  "Lane status summary",
+  "MASS ULW dependency graph viewport",
+  "backend · failed",
+  "frontend · running",
 ];
 
 function withTimeout(promise, ms, label) {
@@ -140,7 +141,8 @@ try {
   await mkdir(project, { recursive: true });
   await writeFile(path.join(project, "package.json"), JSON.stringify({ name: "mass-ulw-dashboard-demo" }));
 
-  const childEnv = { ...process.env, HOME: home, USERPROFILE: home };
+  const stateDir = path.join(tempRoot, "state");
+  const childEnv = { ...process.env, HOME: home, USERPROFILE: home, JK_STATE_DIR: stateDir };
   const cli = path.join(repoRoot, "dist", "cli.js");
   const initialized = spawnSync(process.execPath, [cli, "init", "--workspace", workspace], {
     cwd: repoRoot,
@@ -157,7 +159,6 @@ try {
   const ownerToken = JSON.parse(generatedToken.stdout).ownerToken;
   if (typeof ownerToken !== "string") throw new Error("owner-token --generate did not return a token");
 
-  const stateDir = path.join(home, ".local", "share", "chatgpt2codex");
   const projects = JSON.parse(await readFile(path.join(stateDir, "projects.json"), "utf8"));
   const projectId = projects.projects?.[0]?.projectId ?? projects[0]?.projectId;
   if (typeof projectId !== "string") throw new Error("init did not register the demo project");
@@ -276,11 +277,51 @@ try {
   if (!requiredLabels.every((label) => pageValue.labels.includes(label))) {
     throw new Error(`missing dashboard labels: ${JSON.stringify(pageValue.labels)}`);
   }
-  for (const text of ["Wave 0", "Running frontend", "Blocked backend", "Verification in-flight"]) {
+  const expectedText = [
+    "Wave 1",
+    "작업 1개 실행 중",
+    "Frontend lane",
+    "Backend lane",
+    "Integration lane",
+    "running",
+    "failed",
+    "왜 기다리나",
+    "의존 작업 확인 필요 · backend",
+    "검증 in-flight",
+  ];
+  for (const text of expectedText) {
     if (!pageValue.text.includes(text)) throw new Error(`dashboard text missing ${text}`);
   }
   report.labels = pageValue.labels;
-  report.actionLog.push({ action: "assert-visible", text: ["Wave 0", "Running frontend", "Blocked backend", "Verification in-flight"] });
+  report.actionLog.push({ action: "assert-visible", text: expectedText });
+
+  await page.send("Emulation.setDeviceMetricsOverride", {
+    width: 390,
+    height: 844,
+    deviceScaleFactor: 1,
+    mobile: true,
+  });
+  const mobileLayout = await page.send("Runtime.evaluate", {
+    returnByValue: true,
+    expression: `({
+      overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      dagVisible: Boolean(document.querySelector('.run-dag')),
+      graphViewportVisible: Boolean(document.querySelector('.run-dag-scroll')),
+      nodeCount: document.querySelectorAll('.run-dag-node').length,
+      edgeCount: document.querySelectorAll('.run-dag-edge').length,
+      width: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    })`,
+  });
+  if (mobileLayout.result.value.overflow) {
+    throw new Error(`mobile dashboard overflows horizontally: ${JSON.stringify(mobileLayout.result.value)}`);
+  }
+  if (!mobileLayout.result.value.dagVisible) throw new Error("mobile MASS ULW DAG is not visible");
+  if (!mobileLayout.result.value.graphViewportVisible) throw new Error("mobile MASS ULW graph viewport is not visible");
+  if (mobileLayout.result.value.nodeCount !== 3 || mobileLayout.result.value.edgeCount !== 2) {
+    throw new Error(`mobile MASS ULW graph primitives are incomplete: ${JSON.stringify(mobileLayout.result.value)}`);
+  }
+  report.actionLog.push({ action: "assert-mobile", ...mobileLayout.result.value });
 
   const capture = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true });
   const screenshot = Buffer.from(capture.data, "base64");

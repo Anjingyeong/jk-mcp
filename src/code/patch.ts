@@ -360,7 +360,7 @@ export async function applyPatch(
 
       const dir = path.dirname(write.abs);
       await fs.mkdir(dir, { recursive: true });
-      const tempPath = path.join(dir, `.chatgpt2codex.tmp.${randomUUID()}`);
+      const tempPath = path.join(dir, `.jk.tmp.${randomUUID()}`);
 
       let prevContent: Buffer | null = null;
       let hadPrevious = false;
@@ -446,7 +446,7 @@ export async function createFile(
 
   const dir = path.dirname(abs);
   await fs.mkdir(dir, { recursive: true });
-  const tempPath = path.join(dir, `.chatgpt2codex.tmp.${randomUUID()}`);
+  const tempPath = path.join(dir, `.jk.tmp.${randomUUID()}`);
   await fs.writeFile(tempPath, content, "utf8");
   await fs.rename(tempPath, abs);
 

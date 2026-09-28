@@ -212,20 +212,23 @@ async function findPathExecutable(command: string): Promise<string | null> {
 }
 
 export async function resolveOmoInvocation(): Promise<OmoInvocation> {
-  const explicitBin = process.env.CHATGPT2CODEX_OMO_BIN;
+  // Canonical overrides are one tier above all legacy overrides, even when
+  // the canonical choice is a Node CLI and the legacy choice is a binary.
+  const canonicalNodeCli = process.env.JK_OMO_NODE_CLI?.trim();
+  const explicitBin = process.env.JK_OMO_BIN?.trim() || (!canonicalNodeCli ? process.env.CHATGPT2CODEX_OMO_BIN : undefined);
   if (explicitBin) {
     const stat = await fs.stat(explicitBin).catch(() => null);
     if (!stat?.isFile()) {
-      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "CHATGPT2CODEX_OMO_BIN does not point to a file");
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "JK_OMO_BIN does not point to a file");
     }
     return await requireCompatibleInvocation(explicitBin, [], "env-bin");
   }
 
-  const explicitNodeCli = process.env.CHATGPT2CODEX_OMO_NODE_CLI;
+  const explicitNodeCli = canonicalNodeCli || process.env.CHATGPT2CODEX_OMO_NODE_CLI;
   if (explicitNodeCli) {
     const stat = await fs.stat(explicitNodeCli).catch(() => null);
     if (!stat?.isFile()) {
-      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "CHATGPT2CODEX_OMO_NODE_CLI does not point to a file");
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "JK_OMO_NODE_CLI does not point to a file");
     }
     return await requireCompatibleInvocation(process.execPath, [explicitNodeCli], "env-node-cli");
   }
@@ -267,7 +270,7 @@ export async function resolveOmoInvocation(): Promise<OmoInvocation> {
   if (process.platform === "win32") {
     throw new DomainError(
       ErrorCode.COMMAND_NOT_ALLOWED,
-      "OMO runner could not find a shell-free Windows CLI. Install/update LazyCodex OMO or set CHATGPT2CODEX_OMO_NODE_CLI.",
+      "OMO runner could not find a shell-free Windows CLI. Install/update LazyCodex OMO or set JK_OMO_NODE_CLI.",
     );
   }
 
@@ -275,7 +278,7 @@ export async function resolveOmoInvocation(): Promise<OmoInvocation> {
   if (!pathOmo) {
     throw new DomainError(
       ErrorCode.COMMAND_NOT_ALLOWED,
-      "OMO runner could not find an OMO CLI on PATH. Install/configure OMO or set CHATGPT2CODEX_OMO_BIN/CHATGPT2CODEX_OMO_NODE_CLI before using omo_run.",
+      "OMO runner could not find an OMO CLI on PATH. Install/configure OMO or set JK_OMO_BIN/JK_OMO_NODE_CLI before using omo_run.",
     );
   }
   return await requireCompatibleInvocation(pathOmo, [], "path");

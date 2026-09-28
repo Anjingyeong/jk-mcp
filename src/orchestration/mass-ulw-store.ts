@@ -6,6 +6,7 @@ import { CommittedPublicationReceiptSchema } from "./mass-ulw-publish-recovery.j
 import { MassUlwStoreFiles } from "./mass-ulw-store-files.js";
 import { MassUlwDocumentSchema, PlanSchema } from "./mass-ulw-store-schema.js";
 import type { MassUlwDocument, MassUlwStoreOptions } from "./mass-ulw-store-schema.js";
+import type { MassUlwFailureDiagnostic } from "./mass-ulw-failure.js";
 
 export { MassUlwDocumentSchema } from "./mass-ulw-store-schema.js";
 export type { MassUlwAttempt, MassUlwDocument, MassUlwLaneState, MassUlwLoopLock, MassUlwPublishEntry, MassUlwStoreOptions, MassUlwWaveState } from "./mass-ulw-store-schema.js";
@@ -103,7 +104,7 @@ export class MassUlwStore extends MassUlwStoreFiles {
         if (completed) {
           wave.status = "completed";
           wave.completedAt ??= timestamp;
-        } else if (wave.laneIds.some((laneId) => document.lanes[laneId]?.status === "blocked")) {
+        } else if (wave.laneIds.every((laneId) => document.lanes[laneId]?.status === "completed" || document.lanes[laneId]?.status === "blocked")) {
           wave.status = "failed";
           delete wave.completedAt;
         } else {
@@ -220,6 +221,7 @@ export class MassUlwStore extends MassUlwStoreFiles {
     loopId: string,
     attemptId: string,
     result: "passed" | "failed",
+    failure?: MassUlwFailureDiagnostic,
   ): Promise<MassUlwDocument> {
     return this.withUpdateLock(loopId, async () => {
       const document = await this.readDocument(loopId);
@@ -241,6 +243,7 @@ export class MassUlwStore extends MassUlwStoreFiles {
       };
       attempt.status = result === "passed" ? "completed" : "failed";
       attempt.completedAt = timestamp;
+      if (result === "failed" && failure) attempt.failure = failure;
       document.updatedAt = timestamp;
       const validated = MassUlwDocumentSchema.parse(document);
       await this.persist(validated);

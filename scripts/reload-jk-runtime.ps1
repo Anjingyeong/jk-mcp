@@ -17,6 +17,7 @@ $Live = Join-Path $Root "build\windows\JK"
 $Next = Join-Path $Root "build\windows\JK-next"
 $Stage = Join-Path $Root "build\windows\JK-stage"
 $Prev = Join-Path $Root "build\windows\JK-prev"
+$RuntimeCandidate = Join-Path $Root "build\windows\JK-runtime-candidate"
 $Candidate = if ($UseStage) { $Stage } else { $Next }
 $LogDir = Join-Path $env:LOCALAPPDATA "JK\logs"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -34,7 +35,8 @@ function Normalize-ProcessCommandLine([string]$Value) {
 
 function Test-RuntimePackage([string]$RuntimeRoot) {
   return (Test-Path -LiteralPath (Join-Path $RuntimeRoot "JK.exe")) -and
-    (Test-Path -LiteralPath (Join-Path $RuntimeRoot "start-chatgpt.ps1")) -and
+    ((Test-Path -LiteralPath (Join-Path $RuntimeRoot "start-jk.ps1")) -or
+      (Test-Path -LiteralPath (Join-Path $RuntimeRoot "start-chatgpt.ps1"))) -and
     (Test-Path -LiteralPath (Join-Path $RuntimeRoot "dist\cli.js"))
 }
 
@@ -77,7 +79,7 @@ function Prepare-RuntimeCandidate {
 }
 
 function Remove-SuccessfulSwapArtifacts {
-  foreach ($path in @($Next, $Stage, $Prev)) {
+  foreach ($path in @($Next, $Stage, $Prev, $RuntimeCandidate)) {
     if ($path -ne $Live -and (Test-Path -LiteralPath $path)) {
       Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -85,6 +87,23 @@ function Remove-SuccessfulSwapArtifacts {
   if (Test-Path -LiteralPath $BuildRoot) {
     Get-ChildItem -LiteralPath $BuildRoot -Directory -Filter "JK-broken-*" -ErrorAction SilentlyContinue | ForEach-Object {
       Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # Historical QA/release staging names are never canonical runtimes. Clean
+    # them only after a successful swap so a failed upgrade still retains all
+    # recovery evidence.
+    foreach ($name in @("JK-fixed", "JK-release-canonical", "JK-release-test")) {
+      $path = Join-Path $BuildRoot $name
+      if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    }
+    # Keep the stable legacy installer name only when it is the sole artifact.
+    # Once a versioned installer exists, the older unversioned build is a
+    # duplicate and causes the confusing multi-JK build directory seen in QA.
+    $versionedInstaller = Get-ChildItem -LiteralPath $BuildRoot -File -Filter "JK-*-windows-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $legacyInstaller = Join-Path $BuildRoot "JK-Setup.exe"
+    if ($versionedInstaller -and (Test-Path -LiteralPath $legacyInstaller -PathType Leaf)) {
+      Remove-Item -LiteralPath $legacyInstaller -Force -ErrorAction SilentlyContinue
     }
   }
   Write-Log "cleanup-success canonical-runtime=JK transient-runtime-folders=removed"
@@ -135,7 +154,7 @@ function Test-LocalListener {
 }
 
 function Stop-JkTree {
-  $runtimeRoots = @($Live, $Next, $Stage, $Prev)
+  $runtimeRoots = @($Live, $Next, $Stage, $Prev, $RuntimeCandidate)
   $targets = Get-CimInstance Win32_Process | Where-Object {
     $process = $_
     $commandLine = Normalize-ProcessCommandLine ([string]$process.CommandLine)

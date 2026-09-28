@@ -1,12 +1,14 @@
-import { mkdtemp, mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "./screenshot-share.js";
 
 describe("E2E screenshot inline shares", () => {
+  let root: string;
+  afterEach(async () => { await rm(root, { recursive: true, force: true }); });
   it("creates a short-lived public image URL for an E2E screenshot", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-e2e-share-"));
+    root = await mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-e2e-share-"));
     const stateDir = path.join(root, "state");
     const screenshotDir = path.join(root, "project", ".chatgpt2codex", "e2e", "screenshots");
     const screenshotPath = path.join(screenshotDir, "screen.png");

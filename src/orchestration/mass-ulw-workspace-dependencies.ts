@@ -2,7 +2,18 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { git, gitBytes } from "./mass-ulw-workspace-repository.js";
-import type { MassUlwLaneCheckout } from "./mass-ulw-workspace-types.js";
+import type { MassUlwLaneCheckout, MassUlwWorkspaceLane } from "./mass-ulw-workspace-types.js";
+import { buildMassUlwPlan, type MassUlwPlan } from "./mass-ulw.js";
+import { stableTopologicalWaves } from "./mass-ulw-executor-graph.js";
+
+/** Adapt workspace metadata to the existing graph contract, not planner admission policy. */
+export function workspaceDependencyPlan(lanes: readonly MassUlwWorkspaceLane[]): MassUlwPlan {
+  const plan = buildMassUlwPlan({
+    executionProfile: "max",
+    candidates: lanes.map((lane) => ({ ...lane, task: lane.id })),
+  });
+  return { ...plan, waves: stableTopologicalWaves(plan.lanes) };
+}
 
 const GIT_ENV = {
   GIT_AUTHOR_NAME: "Mass ULW",

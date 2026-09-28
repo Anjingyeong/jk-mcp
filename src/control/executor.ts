@@ -1,19 +1,21 @@
 import type { ToolContext } from "../types.js";
 import { resolveActiveProject } from "../workspace/active.js";
+import { requireProjectLease } from "../workspace/lease-guard.js";
 import { captureE2eAppScreenshot, captureE2eScreenshot } from "../e2e/local-e2e.js";
 import { redact } from "../policy/secrets.js";
-import { assertAllowedTarget, controlAllowlist, isSensitiveApp } from "./policy.js";
+import { assertAllowedTarget, controlAllowlist, controlAllowlistForContext, isSensitiveApp } from "./policy.js";
 import { maskSensitiveRegions } from "./screenshot-mask.js";
 import { autoDecision, recordAutoUse } from "./auto.js";
 import { approveAction, getAction, isKilled, listActions, markDone, toSummary, type ControlActionRecord } from "./queue.js";
 import * as macInput from "./mac-input.js";
+import { executeRemoteComputerAction, resolveRemoteControlProject } from "./remote.js";
 
 /**
  * Session worker that turns an `approved` control action into a real
  * synthetic click/keystroke. Nothing but this module ever calls
  * src/control/mac-input.ts's synthetic-input functions, and it only ever
  * does so for actions a local human has already moved to `approved` (see
- * src/control/queue.ts / the `chatgpt2codex control approve` CLI path).
+ * src/control/queue.ts / the `jk control approve` CLI path).
  */
 
 function keySummary(keyCode: number | undefined): string | undefined {
@@ -85,6 +87,46 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
       reason: "killed",
     });
     await markDone(ctx.stateDir, record.actionId, { ok: false, error: "killed" });
+    return;
+  }
+
+  const active = await resolveActiveProject(ctx);
+  const routedProjectId = record.projectId ?? active?.projectId;
+  const remote = routedProjectId ? await resolveRemoteControlProject(ctx, routedProjectId) : null;
+  if (remote) {
+    try {
+      await requireProjectLease(ctx, routedProjectId!, "control");
+      assertAllowedTarget({ appName: record.appName, allowlist: await controlAllowlistForContext(ctx) });
+      const remoteResult = await executeRemoteComputerAction(ctx, remote, record);
+      await ctx.ledger.append({
+        type: "control.action.executed",
+        actionId: record.actionId,
+        appName: record.appName,
+        kind: record.kind,
+        frontmostApp: remoteResult.frontmostProcess,
+        windowPoint: remoteResult.point,
+        keySummary: keySummary(record.keyCode),
+        textSummary: toSummary(record).textSummary,
+        approvedVia: record.approvedVia ?? "human",
+        remote: true,
+        ok: true,
+      });
+      await markDone(ctx.stateDir, record.actionId, { ok: true });
+    } catch (err) {
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const message = record.kind === "type" ? "type-failed" : redact(rawMessage);
+      await ctx.ledger.append({
+        type: "control.action.executed",
+        actionId: record.actionId,
+        appName: record.appName,
+        kind: record.kind,
+        approvedVia: record.approvedVia ?? "human",
+        remote: true,
+        ok: false,
+        error: message,
+      });
+      await markDone(ctx.stateDir, record.actionId, { ok: false, error: message });
+    }
     return;
   }
 
@@ -185,6 +227,8 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
         throw new Error("key action has an out-of-range keyCode");
       }
       await macInput.pressKey(record.appName, keyCode);
+    } else if (record.kind === "scroll") {
+      throw new Error("scroll action is currently supported on the Windows remote executor only");
     }
 
     const evidenceAfter = await captureActionEvidence(ctx, record, "after");

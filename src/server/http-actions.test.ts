@@ -1,17 +1,48 @@
 import { createServer as createNodeServer, type Server } from "node:http";
+import { EventEmitter, once } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Store } from "../state/store.js";
+import { ProjectMemoryStore } from "../state/project-memory.js";
+import { createServer as createMcpServer } from "./mcp-server.js";
 import { storeOwnerToken } from "../auth/owner-token.js";
 import { resolveMassUlwExecutionId } from "../orchestration/mass-ulw-identity-index.js";
+import { git } from "../orchestration/mass-ulw-workspace-repository.js";
+import { buildMassUlwPlan } from "../orchestration/mass-ulw.js";
 import type { Lease, ToolContext } from "../types.js";
 import { createHttpServer, defaultHttpServerConfig } from "./http.js";
 import { completeExecutorJob, pollExecutorJob, recordExecutorHeartbeat, type ExecutorJob } from "../executors/broker.js";
+import * as broker from "../executors/broker.js";
+import { TARGET_CAPABILITY, RuntimeIdentitySchema } from "../executors/target-protocol.js";
+import { readLocalShellJob, updateLocalShellJob } from "../policy/local-shell-jobs.js";
 
 const OWNER_TOKEN = "unit-test-owner-token-123456";
+const jobEvents = new EventEmitter();
+
+async function approveJob(baseUrl: string, id: string | undefined): Promise<Response> {
+  let listener: (event: Record<string, unknown>) => void = () => undefined;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const finished = new Promise<Record<string, unknown>>((resolve, reject) => {
+    listener = (event) => { if (event.approvalId === id) resolve(event); };
+    jobEvents.on("terminal", listener);
+    deadline = setTimeout(() => reject(new Error("Owned approval job did not settle")), 15000);
+  });
+  try {
+  const response = await fetch(`${baseUrl}/api/jk/control/approvals/${id}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
+  });
+  expect(response.status).toBe(200);
+  expect(await finished).toMatchObject({ approvalId: id });
+  return response;
+  } finally { clearTimeout(deadline); jobEvents.off("terminal", listener); }
+}
 
 function base64Url(bytes: Buffer): string {
   return bytes.toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
@@ -79,7 +110,9 @@ function makeCtx(
     workspaceRoot: path.dirname(projectRoot),
     stateDir,
     registry,
-    ledger: { append: async () => undefined },
+    ledger: { append: async (event) => {
+      if (event.type === "local.job.finished" || event.type === "local.job.failed") jobEvents.emit("terminal", event);
+    } },
     store: {
       loadProjects: async () => registry,
       saveProjects: async () => undefined,
@@ -112,12 +145,21 @@ async function postAction(baseUrl: string, pathName: string, body: unknown, toke
 
 interface FakeWindowsExecutorHandle {
   calls: ExecutorJob[];
+  waitForRuntimeQueued(): Promise<unknown[]>;
+  proveReconnect(): void;
+  setRuntimeManifestVersion(value: string): void;
+  setMissingPath(value: string, missing?: boolean): void;
   stop(): Promise<void>;
 }
 
-async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsExecutorHandle> {
+async function startFakeWindowsExecutor(stateDir: string, sameBufferDigest = true): Promise<FakeWindowsExecutorHandle> {
   const calls: ExecutorJob[] = [];
+  const missingPaths = new Set<string>();
   let active = true;
+  let runtimeManifestVersion = "build-a";
+  let runtimeGeneration = 0;
+  let proveReconnect = false;
+  const events = new EventEmitter();
   const project = {
     projectId: "chatgpt2codex",
     name: "chatgpt2codex",
@@ -128,13 +170,15 @@ async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsEx
     packageHints: ["node"],
   };
   const heartbeat = async (upgraded: boolean) => {
-    await recordExecutorHeartbeat(stateDir, {
+    const status = await recordExecutorHeartbeat(stateDir, {
+      role: "worker", protocolVersion: 1, os: "win32", arch: "x64",
       executorId: "windows-main",
       label: "Windows PC",
       platform: "win32/x64 · test-host",
       workspaceRoot: "C:\\JK",
       projects: [project],
       capabilities: [
+        TARGET_CAPABILITY,
         "project_status",
         "project_rules",
         "repo_status",
@@ -150,22 +194,50 @@ async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsEx
         "e2e_screenshot",
         "executor_restart",
       ],
-      instanceId: upgraded ? "fake-windows-new" : "fake-windows-old",
-      startedAtMs: upgraded ? 2_000 : 1_000,
+      instanceId: upgraded ? `fake-windows-${runtimeGeneration}` : "fake-windows-old",
+      startedAtMs: upgraded ? 2_000 + runtimeGeneration : 1_000,
     });
+    return RuntimeIdentitySchema.parse(status);
   };
-  await heartbeat(false);
+  let identity = await heartbeat(false);
+  const listStatus = broker.listExecutorStatus;
+  const statusSpy = vi.spyOn(broker, "listExecutorStatus").mockImplementation(async (...args) => {
+    if (proveReconnect) {
+      identity = await heartbeat(true);
+      events.emit("identity.ready");
+    }
+    return listStatus(...args);
+  });
 
   const pump = (async () => {
     while (active) {
-      const job = await pollExecutorJob("windows-main", 50);
+      const job = await pollExecutorJob("windows-main", 25000, identity, stateDir);
       if (!job) continue;
+      if (!active) {
+        completeExecutorJob(job.jobId, {}, undefined, "windows-main", job.runtime);
+        break;
+      }
       calls.push(job);
       try {
+        expect(job.payload.executionTarget).toEqual(job.executionTarget);
+        expect(job.executionTarget).toMatchObject({ kind: "remote", executorId: "windows-main", instanceId: job.runtime.instanceId,
+          sourceProjectId: "chatgpt2codex", projectRoot: project.root });
         if (job.tool === "file_read_slice") {
           const rel = String(job.payload.path ?? "unknown.txt");
+          if (missingPaths.has(rel)) {
+            completeExecutorJob(
+              job.jobId,
+              null,
+              `ENOENT: no such file or directory, lstat '${rel}'`,
+              "windows-main",
+              job.runtime,
+            );
+            continue;
+          }
           const content = rel === "resume.txt"
             ? "remote resume content\n"
+            : rel === "dist/runtime-schema-manifest.json"
+              ? `${runtimeManifestVersion}\n`
             : rel.endsWith("reload-jk-runtime.ps1")
               ? "param()\n"
               : "// remote JK source marker\n";
@@ -178,9 +250,10 @@ async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsEx
             content,
             lineHashes: [hash],
             fileHash: hash,
+            ...(sameBufferDigest ? { fullFileHash: hash } : {}),
             workContextFileHash: hash,
             eol: "lf",
-          }, undefined, "windows-main");
+          }, undefined, "windows-main", job.runtime);
           continue;
         }
         if (job.tool === "project_status") {
@@ -192,11 +265,12 @@ async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsEx
             ruleFiles: [],
             knownCommands: [],
             hasCodeBrain: false,
-          }, undefined, "windows-main");
+          }, undefined, "windows-main", job.runtime);
           continue;
         }
         if (job.tool === "local_shell_run") {
-          await heartbeat(true);
+          const reconnected = once(events, "identity.ready", { signal: AbortSignal.timeout(15000) });
+          runtimeGeneration += 1;
           completeExecutorJob(job.jobId, {
             cwd: "C:\\JK\\chatgpt2codex",
             exitCode: 0,
@@ -204,29 +278,34 @@ async function startFakeWindowsExecutor(stateDir: string): Promise<FakeWindowsEx
             stderrSummary: "",
             durationMs: 5,
             outputTruncated: false,
-          }, undefined, "windows-main");
-          void (async () => {
-            await new Promise((resolve) => setTimeout(resolve, 650));
-            if (!active) return;
-            await heartbeat(true);
-            await new Promise((resolve) => setTimeout(resolve, 650));
-            if (!active) return;
-            await heartbeat(true);
-          })();
+          }, undefined, "windows-main", job.runtime);
+          events.emit("runtime.queued");
+          await reconnected;
           continue;
         }
-        completeExecutorJob(job.jobId, null, `unsupported fake worker tool: ${job.tool}`, "windows-main");
+        completeExecutorJob(job.jobId, null, `unsupported fake worker tool: ${job.tool}`, "windows-main", job.runtime);
       } catch (err) {
-        completeExecutorJob(job.jobId, null, err instanceof Error ? err.message : String(err), "windows-main");
+        completeExecutorJob(job.jobId, null, err instanceof Error ? err.message : String(err), "windows-main", job.runtime);
       }
     }
   })();
 
   return {
     calls,
+    waitForRuntimeQueued() { return once(events, "runtime.queued", { signal: AbortSignal.timeout(15000) }); },
+    proveReconnect() { proveReconnect = true; },
+    setRuntimeManifestVersion(value: string) {
+      runtimeManifestVersion = value;
+    },
+    setMissingPath(value: string, missing = true) {
+      if (missing) missingPaths.add(value);
+      else missingPaths.delete(value);
+    },
     async stop() {
       active = false;
-      await pump;
+      events.emit("identity.ready");
+      await Promise.all([pump, broker.dispatchExecutorJob(stateDir, "windows-main", "executor_restart", {})]);
+      statusSpy.mockRestore();
     },
   };
 }
@@ -320,6 +399,164 @@ describe("Custom GPT action bridge", () => {
     }
     await fs.rm(stateDir, { recursive: true, force: true });
     await fs.rm(projectRoot, { recursive: true, force: true });
+    await expect(fs.stat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(projectRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  describe("Actions/MCP confirmSwitch reconciliation", () => {
+    async function switchingContext(): Promise<ToolContext> {
+      const secondRoot = path.join(stateDir, "project-two");
+      await fs.mkdir(secondRoot);
+      const ctx = makeCtx(stateDir, projectRoot, [{ projectId: "proj2", name: "proj2", root: secondRoot }]);
+      const store = new Store(stateDir);
+      await store.saveProjects(ctx.registry);
+      return { ...ctx, store };
+    }
+
+    const shapes = [
+      { label: "dedicated raw", route: "/actions/project-select", body: (input: Record<string, unknown>) => input },
+      { label: "dedicated wrapped", route: "/actions/project-select", body: (input: Record<string, unknown>) => ({ input }) },
+      { label: "generic raw", route: "/actions/call-tool", body: (input: Record<string, unknown>) => ({ toolName: "project_select", input }) },
+      { label: "generic nested", route: "/actions/call-tool", body: (input: Record<string, unknown>) => ({ input: { toolName: "project_select", input } }) },
+    ];
+    const confirmations = [
+      { label: "omitted", input: {}, code: undefined },
+      { label: "false", input: { confirmSwitch: false }, code: "PENDING_WORK_IN_ACTIVE" },
+      { label: "true", input: { confirmSwitch: true }, code: undefined },
+      { label: "null", input: { confirmSwitch: null }, code: "INVALID_INPUT" },
+      { label: "string", input: { confirmSwitch: "true" }, code: "INVALID_INPUT" },
+    ];
+
+    describe.each(shapes)("$label", ({ route, body }) => {
+      it.each(confirmations)("persists the Actions switch decision when confirmSwitch is $label", async ({ input, code }) => {
+        // Given two real project roots and an existing persisted lease on A.
+        const ctx = await switchingContext();
+        const server = await startApp(ctx);
+        stop = server.stop;
+        const initial = await postAction(server.baseUrl, route, body({ projectId: "proj", reason: "fixture A", confirmSwitch: true }));
+        expect(initial.status).toBe(200);
+        expect(await initial.json()).toMatchObject({ ok: true, structuredContent: { lease: { projectId: "proj", preset: "full-write" } } });
+        const before = await new Store(stateDir).getSession();
+        expect(before).toMatchObject({ activeProjectId: "proj", lease: { projectId: "proj" } });
+        const beforeBytes = await fs.readFile(path.join(stateDir, "sessions.json"));
+
+        // When B is selected through the actual authenticated HTTP adapter.
+        const response = await postAction(server.baseUrl, route, body({ projectId: "proj2", reason: "fixture B", ...input }));
+        const result = await response.json();
+
+        // Then parsed results and persisted state agree, including rejection immutability.
+        expect(response.status).toBe(200);
+        if (code) {
+          expect(result).toMatchObject({ ok: false, structuredContent: { code } });
+          const after = await new Store(stateDir).getSession();
+          // Domain-error continuation bookkeeping may update only the document timestamp.
+          expect(after).toEqual({ ...before, updatedAt: after.updatedAt });
+          if (code === "INVALID_INPUT") {
+            expect(await fs.readFile(path.join(stateDir, "sessions.json"))).toEqual(beforeBytes);
+          }
+        } else {
+          expect(result).toMatchObject({ ok: true, structuredContent: { lease: { projectId: "proj2", preset: "full-write" } } });
+          expect(await new Store(stateDir).getSession()).toMatchObject({ activeProjectId: "proj2", lease: { projectId: "proj2", preset: "full-write" } });
+        }
+      });
+    });
+
+    it.each([
+      { label: "omitted", input: {}, rejected: true },
+      { label: "false", input: { confirmSwitch: false }, rejected: true },
+      { label: "true", input: { confirmSwitch: true }, rejected: false },
+    ])("keeps remote MCP explicit confirmation when confirmSwitch is $label", async ({ input, rejected }) => {
+      // Given a real SDK connection, isolated persistent state and a lease on A.
+      const ctx = await switchingContext();
+      const server = await createMcpServer({ ...ctx, remote: true });
+      const client = new Client({ name: "actions-switch-boundary-test", version: "1" });
+      try {
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        await server.connect(serverTransport);
+        await client.connect(clientTransport);
+        const initial = await client.callTool({ name: "project_select", arguments: { projectId: "proj", reason: "fixture A", preset: "full-write", confirmSwitch: true } });
+        expect(initial.isError).not.toBe(true);
+        expect(initial.structuredContent).toMatchObject({ lease: { projectId: "proj", preset: "full-write" } });
+        const before = await new Store(stateDir).getSession();
+        expect(before).toMatchObject({ activeProjectId: "proj", lease: { projectId: "proj" } });
+
+        // When B is selected over MCP, bypassing both Actions adapters.
+        const result = await client.callTool({ name: "project_select", arguments: { projectId: "proj2", reason: "fixture B", preset: "full-write", ...input } });
+
+        // Then omission/false still rejects while only explicit true switches.
+        expect(Boolean(result.isError)).toBe(rejected);
+        if (rejected) {
+          expect(result.structuredContent).toMatchObject({ code: "PENDING_WORK_IN_ACTIVE" });
+          const after = await new Store(stateDir).getSession();
+          expect(after).toEqual({ ...before, updatedAt: after.updatedAt });
+        } else {
+          expect(result.structuredContent).toMatchObject({ lease: { projectId: "proj2", preset: "full-write" } });
+          expect(await new Store(stateDir).getSession()).toMatchObject({ activeProjectId: "proj2", lease: { projectId: "proj2", preset: "full-write" } });
+        }
+      } finally {
+        try { await client.close(); } finally { await server.close(); }
+      }
+    });
+  });
+
+  it("creates, verifies and publishes an isolated task through the generic Actions bridge", async () => {
+    await git(projectRoot, ["init", "--quiet"]);
+    await git(projectRoot, ["config", "user.name", "JK test"]);
+    await git(projectRoot, ["config", "user.email", "test@localhost"]);
+    await fs.writeFile(path.join(projectRoot, "package.json"), JSON.stringify({ scripts: { test: "node check.cjs" } }));
+    await fs.writeFile(path.join(projectRoot, "check.cjs"), "require('node:assert/strict').equal(require('node:fs').readFileSync('result.txt','utf8'), 'done');");
+    await git(projectRoot, ["add", "."]);
+    await git(projectRoot, ["commit", "--quiet", "-m", "baseline"]);
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const call = async (toolName: string, input: Record<string, unknown>) => {
+      const response = await postAction(server.baseUrl, "/actions/call-tool", { toolName, input });
+      const body = await response.json() as { ok: boolean; structuredContent: Record<string, any> };
+      expect(body.ok, JSON.stringify(body)).toBe(true);
+      return body.structuredContent;
+    };
+    await call("project_select", { projectId: "proj", preset: "full-write", reason: "isolated task" });
+    const created = await call("task_workspace", { action: "create", projectId: "proj", workSessionId: "ws_actions", goal: "Create result" });
+    const projectId = created.projectId;
+    await call("file_create", { projectId, path: "result.txt", content: "done" });
+    await expect(fs.stat(path.join(projectRoot, "result.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    const commands = await call("command_list", { projectId });
+    const commandId = commands.commands.find((item: any) => item.riskTier === "verify").commandId;
+    const verified = await call("task_workspace", { action: "verify", projectId, commandId });
+    expect(verified.workspace.verificationCurrent).toBe(true);
+    const published = await call("task_workspace", { action: "publish", projectId, verificationId: verified.workspace.verification.id, reviewSummary: "Reviewed result and its assertion" });
+    expect(published.workspace.status).toBe("published");
+    expect(await fs.readFile(path.join(projectRoot, "result.txt"), "utf8")).toBe("done");
+  });
+
+  it("returns the next ChatGPT reasoning turn through Actions after an incremental MASS ULW submission", async () => {
+    await git(projectRoot, ["init", "--quiet"]);
+    await git(projectRoot, ["config", "user.name", "JK test"]);
+    await git(projectRoot, ["config", "user.email", "test@localhost"]);
+    await fs.writeFile(path.join(projectRoot, "package.json"), JSON.stringify({ scripts: { test: "node check.cjs" } }));
+    await fs.writeFile(path.join(projectRoot, "check.cjs"), "console.log('Actions verifier ran');");
+    await git(projectRoot, ["add", "."]); await git(projectRoot, ["commit", "--quiet", "-m", "baseline"]);
+    const server = await startApp(makeCtx(stateDir, projectRoot)); stop = server.stop;
+    const call = async (toolName: string, input: Record<string, unknown>) => {
+      const response = await postAction(server.baseUrl, "/actions/call-tool", { toolName, input });
+      const body = await response.json() as { ok: boolean; structuredContent: Record<string, any> };
+      expect(body.ok, JSON.stringify(body)).toBe(true); return body.structuredContent;
+    };
+    await call("project_select", { projectId: "proj", preset: "full-write", reason: "Web MASS ULW" });
+    const created = await call("task_workspace", { action: "create", projectId: "proj", workSessionId: "ws_http_mass", goal: "Parallel implementation" });
+    const candidates = [
+      { id: "A", task: "Implement A", estimatedWeight: 5, writeScopes: ["src/a"] },
+      { id: "B", task: "Implement B", estimatedWeight: 5, writeScopes: ["src/b"] },
+    ];
+    const base = { projectId: created.projectId, workSessionId: "ws_http_mass", loopId: "loop-http-mass", planFingerprint: buildMassUlwPlan({ executionProfile: "max", candidates }).planFingerprint };
+    await call("goal_loop", { ...base, executionProfile: "max", fanoutCandidates: candidates, pending: ["A", "B"] });
+    const started = await call("mass_ulw_step", { ...base, action: "start", laneVerificationCommandIds: { A: "npm:test", B: "npm:test" }, finalVerificationCommandId: "npm:test" });
+    expect(started.nextCall.input.action).toBe("submit");
+    const result = await call("mass_ulw_step", { ...base, action: "submit", submissions: [{ laneId: "A", contextToken: started.lanes.find((item: any) => item.id === "A").contextToken, submissionId: "http-A", patch: "*** Begin Patch\n*** Add File: src/a/result.txt\n+A\n*** End Patch" }] });
+    expect(result.role).toBe("reviewer"); expect(result.nextCall.input.action).toBe("review");
+    expect(result.externalModelRequired).toBe(false);
+    expect(result.lanes.find((item: any) => item.id === "B").status).toBe("waiting");
+    await expect(fs.stat(path.join(projectRoot, "src"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("serves an OpenAPI schema for GPT Actions", async () => {
@@ -351,6 +588,9 @@ describe("Custom GPT action bridge", () => {
           CallToolInput: { properties: Record<string, unknown> };
           GoalIntakeInput: Record<string, unknown>;
           GoalLoopInput: Record<string, unknown>;
+          ProjectSelectInput: { properties?: Record<string, unknown> };
+          LocalShellRunInput: { properties?: { intent?: { properties?: Record<string, unknown> } } };
+          OmoRunInput: { required?: string[]; properties?: Record<string, unknown> };
           MassUlwExecuteInput: Record<string, unknown>;
           SessionResumeInput: Record<string, unknown>;
           E2eRunCommandInput: Record<string, unknown>;
@@ -434,6 +674,7 @@ describe("Custom GPT action bridge", () => {
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.newLoop).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.phase).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.verificationStatus).toBeDefined();
+    expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.reviewVerdict).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.failureCount).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.fanoutCandidates).toBeDefined();
     expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.executionProfile).toBeDefined();
@@ -514,7 +755,7 @@ describe("Custom GPT action bridge", () => {
 
     expect(res.status).toBe(200);
     expect(body.ok).toBe(true);
-    expect(body.name).toBe("chatgpt2codex-actions");
+    expect(body.name).toBe("jk-actions");
     expect(body.actions).toBeGreaterThan(body.openApiOperations ?? 0);
     expect(body.openApiOperations).toBeLessThanOrEqual(30);
     expect(body.openApiToolNames).toContain("workspace_list_projects");
@@ -556,7 +797,7 @@ describe("Custom GPT action bridge", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/plain");
-    expect(text).toContain("chatgpt2codex privacy notice");
+    expect(Number(res.headers.get("content-length"))).toBe(Buffer.byteLength(text));
     expect(text).toContain("Custom GPT Actions");
   });
 
@@ -843,8 +1084,8 @@ describe("Custom GPT action bridge", () => {
       requiredBeforeCoding: true,
     });
     expect(guide.structuredContent.toolAvailabilityGate?.namespace).toBe("ChatGPT_To_Codex");
-    expect(guide.structuredContent.workflow?.join(" ")).toContain("no chatgpt2codex work happened");
-    expect(guide.text).toContain("chatgpt2codex can operate");
+    expect(guide.structuredContent.toolAvailabilityGate).toMatchObject({ app: "jk" });
+    expect(guide.toolCall).toMatchObject({ app: "jk" });
     expect(guide.structuredContent.workflow).toContain("workspace_list_projects or workspace_refresh_index");
     expect(guide.structuredContent.workflow?.join(" ")).toContain("device-agnostic/mobile");
     expect(guide.structuredContent.workflow?.join(" ")).toContain("goal_intake immediately");
@@ -1503,7 +1744,7 @@ describe("Custom GPT action bridge", () => {
 
     expect(res.status).toBe(200);
     expect(body.ok).toBe(true);
-    expect(body.text).toContain("Continue with the next chatgpt2codex tool call now");
+    expect(body).toMatchObject({ toolCall: { app: "jk", tool: "goal_intake", ok: true } });
     expect(body.structuredContent.goalId).toMatch(/^goal-/);
     expect(body.structuredContent.loopId).toMatch(/^loop-/);
     expect(body.structuredContent.workSessionId).toMatch(/^ws_/);
@@ -1516,6 +1757,95 @@ describe("Custom GPT action bridge", () => {
     expect(body.structuredContent.nextActions?.join(" ")).toContain(body.structuredContent.loopId);
     expect(body.structuredContent.timeoutGuidance).toContain("intentionally fast");
     await expect(fs.readdir(path.join(stateDir, "goals"))).resolves.toHaveLength(2);
+  });
+
+  it("recalls relevant durable project memory as historical Aha moments on a new goal", async () => {
+    const ctx = makeCtx(stateDir, projectRoot);
+    await new ProjectMemoryStore(stateDir).addKnownFix("proj", {
+      title: "Recover executor delivery receipts",
+      symptom: "executor recovery delivery can replay a completed job when its receipt is lost",
+      solution: "resume durable receipt delivery before replaying executor work",
+      tags: ["executor", "recovery", "delivery"],
+    });
+    const server = await startApp(ctx);
+    stop = server.stop;
+
+    const priorRes = await postAction(server.baseUrl, "/actions/goal-intake", {
+      goal: "repair executor recovery delivery receipts",
+      projectId: "proj",
+      workSessionId: "ws_prior_aha",
+    });
+    const prior = (await priorRes.json()) as { structuredContent: { loopId?: string } };
+    await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: prior.structuredContent.loopId,
+      projectId: "proj",
+      workSessionId: "ws_prior_aha",
+      currentTask: "repair executor recovery delivery",
+      decisions: [{ summary: "Do not replay completed executor jobs after a lost receipt", rationale: "The durable result must be delivered first" }],
+      pending: ["finish receipt recovery"],
+      phase: "plan",
+    });
+
+    const recalledRes = await postAction(server.baseUrl, "/actions/goal-intake", {
+      goal: "harden executor recovery delivery receipts",
+      projectId: "proj",
+      workSessionId: "ws_new_aha",
+    });
+    const recalled = (await recalledRes.json()) as {
+      structuredContent: {
+        ahaMoments?: Array<{
+          label?: string;
+          kind?: string;
+          hint?: string;
+          caveat?: string;
+          source?: { workSessionId?: string; knownFixId?: string };
+        }>;
+      };
+    };
+    expect(recalled.structuredContent.ahaMoments).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        label: "✦ Aha moment!",
+        kind: "known-fix",
+        caveat: "historical-memory-not-current-state",
+      }),
+      expect.objectContaining({
+        label: "✦ Aha moment!",
+        kind: "work-session",
+        hint: expect.stringContaining("Do not replay completed executor jobs"),
+        source: { workSessionId: "ws_prior_aha" },
+        caveat: "historical-memory-not-current-state",
+      }),
+    ]));
+  });
+
+  it("preserves a long goal contract beyond the UI preview across goal_loop turns", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const tailMarker = "FINAL_CONSTRAINT_MUST_SURVIVE";
+    const longGoal = `Implement autonomous harness safely. ${"constraint ".repeat(180)}${tailMarker}`;
+
+    const intakeRes = await postAction(server.baseUrl, "/actions/goal-intake", {
+      goal: longGoal,
+      projectId: "proj",
+      urgency: "fast",
+    });
+    const intake = (await intakeRes.json()) as {
+      structuredContent: { loopId?: string; workSessionId?: string; taskState?: { currentGoal?: string | null } };
+    };
+    expect(intake.structuredContent.taskState?.currentGoal).toContain(tailMarker);
+    expect(intake.structuredContent.taskState?.currentGoal?.length).toBeGreaterThan(1000);
+
+    const continuedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: intake.structuredContent.loopId,
+      projectId: "proj",
+      workSessionId: intake.structuredContent.workSessionId,
+      maxTurns: 4,
+      lastResult: "continue without restating the original goal",
+    });
+    const continued = (await continuedRes.json()) as {
+      structuredContent: { intentContext?: { goalContract?: string | null } };
+    };
+    expect(continued.structuredContent.intentContext?.goalContract).toContain(tailMarker);
   });
 
   it("continues the loop reserved by goal_intake instead of silently creating a replacement", async () => {
@@ -1656,6 +1986,7 @@ describe("Custom GPT action bridge", () => {
         workSessionId?: string;
         nextActions?: string[];
         orchestration?: { phase?: string; primaryStage?: string; failureCount?: number };
+        intentContext?: { goalContract?: string; currentTask?: string; decisions?: Array<{ summary: string; rationale: string }> };
       };
     };
 
@@ -1678,7 +2009,6 @@ describe("Custom GPT action bridge", () => {
         },
       ],
     });
-    expect(second.structuredContent.nextActions?.join(" ")).toContain("persisted goal contract");
     expect(second.structuredContent.nextActions?.join(" ")).toContain("Do not apply another patch");
     const loopFile = path.join(stateDir, "goals", `${first.structuredContent.loopId}.loop.json`);
     const loopState = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[] };
@@ -1692,6 +2022,7 @@ describe("Custom GPT action bridge", () => {
       currentTask: "release complete",
       phase: "release",
       verificationStatus: "pass",
+      reviewVerdict: "approve",
       failureCount: 0,
       completed: ["wire structured task state", "wire resume", "run focused tests"],
       pending: [],
@@ -1708,12 +2039,12 @@ describe("Custom GPT action bridge", () => {
     };
     expect(terminalRes.status).toBe(200);
     expect(terminal.ok).toBe(true);
-    expect(terminal.text).toContain("completed after verified release");
     expect(terminal.structuredContent).toMatchObject({
-      terminal: true,
-      terminalStatus: "succeeded",
-      terminalPushResult: "failed",
-      continueRequired: false,
+      terminal: false,
+      terminalStatus: null,
+      terminalPushResult: null,
+      continueRequired: true,
+      continuationReason: "evidence-required",
     });
 
     const selectRes = await postAction(server.baseUrl, "/actions/project-select", {
@@ -1757,6 +2088,120 @@ describe("Custom GPT action bridge", () => {
     });
   });
 
+  it("requires a fresh final review verdict and lets a proven blocker terminate cleanly", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const initialRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement and verify a harness change",
+      projectId: "proj",
+      maxTurns: 6,
+      currentTask: "verify the change",
+      pending: ["run verification"],
+    });
+    const initial = (await initialRes.json()) as {
+      structuredContent: { loopId?: string };
+    };
+
+    const missingRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: initial.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 6,
+      currentTask: "final review",
+      phase: "release",
+      verificationStatus: "pass",
+      pending: [],
+    });
+    const missing = (await missingRes.json()) as {
+      structuredContent: {
+        terminal?: boolean;
+        terminalBlockedByReview?: boolean;
+        continueRequired?: boolean;
+        orchestration?: { reviewVerdict?: string };
+        nextActions?: string[];
+      };
+    };
+    expect(missing.structuredContent).toMatchObject({
+      terminal: false,
+      terminalBlockedByReview: true,
+      continueRequired: true,
+      orchestration: { reviewVerdict: "missing" },
+    });
+    expect(missing.structuredContent.nextActions?.join(" ")).toContain("final review is still missing");
+
+    const rejectedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: initial.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 6,
+      currentTask: "resolve final review",
+      phase: "release",
+      verificationStatus: "pass",
+      reviewVerdict: "reject",
+      pending: [],
+    });
+    const rejected = (await rejectedRes.json()) as {
+      structuredContent: {
+        terminal?: boolean;
+        terminalBlockedByReview?: boolean;
+        orchestration?: { phase?: string; reviewVerdict?: string };
+      };
+    };
+    expect(rejected.structuredContent).toMatchObject({
+      terminal: false,
+      terminalBlockedByReview: true,
+      orchestration: { phase: "review", reviewVerdict: "reject" },
+    });
+
+    const approvedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: initial.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 6,
+      currentTask: "release complete",
+      phase: "release",
+      verificationStatus: "pass",
+      reviewVerdict: "approve",
+      pending: [],
+    });
+    const approved = (await approvedRes.json()) as {
+      structuredContent: { terminal?: boolean; terminalStatus?: string | null; continueRequired?: boolean };
+    };
+    expect(approved.structuredContent).toMatchObject({
+      terminal: false,
+      terminalStatus: null,
+      continueRequired: true,
+      continuationReason: "evidence-required",
+    });
+
+    const blockedStartRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Investigate a hard environment blocker",
+      projectId: "proj",
+      newLoop: true,
+      maxTurns: 3,
+      currentTask: "prove the blocker",
+      pending: ["inspect environment"],
+    });
+    const blockedStart = (await blockedStartRes.json()) as { structuredContent: { loopId?: string } };
+    const blockedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: blockedStart.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 3,
+      currentTask: "blocker proven",
+      phase: "recovery",
+      verificationStatus: "blocked",
+      pending: [],
+      lastResult: "required runtime is unavailable after evidence-backed recovery checks",
+    });
+    const blocked = (await blockedRes.json()) as {
+      structuredContent: { terminal?: boolean; terminalStatus?: string | null; continueRequired?: boolean };
+    };
+    expect(blocked.structuredContent).toMatchObject({
+      terminal: false,
+      terminalStatus: null,
+      continueRequired: true,
+      lifecycle: "blocked",
+    });
+  });
+
   it("does not finish live/release work until runtime proof passes and operational drift is cleared", async () => {
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
@@ -1768,6 +2213,7 @@ describe("Custom GPT action bridge", () => {
       currentTask: "deploy the app",
       phase: "release",
       verificationStatus: "pass",
+      reviewVerdict: "approve",
       pending: [],
       safety: {
         executionKind: "release-deploy",
@@ -1818,6 +2264,7 @@ describe("Custom GPT action bridge", () => {
       currentTask: "verify live release",
       phase: "release",
       verificationStatus: "pass",
+      reviewVerdict: "approve",
       pending: [],
       safety: {
         runtimeProofStatus: "pass",
@@ -1836,8 +2283,9 @@ describe("Custom GPT action bridge", () => {
     expect(finishedRes.status).toBe(200);
     expect(finished.ok).toBe(true);
     expect(finished.structuredContent).toMatchObject({
-      terminal: true,
-      terminalStatus: "succeeded",
+      terminal: false,
+      terminalStatus: null,
+      continuationReason: "evidence-required",
       safetyGate: { terminalReady: true },
     });
   });
@@ -1913,12 +2361,17 @@ describe("Custom GPT action bridge", () => {
       },
     });
     const incomplete = (await incompleteRes.json()) as {
-      structuredContent: { code?: string; approvalPending?: boolean; missingApprovalPlanCommands?: string[] };
+      structuredContent: { code?: string; approvalPending?: boolean; approvalId?: string };
     };
-    expect(incomplete.structuredContent.code).toBe("COMMAND_NOT_ALLOWED");
-    expect(incomplete.structuredContent.approvalPending).toBe(false);
-    const stillNone = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as { approvals?: unknown[] };
-    expect(stillNone.approvals ?? []).toHaveLength(0);
+    expect(incomplete.structuredContent.code).toBe("APPROVAL_REQUIRED");
+    expect(incomplete.structuredContent.approvalPending).toBe(true);
+    const afterIncomplete = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; bundleLabel?: string; bundlePreviews?: string[] }>;
+    };
+    expect(afterIncomplete.approvals ?? []).toHaveLength(1);
+    expect(afterIncomplete.approvals?.[0]?.id).toBe(incomplete.structuredContent.approvalId);
+    expect(afterIncomplete.approvals?.[0]?.bundleLabel).toBe("release");
+    expect(afterIncomplete.approvals?.[0]?.bundlePreviews).toHaveLength(2);
 
     const bundledRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
       projectId: "proj",
@@ -1931,15 +2384,16 @@ describe("Custom GPT action bridge", () => {
       },
     });
     const bundled = (await bundledRes.json()) as {
-      structuredContent: { code?: string; approvalPending?: boolean; bundleCount?: number };
+      structuredContent: { code?: string; approvalPending?: boolean; approvalId?: string; approvalReused?: string };
     };
     expect(bundled.structuredContent.code).toBe("APPROVAL_REQUIRED");
-    expect(bundled.structuredContent.approvalPending).toBe(true);
+    expect(bundled.structuredContent.approvalId).toBe(incomplete.structuredContent.approvalId);
+    expect(bundled.structuredContent.approvalReused).toBe("existing-job");
     const after = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
       approvals?: Array<{ bundleLabel?: string; bundlePreviews?: string[] }>;
     };
     expect(after.approvals ?? []).toHaveLength(1);
-    expect(after.approvals?.[0]?.bundleLabel).toContain("release-deploy");
+    expect(after.approvals?.[0]?.bundleLabel).toBe("release");
     expect(after.approvals?.[0]?.bundlePreviews).toHaveLength(2);
   });
 
@@ -2042,7 +2496,7 @@ describe("Custom GPT action bridge", () => {
 
     const persistedExecutionId = await resolveMassUlwExecutionId(stateDir, {
       projectId: "proj",
-      externalLoopId: body.structuredContent.loopId,
+      externalLoopId: body.structuredContent.loopId ?? (() => { throw new Error("goal loop response did not include loopId"); })(),
     });
     expect(persistedExecutionId).toMatch(/^mass-[a-f0-9]{64}$/);
     const persisted = JSON.parse(
@@ -2074,7 +2528,7 @@ describe("Custom GPT action bridge", () => {
       ok: boolean;
       structuredContent: {
         orchestration?: {
-          massUlw?: { state?: string; recommended?: boolean; hardBlocks?: string[] };
+          massUlw?: { state?: string; recommended?: boolean; hardBlocks?: string[]; planFingerprint?: string };
         };
       };
     };
@@ -2099,6 +2553,7 @@ describe("Custom GPT action bridge", () => {
       structuredContent: {
         orchestration?: {
           executionProfile?: { requested?: string; effective?: string; source?: string };
+          coordination?: { mode?: string };
           massUlw?: { state?: string; recommended?: boolean };
         };
       };
@@ -2108,6 +2563,7 @@ describe("Custom GPT action bridge", () => {
       effective: "fast",
       source: "auto",
     });
+    expect(body.structuredContent.orchestration?.coordination?.mode).toBe("standard");
     expect(body.structuredContent.orchestration?.massUlw).toMatchObject({ state: "inactive", recommended: false });
   });
 
@@ -2124,6 +2580,7 @@ describe("Custom GPT action bridge", () => {
       structuredContent: {
         orchestration?: {
           executionProfile?: { requested?: string; effective?: string; source?: string };
+          coordination?: { mode?: string };
           massUlw?: { state?: string };
         };
       };
@@ -2133,7 +2590,233 @@ describe("Custom GPT action bridge", () => {
       effective: "max",
       source: "auto",
     });
+    expect(body.structuredContent.orchestration?.coordination?.mode).toBe("dispatcher");
     expect(body.structuredContent.orchestration?.massUlw?.state).toBe("evaluate");
+  });
+
+  it("Explicit standard coordination overrides automatic dispatcher selection", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement cross-module integration and run regression verification",
+      projectId: "proj",
+      coordinationMode: "standard",
+      pending: ["inspect", "patch", "verify"],
+    });
+    const body = (await res.json()) as {
+      structuredContent: { orchestration?: { coordination?: { mode?: string } } };
+    };
+    expect(body.structuredContent.orchestration?.coordination?.mode).toBe("standard");
+  });
+
+  it("uses mature telemetry only to demote borderline dispatcher work, never hard coordination cases", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const telemetryDir = path.join(stateDir, "telemetry");
+    await fs.mkdir(telemetryDir, { recursive: true });
+    const rows = [
+      ...Array.from({ length: 20 }, () => ({ schemaVersion: 1, at: new Date().toISOString(), coordinationMode: "standard", durationMs: 100, responseBytes: 9000, turn: 1, failureCount: 0, retryCount: 0, lifecycle: "yielded" })),
+      ...Array.from({ length: 20 }, () => ({ schemaVersion: 1, at: new Date().toISOString(), coordinationMode: "dispatcher", durationMs: 150, responseBytes: 8800, turn: 1, failureCount: 0, retryCount: 0, lifecycle: "yielded" })),
+    ];
+    await fs.writeFile(path.join(telemetryDir, "goal-loop.jsonl"), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+
+    const borderlineRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Review one cross-module integration boundary without broad QA or multiple pending lanes",
+      projectId: "proj",
+      maxTurns: 2,
+      newLoop: true,
+    });
+    const borderline = (await borderlineRes.json()) as { structuredContent: { orchestration?: { coordination?: { mode?: string } } } };
+    expect(borderline.structuredContent.orchestration?.coordination?.mode).toBe("standard");
+
+    const hardRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Review one cross-module integration boundary",
+      projectId: "proj",
+      pending: ["inspect", "verify"],
+      maxTurns: 2,
+      newLoop: true,
+    });
+    const hard = (await hardRes.json()) as { structuredContent: { orchestration?: { coordination?: { mode?: string } } } };
+    expect(hard.structuredContent.orchestration?.coordination?.mode).toBe("dispatcher");
+  });
+
+  it("Auto-selected dispatcher coordination persists across goal_loop turns", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const firstRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement cross-module integration and run regression verification",
+      projectId: "proj",
+      pending: ["inspect", "patch"],
+    });
+    const first = (await firstRes.json()) as {
+      structuredContent: {
+        loopId?: string;
+        workSessionId?: string;
+        orchestration?: { coordination?: { mode?: string } };
+      };
+    };
+    expect(first.structuredContent.orchestration?.coordination?.mode).toBe("dispatcher");
+
+    const resumedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      projectId: "proj",
+      loopId: first.structuredContent.loopId,
+      workSessionId: first.structuredContent.workSessionId,
+      lastResult: "scoped batch complete",
+      pending: [],
+    });
+    const resumed = (await resumedRes.json()) as {
+      structuredContent: { orchestration?: { coordination?: { mode?: string } } };
+    };
+    expect(resumed.structuredContent.orchestration?.coordination?.mode).toBe("dispatcher");
+  });
+
+  it("Dispatcher mode persists a compact coordination contract across goal_loop turns", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const firstRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "Implement a scoped change with compact orchestration",
+      projectId: "proj",
+      coordinationMode: "dispatcher",
+      pending: ["inspect", "patch", "verify"],
+    });
+    const first = (await firstRes.json()) as {
+      structuredContent: {
+        loopId?: string;
+        workSessionId?: string;
+        orchestration?: {
+          coordination?: {
+            mode?: string;
+            mainRole?: string;
+            contextPolicy?: string;
+            rawOutputPolicy?: string;
+            workerResultContract?: { maxFindings?: number; maxRisks?: number; rawOutput?: boolean };
+          };
+        };
+        nextActions?: string[];
+        activeRoleContext?: { contextText?: string; role?: { id?: string; name?: string } };
+        intentContext?: { goalContract?: string; currentTask?: string | null };
+        taskState?: { currentGoal?: string; pending?: string[] };
+        loopRules?: string[];
+      };
+    };
+
+    expect(first.structuredContent.orchestration?.coordination).toMatchObject({
+      mode: "dispatcher",
+      mainRole: "route-decide-summarize",
+      contextPolicy: "narrow",
+      rawOutputPolicy: "summary-only",
+      workerResultContract: { maxFindings: 8, maxRisks: 3, rawOutput: false },
+    });
+    expect(first.structuredContent.nextActions?.join(" ")).not.toContain("Dispatcher mode");
+    expect(first.structuredContent.loopRules?.join(" ")).toContain("main context compact");
+    expect(first.structuredContent.activeRoleContext?.contextText).toBeUndefined();
+    expect(first.structuredContent.intentContext?.goalContract).toBe("Implement a scoped change with compact orchestration");
+    expect(first.structuredContent.taskState?.currentGoal).toBeUndefined();
+    expect(first.structuredContent.nextActions?.length).toBeLessThanOrEqual(5);
+
+    const resumedRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      projectId: "proj",
+      loopId: first.structuredContent.loopId,
+      workSessionId: first.structuredContent.workSessionId,
+      lastResult: "scoped batch complete",
+    });
+    const resumed = (await resumedRes.json()) as {
+      structuredContent: { orchestration?: { coordination?: { mode?: string } } };
+    };
+    expect(resumed.structuredContent.orchestration?.coordination?.mode).toBe("dispatcher");
+  });
+
+  it("records sanitized goal_loop coordination telemetry without user content", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "PRIVATE_STANDARD_MARKER fix one typo",
+      projectId: "proj",
+      coordinationMode: "standard",
+    });
+    await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "PRIVATE_DISPATCHER_MARKER coordinate cross-module integration",
+      projectId: "proj",
+      coordinationMode: "dispatcher",
+      pending: ["inspect", "verify"],
+      verificationStatus: "fail",
+    });
+
+    const raw = await fs.readFile(path.join(stateDir, "telemetry", "goal-loop.jsonl"), "utf8");
+    const records = raw.trim().split("\n").map((line) => JSON.parse(line)) as Array<{
+      coordinationMode?: string;
+      durationMs?: number;
+      responseBytes?: number;
+      turn?: number;
+      failureCount?: number;
+      retryCount?: number;
+    }>;
+    expect(records.slice(-2).map((record) => record.coordinationMode)).toEqual(["standard", "dispatcher"]);
+    expect(records.at(-1)).toMatchObject({ turn: 1, failureCount: 1, retryCount: 0 });
+    expect(records.at(-1)?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(records.at(-1)?.responseBytes).toBeGreaterThan(0);
+    expect(raw).not.toContain("PRIVATE_STANDARD_MARKER");
+    expect(raw).not.toContain("PRIVATE_DISPATCHER_MARKER");
+    expect(raw).not.toContain(projectRoot);
+
+    const statusRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
+    const status = (await statusRes.json()) as {
+      structuredContent: {
+        goalLoopTelemetry?: {
+          windowSize?: number;
+          samples?: number;
+          standard?: { samples?: number; avgResponseBytes?: number | null; failureRate?: number | null };
+          dispatcher?: { samples?: number; avgResponseBytes?: number | null; failureRate?: number | null };
+          dispatcherVsStandard?: { responseBytesDeltaPct?: number | null };
+        };
+      };
+    };
+    expect(status.structuredContent.goalLoopTelemetry).toMatchObject({
+      windowSize: 200,
+      samples: 2,
+      standard: { samples: 1, failureRate: 0 },
+      dispatcher: { samples: 1, failureRate: 1 },
+    });
+    expect(status.structuredContent.goalLoopTelemetry?.standard?.avgResponseBytes).toBeGreaterThan(0);
+    expect(status.structuredContent.goalLoopTelemetry?.dispatcher?.avgResponseBytes).toBeGreaterThan(0);
+    expect(status.structuredContent.goalLoopTelemetry?.dispatcherVsStandard?.responseBytesDeltaPct).not.toBeNull();
+  });
+
+  it("rotates oversized goal_loop telemetry while retaining recent records", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const telemetryDir = path.join(stateDir, "telemetry");
+    await fs.mkdir(telemetryDir, { recursive: true });
+    const seed = JSON.stringify({
+      schemaVersion: 1,
+      at: "2026-09-20T00:00:00.000Z",
+      coordinationMode: "standard",
+      durationMs: 1,
+      responseBytes: 100,
+      turn: 1,
+      failureCount: 0,
+      retryCount: 0,
+      lifecycle: "yielded",
+      padding: "x".repeat(650),
+    });
+    await fs.writeFile(path.join(telemetryDir, "goal-loop.jsonl"), `${Array(9000).fill(seed).join("\n")}\n`, "utf8");
+
+    await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "trigger telemetry rotation",
+      projectId: "proj",
+      coordinationMode: "standard",
+      maxTurns: 1,
+    });
+
+    const rotated = await fs.readFile(path.join(telemetryDir, "goal-loop.jsonl"), "utf8");
+    const lines = rotated.trim().split("\n");
+    expect(lines).toHaveLength(5000);
+    expect(Buffer.byteLength(rotated, "utf8")).toBeLessThan(5 * 1024 * 1024);
+    expect(JSON.parse(lines.at(-1) ?? "{}").padding).toBeUndefined();
   });
 
   it("Fast keeps independent candidate lanes sequential", async () => {
@@ -2154,7 +2837,7 @@ describe("Custom GPT action bridge", () => {
       structuredContent: {
         orchestration?: {
           executionProfile?: { requested?: string; effective?: string };
-          massUlw?: { state?: string; recommended?: boolean; hardBlocks?: string[]; rationale?: string };
+          massUlw?: { state?: string; recommended?: boolean; hardBlocks?: string[]; rationale?: string; planFingerprint?: string };
         };
       };
     };
@@ -2383,8 +3066,147 @@ describe("Custom GPT action bridge", () => {
     );
   });
 
-  it("keeps an approved job continuation visible until goal_loop consumes it", async () => {
+  it.each(["local-shell-run", "command-run"] as const)("requires a new approval for a new goal on the same work session (%s)", async (route) => {
+    await fs.writeFile(path.join(projectRoot, "package.json"), JSON.stringify({
+      name: "owned-counter", private: true, scripts: { deploy: "node counter.cjs" },
+    }));
+    await fs.writeFile(path.join(projectRoot, "counter.cjs"),
+      "const fs=require('node:fs');const n=Number(fs.existsSync('count.txt')?fs.readFileSync('count.txt','utf8'):0)+1;fs.writeFileSync('count.txt',String(n));console.log('QA_COUNT='+n);");
     const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj", preset: "full-write", reason: "owned counter",
+    })).status).toBe(200);
+    const intake = async (goal: string) => z.object({ structuredContent: z.object({ goalId: z.string() }) }).parse(
+      await (await postAction(server.baseUrl, "/actions/goal-intake", { projectId: "proj", workSessionId: "ws_reused", goal })).json(),
+    ).structuredContent;
+    const resultSchema = z.object({ structuredContent: z.object({
+      code: z.string().optional(), jobId: z.string().optional(), approvalId: z.string().optional(), reusedJob: z.boolean().optional(),
+    }) });
+    const run = async (reason: string) => resultSchema.parse(await (await postAction(server.baseUrl, `/actions/${route}`, {
+      projectId: "proj", workSessionId: "ws_reused",
+      ...(route === "command-run" ? { commandId: "npm:deploy" } : { command: "node counter.cjs" }),
+      intent: { destructive: true, writesWorkspace: true, reason },
+    })).json()).structuredContent;
+
+    const a = await intake("implement counter goal A");
+    const first = await run("QA first run");
+    expect(first.code).toBe("APPROVAL_REQUIRED");
+    await approveJob(server.baseUrl, first.approvalId);
+    expect(await fs.readFile(path.join(projectRoot, "count.txt"), "utf8")).toBe("1");
+    expect(await run("different explanation, same goal")).toMatchObject({ jobId: first.jobId, reusedJob: true });
+    const b = await intake("implement counter goal B");
+    expect(b.goalId).not.toBe(a.goalId);
+    const next = await run("same operation, new goal");
+    expect(next.code).toBe("APPROVAL_REQUIRED");
+    expect(next.jobId).not.toBe(first.jobId);
+    expect(await fs.readFile(path.join(projectRoot, "count.txt"), "utf8")).toBe("1");
+    await approveJob(server.baseUrl, next.approvalId);
+    expect(await fs.readFile(path.join(projectRoot, "count.txt"), "utf8")).toBe("2");
+  });
+
+  it.each(["ready", "legacy", "none", "rejected", "write-error", "unresolved", "foreign-session", "foreign-goal", "foreign-loop", "foreign-project", "missing-job"] as const)("consumes only the resolved loop continuation when workSessionId is omitted (%s)", async (mode) => {
+    const ctx = makeCtx(stateDir, projectRoot);
+    const server = await startApp(ctx);
+    stop = server.stop;
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj", preset: "full-write", reason: "loop ownership",
+    })).status).toBe(200);
+    const create = async (workSessionId: string, complete: boolean) => {
+      const loop = z.object({ structuredContent: z.object({ loopId: z.string(), goalId: z.string() }) }).parse(
+        await (await postAction(server.baseUrl, "/actions/goal-intake", { projectId: "proj", workSessionId, goal: `implement result ${workSessionId}` })).json(),
+      ).structuredContent;
+      if (!complete) return { ...loop, workSessionId, jobId: undefined };
+      const job = z.object({ structuredContent: z.object({ code: z.literal("APPROVAL_REQUIRED"), approvalId: z.string(), jobId: z.string() }) }).parse(
+        await (await postAction(server.baseUrl, "/actions/local-shell-run", {
+          projectId: "proj", workSessionId, command: `node -e "console.log('${workSessionId}')"`,
+          intent: { destructive: true, reason: "loop-owned result" },
+        })).json(),
+      ).structuredContent;
+      await approveJob(server.baseUrl, job.approvalId);
+      return { ...loop, workSessionId, jobId: job.jobId };
+    };
+    const b = await create("ws_b", mode !== "none");
+    const a = await create("ws_a", true);
+    if (mode === "legacy") {
+      const session = z.object({ workSessions: z.record(z.record(z.unknown())), workContexts: z.record(z.unknown()) }).passthrough()
+        .parse(await ctx.store.getSession());
+      const { ws_b, ...otherSessions } = session.workSessions.proj ?? {};
+      const context = z.record(z.unknown()).parse(ws_b);
+      await ctx.store.setSession({ ...session, workSessions: { ...session.workSessions, proj: otherSessions },
+        workContexts: { ...session.workContexts, proj: { ...context, workSessionId: null } } });
+      const loopFile = path.join(stateDir, "goals", `${b.loopId}.loop.json`);
+      const { workSessionId: _workSessionId, schemaVersion: _schemaVersion, owner: _owner, ...loop } = z.record(z.unknown()).parse(JSON.parse(await fs.readFile(loopFile, "utf8")));
+      await fs.writeFile(loopFile, JSON.stringify({ ...loop, turns: [{}] }));
+      await updateLocalShellJob(stateDir, b.jobId ?? "", (job) => ({ ...job, workSessionId: null,
+        continuation: { goalId: b.goalId, loopId: b.loopId, workSessionId: null } }));
+    }
+    if (mode.startsWith("foreign-")) {
+      await updateLocalShellJob(stateDir, b.jobId ?? "", (job) => ({ ...job,
+        ...(mode === "foreign-project" ? { projectId: "foreign" } : {}),
+        ...(mode === "foreign-session" ? { workSessionId: "ws_foreign" } : {}),
+        continuation: { workSessionId: b.workSessionId, goalId: b.goalId, loopId: b.loopId,
+          ...(mode === "foreign-goal" ? { goalId: a.goalId } : {}),
+          ...(mode === "foreign-loop" ? { loopId: a.loopId } : {}),
+        },
+      }));
+    }
+    if (mode === "missing-job") await fs.rm(path.join(stateDir, "approvals", "shell", "jobs", `${b.jobId}.json`));
+    const notices = async () => {
+      const contextSchema = z.object({ taskState: z.object({ continuation: z.unknown() }) });
+      const session = z.object({ workSessions: z.object({ proj: z.record(contextSchema) }),
+        workContexts: z.object({ proj: contextSchema.optional() }),
+      }).parse(await ctx.store.getSession());
+      return { ws_a: session.workSessions.proj.ws_a, ws_b: session.workSessions.proj.ws_b, legacy: session.workContexts.proj };
+    };
+    const before = await notices();
+    const writeLoop = Store.prototype.writeGoalLoop;
+    const writeSpy = mode === "write-error" ? vi.spyOn(Store.prototype, "writeGoalLoop").mockImplementation(async function (this: Store, loopId, payload) {
+      if (loopId === b.loopId) throw Object.assign(new Error("loop write failed"), { code: "EIO" });
+      return writeLoop.call(this, loopId, payload);
+    }) : undefined;
+    let response: Response;
+    try {
+      response = await postAction(server.baseUrl, "/actions/goal-loop", {
+        projectId: "proj", ...(mode === "unresolved" ? { newLoop: true } : { loopId: b.loopId }),
+        ...(mode === "rejected" ? { workSessionId: a.workSessionId } :
+          mode.startsWith("foreign-") || mode === "missing-job" ? { workSessionId: b.workSessionId } : {}),
+      });
+    } finally {
+      writeSpy?.mockRestore();
+    }
+    const envelope = z.object({ ok: z.boolean(), structuredContent: z.object({
+      projectId: z.string().optional(), loopId: z.string().optional(), workSessionId: z.string().nullable().optional(),
+      taskContinuation: z.object({ loopId: z.string(), workSessionId: z.string().nullable(), jobResult: z.object({ jobId: z.string() }) }).optional(),
+    }) }).parse(await response.json());
+    const result = envelope.structuredContent;
+    if (mode === "ready" || mode === "legacy") {
+      const workSessionId = mode === "legacy" ? null : b.workSessionId;
+      expect(result.taskContinuation).toMatchObject({ loopId: b.loopId, workSessionId, jobResult: { jobId: b.jobId } });
+      expect(result).toMatchObject({ projectId: "proj", loopId: b.loopId, workSessionId });
+      expect((await notices())[mode === "legacy" ? "legacy" : "ws_b"]?.taskState.continuation).toEqual(before[mode === "legacy" ? "legacy" : "ws_b"]?.taskState.continuation);
+    } else {
+      expect(result.taskContinuation).toBeUndefined();
+      expect((await notices()).ws_b?.taskState.continuation).toEqual(before.ws_b?.taskState.continuation);
+    }
+    expect((await notices()).ws_a?.taskState.continuation).toEqual(before.ws_a?.taskState.continuation);
+    if (mode === "rejected" || mode === "write-error") expect(envelope.ok).toBe(false);
+    else if (mode === "ready" || mode === "legacy" || mode === "none") {
+      expect(response.status).toBe(200);
+      const repeat = await postAction(server.baseUrl, "/actions/call-tool", {
+        toolName: "goal_loop", input: { projectId: "proj", loopId: b.loopId },
+      });
+      const repeatedNotice = z.object({ structuredContent: z.record(z.unknown()) }).parse(await repeat.json()).structuredContent.taskContinuation;
+      if (mode === "none") expect(repeatedNotice).toBeUndefined();
+      else expect(repeatedNotice).toMatchObject({ loopId: b.loopId, jobResult: { jobId: b.jobId } });
+      expect((await notices()).ws_a?.taskState.continuation).toEqual(before.ws_a?.taskState.continuation);
+    }
+  });
+
+  it.each([false, true])("native-evolution R2 retains an approved result until exact owner acknowledgement (legacy null goal=%s)", async (legacyNullGoal) => {
+    const ctx = makeCtx(stateDir, projectRoot);
+    const store = new Store(stateDir); await store.saveProjects(ctx.registry); ctx.store = store;
+    let server = await startApp(ctx);
     stop = server.stop;
 
     expect((await postAction(server.baseUrl, "/actions/project-select", {
@@ -2406,10 +3228,22 @@ describe("Custom GPT action bridge", () => {
     expect(loop.structuredContent.loopId).toMatch(/^loop-/u);
     expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
 
+    await fs.writeFile(path.join(projectRoot, "continuation-count.cjs"), "require('node:fs').appendFileSync('continuation-effects.txt','1'); console.log('continuation-ok');");
+    if (legacyNullGoal) {
+      await store.updateSession((session) => {
+        const task = session.workSessions.proj?.[loop.structuredContent.workSessionId ?? ""]?.taskState;
+        if (!task) throw new Error("Missing owned legacy fixture");
+        task.goalId = null; return session;
+      });
+      const location = path.join(stateDir, "goals", loop.structuredContent.loopId + ".loop.json");
+      const old = z.record(z.unknown()).parse(JSON.parse(await fs.readFile(location, "utf8")));
+      for (const key of ["schemaVersion", "owner", "taskState", "revision", "totalTurns"]) delete old[key];
+      await fs.writeFile(location, JSON.stringify(old));
+    }
     const shellRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
       projectId: "proj",
       workSessionId: loop.structuredContent.workSessionId,
-      command: `node -e "console.log('continuation-ok')"`,
+      command: "node continuation-count.cjs",
       intent: { needsNetwork: true, reason: "exercise exact approval continuation" },
     });
     const shell = (await shellRes.json()) as {
@@ -2430,22 +3264,40 @@ describe("Custom GPT action bridge", () => {
     const approvalId = pendingApprovals.approvals?.find((approval) => approval.projectId === "proj")?.id;
     expect(approvalId).toMatch(/^[a-f0-9]{64}$/u);
 
-    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${approvalId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approve" }),
-    });
+    const approveRes = await approveJob(server.baseUrl, approvalId);
     expect(approveRes.status).toBe(200);
 
-    let finished = false;
-    for (let i = 0; i < 480 && !finished; i += 1) {
-      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-        jobs?: Array<{ id?: string; status?: string }>;
-      };
-      finished = approvals.jobs?.some((job) => job.id === approvalId && job.status === "succeeded") ?? false;
-      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect((await readLocalShellJob(stateDir, approvalId ?? ""))?.status).toBe("succeeded");
+
+    // The owner already approved this goal/work-session's bounded network task.
+    // A narrow GitHub status read should reuse that task grant instead of
+    // creating a second approval. Use a project-local gh stub so the test
+    // proves approval routing without touching the real network.
+    const ghStub = path.join(projectRoot, process.platform === "win32" ? "gh.exe" : "gh");
+    if (process.platform === "win32") {
+      // Preserve the gh executable family without requiring a POSIX shell.
+      await fs.copyFile(process.execPath, ghStub);
+      await fs.writeFile(path.join(projectRoot, "run"), "console.log('gh-status-ok');\n", "utf8");
+    } else {
+      await fs.writeFile(ghStub, "#!/bin/sh\nprintf 'gh-status-ok\\n'\n", "utf8");
+      await fs.chmod(ghStub, 0o755);
     }
-    expect(finished).toBe(true);
+    const followupRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: `"${ghStub.replaceAll("\\", "/")}" run list --limit 5`,
+      intent: { needsNetwork: true, reason: "verify GitHub Actions status after the approved task" },
+    });
+    const followup = (await followupRes.json()) as {
+      ok: boolean;
+      structuredContent: { code?: string; stdoutSummary?: string; approvalPending?: boolean };
+    };
+    expect(followupRes.status).toBe(200);
+    expect(followup.ok).toBe(true);
+    expect(followup).toMatchObject({ structuredContent: { exitCode: 0 } });
+    expect(followup.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
+    expect(followup.structuredContent.approvalPending).not.toBe(true);
+    expect(followup.structuredContent.stdoutSummary).toContain("gh-status-ok");
 
     const firstRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
     const first = (await firstRes.json()) as {
@@ -2455,7 +3307,8 @@ describe("Custom GPT action bridge", () => {
           loopId?: string;
           workSessionId?: string;
           continuationStatus?: string;
-          jobResult?: { status?: string; stdoutSummary?: string };
+          instruction?: string;
+          jobResult?: unknown;
         };
       };
     };
@@ -2463,16 +3316,17 @@ describe("Custom GPT action bridge", () => {
       loopId: loop.structuredContent.loopId,
       workSessionId: loop.structuredContent.workSessionId,
       continuationStatus: "ready-to-resume",
-      jobResult: { status: "succeeded" },
     });
-    expect(first.structuredContent.taskContinuation?.jobResult?.stdoutSummary).toContain("continuation-ok");
+    expect(first.structuredContent.taskContinuation?.instruction).toContain("goal_loop");
+    expect(first.structuredContent.taskContinuation?.jobResult).toBeUndefined();
     expect(first.text).toContain("[JK task continuation]");
 
     const secondRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
     const second = (await secondRes.json()) as {
-      structuredContent: { taskContinuation?: { jobResult?: { jobId?: string; status?: string } } };
+      structuredContent: { taskContinuation?: { loopId?: string; jobResult?: unknown } };
     };
-    expect(second.structuredContent.taskContinuation?.jobResult).toMatchObject({ status: "succeeded" });
+    expect(second.structuredContent.taskContinuation?.loopId).toBe(loop.structuredContent.loopId);
+    expect(second.structuredContent.taskContinuation?.jobResult).toBeUndefined();
 
     const resumedLoopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
       loopId: loop.structuredContent.loopId,
@@ -2488,9 +3342,282 @@ describe("Custom GPT action bridge", () => {
     expect(resumedLoop.structuredContent.taskContinuation?.jobResult).toMatchObject({ status: "succeeded" });
     expect(resumedLoop.structuredContent.taskContinuation?.jobResult?.stdoutSummary).toContain("continuation-ok");
 
+    const droppedResponse = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId, projectId: "proj", workSessionId: loop.structuredContent.workSessionId,
+    });
+    await droppedResponse.body?.cancel();
+    const retryRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId, projectId: "proj", workSessionId: loop.structuredContent.workSessionId,
+    });
+    const receiptSchema = z.object({ structuredContent: z.object({ taskContinuation: z.object({
+      deliveryToken: z.string(), resultRevision: z.string(), jobResult: z.object({ jobId: z.string() }),
+    }) }) });
+    const receipt = receiptSchema.parse(await retryRes.json()).structuredContent.taskContinuation;
+    expect(receipt).toMatchObject(receiptSchema.parse(resumedLoop).structuredContent.taskContinuation);
+    const jobBytes = await fs.readFile(path.join(stateDir, "approvals", "shell", "jobs", receipt.jobResult.jobId + ".json"));
+    const approvalsBefore = await fs.readdir(path.join(stateDir, "approvals", "shell", "jobs"));
+    await server.stop(); stop = undefined;
+    ctx.store = new Store(stateDir); server = await startApp(ctx); stop = server.stop;
+    const reconnected = receiptSchema.parse(await (await postAction(server.baseUrl, "/actions/goal-loop", {
+      projectId: "proj", loopId: loop.structuredContent.loopId, workSessionId: loop.structuredContent.workSessionId,
+    })).json()).structuredContent.taskContinuation;
+    expect(reconnected).toEqual(receipt);
+    const ackInput = { projectId: "proj", loopId: loop.structuredContent.loopId, workSessionId: loop.structuredContent.workSessionId,
+      acknowledgeResult: { jobId: receipt.jobResult.jobId, resultRevision: receipt.resultRevision, deliveryToken: receipt.deliveryToken } };
+    for (const invalid of [
+      { ...ackInput, projectId: "foreign-project" }, { ...ackInput, workSessionId: "ws_foreign" }, { ...ackInput, loopId: "foreign-loop" },
+      ...["jobId", "resultRevision", "deliveryToken"].map((field) => ({ ...ackInput, acknowledgeResult: { ...ackInput.acknowledgeResult, [field]: "foreign" } })),
+    ]) {
+      const before = await fs.readFile(path.join(stateDir, "sessions.json"));
+      const rejected = await postAction(server.baseUrl, "/actions/call-tool", { toolName: "goal_loop", input: invalid });
+      expect(z.object({ ok: z.boolean() }).parse(await rejected.json()).ok).toBe(false);
+      expect(await fs.readFile(path.join(stateDir, "sessions.json"))).toEqual(before);
+    }
+    expect((await postAction(server.baseUrl, "/actions/call-tool", { toolName: "goal_loop", input: ackInput })).status).toBe(200);
+    const acknowledgedSession = await fs.readFile(path.join(stateDir, "sessions.json"));
+    const acknowledgedLoop = await fs.readFile(path.join(stateDir, "goals", loop.structuredContent.loopId + ".loop.json"));
+    expect((await postAction(server.baseUrl, "/actions/call-tool", { toolName: "goal_loop", input: ackInput })).status).toBe(200);
+    expect(await fs.readFile(path.join(stateDir, "sessions.json"))).toEqual(acknowledgedSession);
+    expect(await fs.readFile(path.join(stateDir, "goals", loop.structuredContent.loopId + ".loop.json"))).toEqual(acknowledgedLoop);
     const afterConsumeRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
     const afterConsume = (await afterConsumeRes.json()) as { structuredContent: { taskContinuation?: unknown } };
     expect(afterConsume.structuredContent.taskContinuation).toBeUndefined();
+    expect(await fs.readFile(path.join(projectRoot, "continuation-effects.txt"), "utf8")).toBe("1");
+    expect(await fs.readdir(path.join(stateDir, "approvals", "shell", "jobs"))).toEqual(approvalsBefore);
+    expect(await fs.readFile(path.join(stateDir, "approvals", "shell", "jobs", receipt.jobResult.jobId + ".json"))).toEqual(jobBytes);
+    await updateLocalShellJob(stateDir, receipt.jobResult.jobId, (job) => ({ ...job, stdoutSummary: "new result revision" }));
+    const staleAck = await postAction(server.baseUrl, "/actions/call-tool", { toolName: "goal_loop", input: ackInput });
+    expect(z.object({ ok: z.boolean() }).parse(await staleAck.json()).ok).toBe(false);
+    const newer = receiptSchema.parse(await (await postAction(server.baseUrl, "/actions/project-status", {
+      projectId: "proj", continuationDetail: "full",
+    })).json()).structuredContent.taskContinuation;
+    expect(newer.resultRevision).not.toBe(receipt.resultRevision);
+    expect(newer.deliveryToken).not.toBe(receipt.deliveryToken);
+  });
+
+  it("clears an expired waiting approval without treating caller-only verification as terminal proof", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "stale continuation cleanup test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "finish even if an old approval continuation expires",
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "verify terminal cleanup",
+      pending: ["finish verification"],
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { loopId?: string; workSessionId?: string } };
+
+    const shellRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: `node -e "console.log('never-run')"`,
+      intent: { needsNetwork: true, reason: "create expiring approval continuation" },
+    });
+    const shell = (await shellRes.json()) as { structuredContent: { approvalId?: string; jobId?: string } };
+    const jobId = shell.structuredContent.jobId ?? shell.structuredContent.approvalId;
+    expect(jobId).toMatch(/^[a-f0-9]{64}$/u);
+
+    const jobPath = path.join(stateDir, "approvals", "shell", "jobs", `${jobId}.json`);
+    const job = JSON.parse(await fs.readFile(jobPath, "utf8")) as Record<string, unknown>;
+    job.expiresAt = Date.now() - 1;
+    job.status = "pending";
+    await fs.writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+
+    const terminalRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId,
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      maxTurns: 4,
+      phase: "release",
+      verificationStatus: "pass",
+      reviewVerdict: "approve",
+      pending: [],
+      completed: ["verification complete"],
+    });
+    const terminal = (await terminalRes.json()) as {
+      structuredContent: { terminal?: boolean; terminalStatus?: string; taskContinuation?: unknown };
+    };
+    expect(terminalRes.status).toBe(200);
+    expect(terminal.structuredContent.terminal).toBe(false);
+    expect(terminal.structuredContent.terminalStatus).toBeNull();
+    expect(terminal.structuredContent.taskContinuation).toBeUndefined();
+
+    const resumeRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+    });
+    const resume = (await resumeRes.json()) as {
+      structuredContent: { taskState?: { continuation?: unknown } };
+    };
+    expect(resume.structuredContent.taskState?.continuation).toBeNull();
+  });
+
+  it("clears a completed approval continuation when the owning goal_loop succeeds", async () => {
+    const ctx = makeCtx(stateDir, projectRoot);
+    const store = new Store(stateDir);
+    await store.saveProjects(ctx.registry);
+    ctx.store = store;
+    const server = await startApp(ctx);
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "terminal continuation cleanup test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "finish a research task after one approved network check",
+      projectId: "proj",
+      mode: "research",
+      maxTurns: 4,
+      currentTask: "run the approved check",
+      pending: ["inspect approved result"],
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { loopId?: string; workSessionId?: string } };
+    const jobId = "a".repeat(64);
+    const now = Date.now();
+    let goalId: string | null = null;
+    await store.updateSession((session) => {
+      const task = session.workSessions.proj?.[loop.structuredContent.workSessionId ?? ""]?.taskState;
+      if (!task) throw new Error("Missing terminal continuation fixture task");
+      goalId = task.goalId;
+      task.continuation = { jobId, status: "ready-to-resume", updatedAt: now };
+      return session;
+    });
+    await fs.mkdir(path.join(stateDir, "approvals", "shell", "jobs"), { recursive: true });
+    await fs.writeFile(path.join(stateDir, "approvals", "shell", "jobs", `${jobId}.json`), `${JSON.stringify({
+      id: jobId,
+      projectId: "proj",
+      command: "fixture approved network check",
+      cwd: null,
+      reason: "terminal continuation cleanup fixture",
+      taskIdentity: null,
+      workSessionId: loop.structuredContent.workSessionId ?? null,
+      needsNetwork: true,
+      destructive: false,
+      timeoutSec: null,
+      writesWorkspace: false,
+      continuation: {
+        workSessionId: loop.structuredContent.workSessionId ?? null,
+        goalId,
+        loopId: loop.structuredContent.loopId ?? null,
+      },
+      createdAt: now - 100,
+      expiresAt: now + 60_000,
+      status: "succeeded",
+      finishedAt: now,
+      exitCode: 0,
+      stdoutSummary: "terminal-continuation-ok",
+      durationMs: 1,
+    }, null, 2)}\n`, "utf8");
+    expect((await readLocalShellJob(stateDir, jobId))?.status).toBe("succeeded");
+
+    const beforeTerminal = await postAction(server.baseUrl, "/actions/project-status", {
+      projectId: "proj",
+      continuationDetail: "full",
+    });
+    const before = (await beforeTerminal.json()) as { structuredContent: { taskContinuation?: { continuationStatus?: string } } };
+    expect(before.structuredContent.taskContinuation?.continuationStatus).toBe("ready-to-resume");
+
+    const terminalRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId,
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      mode: "research",
+      maxTurns: 4,
+      phase: "release",
+      verificationStatus: "pass",
+      reviewVerdict: "approve",
+      pending: [],
+      completed: ["approved network check reviewed"],
+      completionEvidence: { kind: "contract-result", artifacts: ["research:approved-network-check"] },
+    });
+    const terminal = (await terminalRes.json()) as {
+      structuredContent: { terminal?: boolean; terminalStatus?: string; taskContinuation?: unknown };
+    };
+    expect(terminalRes.status).toBe(200);
+    expect(terminal.structuredContent.terminal).toBe(true);
+    expect(terminal.structuredContent.terminalStatus).toBe("succeeded");
+    expect(terminal.structuredContent.taskContinuation).toBeUndefined();
+
+    const resumeRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+    });
+    const resume = (await resumeRes.json()) as { structuredContent: { taskState?: { continuation?: unknown } } };
+    expect(resume.structuredContent.taskState?.continuation).toBeNull();
+  });
+
+  it("quarantines a corrupt approval continuation and resumes without APPROVAL_RESUME_FAILED", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "corrupt continuation recovery test",
+    })).status).toBe(200);
+
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "resume after a stale corrupt approval continuation",
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "recover stale approval",
+      pending: ["resume"],
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { loopId?: string; workSessionId?: string } };
+    const shellRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: `node -e "console.log('never-run-corrupt')"`,
+      intent: { needsNetwork: true, reason: "create corrupt approval continuation" },
+    });
+    const shell = (await shellRes.json()) as { structuredContent: { approvalId?: string; jobId?: string } };
+    const jobId = shell.structuredContent.jobId ?? shell.structuredContent.approvalId;
+    expect(jobId).toMatch(/^[a-f0-9]{64}$/u);
+
+    const jobPath = path.join(stateDir, "approvals", "shell", "jobs", `${jobId}.json`);
+    await fs.writeFile(jobPath, "{broken", "utf8");
+    const statusRes = await postAction(server.baseUrl, "/actions/project-status", { projectId: "proj" });
+    const status = (await statusRes.json()) as { ok?: boolean; structuredContent: { taskContinuation?: unknown } };
+    expect(statusRes.status).toBe(200);
+    expect(status.ok).not.toBe(false);
+    expect(status.structuredContent.taskContinuation).toBeUndefined();
+    expect(await fs.readFile(jobPath, "utf8")).toBe("{broken");
+
+    const goalResumeRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId,
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      maxTurns: 4,
+      currentTask: "continue after stale approval cleanup",
+      lastResult: "stale approval must be quarantined before continuing",
+    });
+    const goalResume = (await goalResumeRes.json()) as { ok?: boolean; structuredContent?: { code?: string } };
+    expect(goalResumeRes.status).toBe(200);
+    expect(goalResume.ok).not.toBe(false);
+    expect(goalResume.structuredContent?.code).not.toBe("APPROVAL_RESUME_FAILED");
+
+    await expect(fs.stat(jobPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const invalidDir = path.join(stateDir, "approvals", "shell", "jobs", "invalid");
+    const quarantined = (await fs.readdir(invalidDir)).find((name) => name.startsWith(`${jobId}.`));
+    expect(quarantined).toBeTruthy();
+    expect(await fs.readFile(path.join(invalidDir, quarantined!), "utf8")).toBe("{broken");
+
+    const resumeRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+    });
+    const resume = (await resumeRes.json()) as { structuredContent: { taskState?: { continuation?: unknown } } };
+    expect(resume.structuredContent.taskState?.continuation).toBeNull();
   });
 
   it("reuses the same approval job before and after approval instead of reissuing the command", async () => {
@@ -2549,22 +3676,10 @@ describe("Custom GPT action bridge", () => {
     };
     expect(pendingAfterRetry.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(1);
 
-    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${approvalId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approve" }),
-    });
+    const approveRes = await approveJob(server.baseUrl, approvalId);
     expect(approveRes.status).toBe(200);
 
-    let finished = false;
-    for (let i = 0; i < 240 && !finished; i += 1) {
-      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-        jobs?: Array<{ id?: string; status?: string }>;
-      };
-      finished = approvals.jobs?.some((job) => job.id === approvalId && job.status === "succeeded") ?? false;
-      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    expect(finished).toBe(true);
+    expect((await readLocalShellJob(stateDir, approvalId ?? ""))?.status).toBe("succeeded");
 
     const resumed = (await (await request("same operation after approval, wording changed again")).json()) as {
       structuredContent: {
@@ -2573,7 +3688,7 @@ describe("Custom GPT action bridge", () => {
         stdoutSummary?: string;
         reusedJob?: boolean;
         jobId?: string;
-        taskContinuation?: { jobResult?: { status?: string } };
+        taskContinuation?: { loopId?: string; jobResult?: unknown };
       };
     };
     expect(resumed.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
@@ -2581,8 +3696,9 @@ describe("Custom GPT action bridge", () => {
       exitCode: 0,
       reusedJob: true,
       jobId: approvalId,
-      taskContinuation: { jobResult: { status: "succeeded" } },
+      taskContinuation: { loopId: expect.any(String) },
     });
+    expect(resumed.structuredContent.taskContinuation?.jobResult).toBeUndefined();
     expect(resumed.structuredContent.stdoutSummary).toContain("approval-resume-count=1");
     expect(await fs.readFile(path.join(projectRoot, "approval-resume-count.txt"), "utf8")).toBe("1");
 
@@ -2659,24 +3775,10 @@ describe("Custom GPT action bridge", () => {
       status: "pending",
     });
 
-    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${first.structuredContent.approvalId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approve" }),
-    });
+    const approveRes = await approveJob(server.baseUrl, first.structuredContent.approvalId);
     expect(approveRes.status).toBe(200);
 
-    let finished = false;
-    for (let i = 0; i < 240 && !finished; i += 1) {
-      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-        jobs?: Array<{ id?: string; status?: string }>;
-      };
-      finished = approvals.jobs?.some(
-        (job) => job.id === first.structuredContent.approvalId && job.status === "succeeded",
-      ) ?? false;
-      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    expect(finished).toBe(true);
+    expect((await readLocalShellJob(stateDir, first.structuredContent.approvalId ?? ""))?.status).toBe("succeeded");
 
     const resumed = (await (await request({ writesWorkspace: false })).json()) as {
       structuredContent: { code?: string; exitCode?: number; stdoutSummary?: string; reusedJob?: boolean; jobId?: string };
@@ -2731,24 +3833,10 @@ describe("Custom GPT action bridge", () => {
     expect(first.structuredContent.approvalId).toMatch(/^[a-f0-9]{64}$/u);
     expect(first.structuredContent.jobId).toBe(first.structuredContent.approvalId);
 
-    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${first.structuredContent.approvalId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approve" }),
-    });
+    const approveRes = await approveJob(server.baseUrl, first.structuredContent.approvalId);
     expect(approveRes.status).toBe(200);
 
-    let finished = false;
-    for (let i = 0; i < 240 && !finished; i += 1) {
-      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-        jobs?: Array<{ id?: string; status?: string }>;
-      };
-      finished = approvals.jobs?.some(
-        (job) => job.id === first.structuredContent.approvalId && job.status === "succeeded",
-      ) ?? false;
-      if (!finished) await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    expect(finished).toBe(true);
+    expect((await readLocalShellJob(stateDir, first.structuredContent.approvalId ?? ""))?.status).toBe("succeeded");
 
     const resumed = (await (await request()).json()) as {
       structuredContent: { code?: string; exitCode?: number; stdoutSummary?: string; reusedJob?: boolean; jobId?: string };
@@ -2767,21 +3855,21 @@ describe("Custom GPT action bridge", () => {
     expect(approvalsAfterResume.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(0);
   });
 
-  it("widens an existing pending local-shell approval card when the same command is retried with a predeclared bundle", async () => {
+  it("keeps an existing pending local-shell approval immutable when the same command is retried with a broader bundle", async () => {
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
 
     expect((await postAction(server.baseUrl, "/actions/project-select", {
       projectId: "proj",
       preset: "full-write",
-      reason: "pending approval bundle upgrade integration test",
+      reason: "pending approval immutability integration test",
     })).status).toBe(200);
 
     const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
-      goal: "finish one bounded pending approval bundle",
+      goal: "keep one pending approval immutable",
       projectId: "proj",
       maxTurns: 3,
-      currentTask: "upgrade the pending command to one approval bundle",
+      currentTask: "retry the exact pending command without widening approval",
     });
     const loop = (await loopRes.json()) as { structuredContent: { workSessionId?: string } };
     const firstCommand = `node -e "console.log('pending-upgrade-first')"`;
@@ -2829,15 +3917,199 @@ describe("Custom GPT action bridge", () => {
     };
     const approvals = pending.approvals?.filter((item) => item.projectId === "proj") ?? [];
     expect(approvals).toHaveLength(1);
-    expect(approvals[0]).toMatchObject({
-      id: first.structuredContent.approvalId,
-      bundleLabel: "pending upgrade bundle",
-    });
-    expect(approvals[0]?.bundlePreviews).toHaveLength(2);
-    expect(approvals[0]?.bundleFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+    expect(approvals[0]?.id).toBe(first.structuredContent.approvalId);
+    expect(approvals[0]?.bundleLabel).toBeUndefined();
+    expect(approvals[0]?.bundlePreviews).toBeUndefined();
+    expect(approvals[0]?.bundleFingerprint).toBeUndefined();
   });
 
-  it("reuses one approved task bundle for a predeclared destructive follow-up only", async () => {
+  it("keeps a pending live-runtime approval immutable when the future approval plan broadens", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "live runtime approval immutability test",
+    })).status).toBe(200);
+
+    const command = `node -e "const fs=require('node:fs');const p='live-runtime-approval-count.txt';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1));console.log('live-runtime-approval-count='+(n+1))"`;
+    const futureCommand = `node -e "console.log('future-live-runtime-step')"`;
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "reload one live runtime step exactly once",
+      projectId: "proj",
+      maxTurns: 5,
+      currentTask: "run the approved live runtime step",
+      pending: ["run live runtime step"],
+      safety: {
+        executionKind: "live-runtime",
+        preflightStatus: "pass",
+        preflightEvidence: ["runtime target and command preflight passed"],
+        executionTarget: {
+          machine: "test-host",
+          projectRoot,
+          branch: "main",
+          dirty: true,
+          runtimeTarget: "test live runtime",
+        },
+        approvalPlan: [command],
+        rollbackStatus: "pass",
+      },
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { loopId?: string; workSessionId?: string } };
+    expect(loop.structuredContent.loopId).toBeTruthy();
+    expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
+
+    const request = (reason: string) => postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command,
+      intent: { destructive: true, writesWorkspace: true, reason },
+    });
+
+    const first = (await (await request("first live runtime approval request")).json()) as {
+      structuredContent: { code?: string; approvalPending?: boolean; approvalId?: string; jobId?: string };
+    };
+    expect(first.structuredContent).toMatchObject({ code: "APPROVAL_REQUIRED", approvalPending: true });
+    expect(first.structuredContent.approvalId).toMatch(/^[a-f0-9]{64}$/u);
+    expect(first.structuredContent.jobId).toBe(first.structuredContent.approvalId);
+
+    const beforeBroadening = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; bundleFingerprint?: string; bundlePreviews?: string[]; bundleCommandKeys?: string[] }>;
+    };
+    const original = beforeBroadening.approvals?.find((item) => item.id === first.structuredContent.approvalId);
+    expect(original?.bundlePreviews).toHaveLength(1);
+    expect(original?.bundleCommandKeys).toHaveLength(1);
+    expect(original?.bundleFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+
+    const broadenRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      loopId: loop.structuredContent.loopId,
+      projectId: "proj",
+      maxTurns: 5,
+      currentTask: "keep the existing approval while planning one future step",
+      pending: ["run live runtime step", "run future verification step"],
+      safety: { approvalPlan: [command, futureCommand] },
+    });
+    expect(broadenRes.status).toBe(200);
+
+    const duplicate = (await (await request("same exact live runtime job after future plan broadening")).json()) as {
+      structuredContent: { code?: string; approvalId?: string; jobId?: string; approvalReused?: string };
+    };
+    expect(duplicate.structuredContent).toMatchObject({
+      code: "APPROVAL_REQUIRED",
+      approvalId: first.structuredContent.approvalId,
+      jobId: first.structuredContent.jobId,
+      approvalReused: "existing-job",
+    });
+
+    const afterBroadening = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; bundleFingerprint?: string; bundlePreviews?: string[]; bundleCommandKeys?: string[] }>;
+    };
+    const stillOriginal = afterBroadening.approvals?.find((item) => item.id === first.structuredContent.approvalId);
+    expect(afterBroadening.approvals?.filter((item) => item.id === first.structuredContent.approvalId) ?? []).toHaveLength(1);
+    expect(stillOriginal?.bundlePreviews).toHaveLength(1);
+    expect(stillOriginal?.bundleCommandKeys).toHaveLength(1);
+    expect(stillOriginal?.bundleFingerprint).toBe(original?.bundleFingerprint);
+
+    const approveRes = await approveJob(server.baseUrl, first.structuredContent.approvalId);
+    expect(approveRes.status).toBe(200);
+
+    expect((await readLocalShellJob(stateDir, first.structuredContent.jobId ?? ""))?.status).toBe("succeeded");
+
+    const resumed = (await (await request("resume the exact approved live runtime job")).json()) as {
+      structuredContent: { exitCode?: number; stdoutSummary?: string; reusedJob?: boolean; jobId?: string };
+    };
+    expect(resumed.structuredContent).toMatchObject({
+      exitCode: 0,
+      reusedJob: true,
+      jobId: first.structuredContent.jobId,
+    });
+    expect(resumed.structuredContent.stdoutSummary).toContain("live-runtime-approval-count=1");
+    expect(await fs.readFile(path.join(projectRoot, "live-runtime-approval-count.txt"), "utf8")).toBe("1");
+  });
+
+  it("merges a partial explicit approval bundle with the full predeclared live-runtime approval plan", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      preset: "full-write",
+      reason: "approval plan inheritance test",
+    })).status).toBe(200);
+
+    const firstCommand = `node -e "console.log('approval-plan-first-ok')"`;
+    const followupCommand = process.platform === "win32"
+      ? `cmd /d /c "if exist approval-plan-followup.tmp del /q approval-plan-followup.tmp & echo approval-plan-followup-ok"`
+      : `sh -c "rm -rf approval-plan-followup.tmp; echo approval-plan-followup-ok"`;
+    const loopRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+      goal: "run one fully predeclared live runtime approval plan",
+      projectId: "proj",
+      maxTurns: 4,
+      currentTask: "run both approved runtime steps",
+      pending: ["run first step", "run follow-up step"],
+      safety: {
+        executionKind: "live-runtime",
+        preflightStatus: "pass",
+        preflightEvidence: ["runtime target and both commands verified"],
+        executionTarget: {
+          machine: "test-host",
+          projectRoot,
+          branch: "main",
+          dirty: true,
+          runtimeTarget: "test live runtime",
+        },
+        approvalPlan: [firstCommand, followupCommand],
+        rollbackStatus: "pass",
+      },
+    });
+    const loop = (await loopRes.json()) as { structuredContent: { workSessionId?: string } };
+    expect(loop.structuredContent.workSessionId).toMatch(/^ws_/u);
+
+    const firstRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: firstCommand,
+      intent: {
+        destructive: true,
+        writesWorkspace: true,
+        reason: "partial explicit bundle should inherit the safety plan",
+        approvalBundle: {
+          label: "partial caller bundle",
+          commands: [firstCommand],
+          ttlMinutes: 10,
+        },
+      },
+    });
+    const first = (await firstRes.json()) as {
+      structuredContent: { code?: string; approvalPending?: boolean; approvalId?: string; jobId?: string };
+    };
+    expect(first.structuredContent).toMatchObject({ code: "APPROVAL_REQUIRED", approvalPending: true });
+
+    const pending = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+      approvals?: Array<{ id?: string; projectId?: string; bundleLabel?: string; bundlePreviews?: string[] }>;
+    };
+    const approval = pending.approvals?.find((item) => item.id === first.structuredContent.approvalId);
+    expect(approval).toMatchObject({ projectId: "proj", bundleLabel: "partial caller bundle" });
+    expect(approval?.bundlePreviews).toHaveLength(2);
+
+    const approveRes = await approveJob(server.baseUrl, first.structuredContent.approvalId);
+    expect(approveRes.status).toBe(200);
+
+    expect((await readLocalShellJob(stateDir, first.structuredContent.jobId ?? ""))?.status).toBe("succeeded");
+
+    const followupRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+      projectId: "proj",
+      workSessionId: loop.structuredContent.workSessionId,
+      command: followupCommand,
+      intent: { writesWorkspace: true, reason: "same predeclared live runtime plan" },
+    });
+    const followup = (await followupRes.json()) as { structuredContent: { code?: string; exitCode?: number } };
+    expect(followup.structuredContent.code).not.toBe("APPROVAL_REQUIRED");
+    expect(followup.structuredContent.exitCode).toBe(0);
+  });
+
+  it("reuses one approved task bundle for concurrent predeclared destructive follow-ups only", async () => {
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
 
@@ -2864,6 +4136,7 @@ describe("Custom GPT action bridge", () => {
       ? `cmd /d /c "if exist bundle-unseen.tmp del /q bundle-unseen.tmp"`
       : `sh -c "rm -rf bundle-unseen.tmp"`;
 
+    const thirdCommand = secondCommand.replaceAll("bundle-second", "bundle-third");
     const firstRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
       projectId: "proj",
       workSessionId: loop.structuredContent.workSessionId,
@@ -2873,7 +4146,7 @@ describe("Custom GPT action bridge", () => {
         reason: "bounded task bundle integration",
         approvalBundle: {
           label: "integration release bundle",
-          commands: [secondCommand],
+          commands: [secondCommand, thirdCommand],
           ttlMinutes: 10,
         },
       },
@@ -2904,35 +4177,35 @@ describe("Custom GPT action bridge", () => {
     };
     const approval = pending.approvals?.find((item) => item.projectId === "proj");
     expect(approval).toMatchObject({ bundleLabel: "integration release bundle" });
-    expect(approval?.bundlePreviews).toHaveLength(2);
+    expect(approval?.bundlePreviews).toHaveLength(3);
     expect(approval?.id).toMatch(/^[a-f0-9]{64}$/u);
     expect(approval?.workSessionId).toBe(loop.structuredContent.workSessionId);
     expect(approval?.bundleFingerprint).toMatch(/^[a-f0-9]{64}$/u);
     expect(pending.approvals?.filter((item) => item.projectId === "proj") ?? []).toHaveLength(1);
 
-    const approveRes = await fetch(`${server.baseUrl}/api/jk/control/approvals/${approval?.id}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approve" }),
-    });
+    const approveRes = await approveJob(server.baseUrl, approval?.id);
     expect(approveRes.status).toBe(200);
 
-    let firstFinished = false;
-    for (let i = 0; i < 240 && !firstFinished; i += 1) {
-      const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-        jobs?: Array<{ id?: string; status?: string }>;
-      };
-      firstFinished = approvals.jobs?.some((job) => job.id === approval?.id && job.status === "succeeded") ?? false;
-      if (!firstFinished) await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    expect(firstFinished).toBe(true);
+    expect((await readLocalShellJob(stateDir, approval?.id ?? ""))?.status).toBe("succeeded");
 
-    const secondRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
-      projectId: "proj",
-      workSessionId: loop.structuredContent.workSessionId,
-      command: secondCommand,
-      intent: { reason: "same bundled task" },
-    });
+    const [secondRes, thirdRes] = await Promise.all([
+      postAction(server.baseUrl, "/actions/local-shell-run", {
+        projectId: "proj",
+        workSessionId: loop.structuredContent.workSessionId,
+        command: secondCommand,
+        intent: { reason: "same bundled task" },
+      }),
+      postAction(server.baseUrl, "/actions/local-shell-run", {
+        projectId: "proj",
+        workSessionId: loop.structuredContent.workSessionId,
+        command: thirdCommand,
+        intent: { reason: "same bundled task" },
+      }),
+    ]);
+    const third = (await thirdRes.json()) as { ok: boolean; structuredContent: { exitCode?: number } };
+    expect(third.ok).toBe(true);
+    expect(third.structuredContent.exitCode).toBe(0);
+    expect(await fs.readFile(path.join(projectRoot, "bundle-third-count.txt"), "utf8")).toBe("1");
     const second = (await secondRes.json()) as {
       structuredContent: { code?: string; exitCode?: number; jobId?: string; reusedJob?: boolean };
     };
@@ -3023,7 +4296,7 @@ describe("Custom GPT action bridge", () => {
     expect(approvals.approvals?.filter((approval) => approval.projectId === "proj") ?? []).toHaveLength(0);
   });
 
-  it("caps isolated work-session retention per project and keeps the newest session", async () => {
+  it.each(["active", "succeeded"] as const)("native-evolution R1 pins active owners but caps completed session retention (%s)", async (lifecycle) => {
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
     const ids: string[] = [];
@@ -3032,10 +4305,19 @@ describe("Custom GPT action bridge", () => {
       const res = await postAction(server.baseUrl, "/actions/goal-intake", {
         goal: `Retention test goal ${i}`,
         projectId: "proj",
+        mode: "research",
       });
-      const body = (await res.json()) as { ok: boolean; structuredContent: { workSessionId?: string } };
+      const body = (await res.json()) as { ok: boolean; structuredContent: { workSessionId?: string; loopId?: string } };
       expect(body.ok).toBe(true);
       ids.push(body.structuredContent.workSessionId!);
+      if (lifecycle === "succeeded") {
+        const completed = await postAction(server.baseUrl, "/actions/call-tool", { toolName: "goal_loop", input: {
+          projectId: "proj", workSessionId: body.structuredContent.workSessionId, loopId: body.structuredContent.loopId,
+          phase: "release", verificationStatus: "pass", reviewVerdict: "approve", pending: [],
+          completionEvidence: { kind: "contract-result", artifacts: ["research:retention-fixture"] },
+        } });
+        expect(z.object({ structuredContent: z.object({ terminal: z.boolean() }) }).parse(await completed.json()).structuredContent.terminal).toBe(true);
+      }
     }
 
     const listRes = await postAction(server.baseUrl, "/actions/call-tool", {
@@ -3052,12 +4334,12 @@ describe("Custom GPT action bridge", () => {
     };
     expect(listed.ok).toBe(true);
     expect(listed.structuredContent.retentionLimit).toBe(20);
-    expect(listed.structuredContent.totalWorkSessions).toBe(20);
-    expect(listed.structuredContent.workSessions).toHaveLength(20);
+    expect(listed.structuredContent.totalWorkSessions).toBe(lifecycle === "active" ? 22 : 20);
+    expect(listed.structuredContent.workSessions).toHaveLength(lifecycle === "active" ? 22 : 20);
     const retainedIds = listed.structuredContent.workSessions?.map((session) => session.workSessionId) ?? [];
     expect(retainedIds).toContain(ids.at(-1));
-    expect(retainedIds).not.toContain(ids[0]);
-    expect(retainedIds).not.toContain(ids[1]);
+    if (lifecycle === "active") expect(retainedIds).toEqual(expect.arrayContaining(ids));
+    else { expect(retainedIds).not.toContain(ids[0]); expect(retainedIds).not.toContain(ids[1]); }
   });
 
   it("does not auto-resume when two hint-matching work sessions are too close", async () => {
@@ -3162,13 +4444,134 @@ describe("Custom GPT action bridge", () => {
       expect(resumedRes.status).toBe(200);
       expect(resumed.ok).toBe(true);
       expect(resumed.structuredContent.resumeContext?.activeSlice?.content).toContain("remote resume content");
-      expect(worker.calls.filter((job) => job.tool === "file_read_slice").length).toBeGreaterThanOrEqual(3);
+      expect(worker.calls.filter((job) => job.tool === "file_read_slice")).toHaveLength(2);
     } finally {
       await worker.stop();
     }
   });
 
-  it("centralizes remote Windows runtime_upgrade approval, executes the same job once, and lets goal_loop consume the continuation", async () => {
+  it("treats deleted remote resume files as stale context instead of failing project_select", async () => {
+    const localJkRoot = path.join(projectRoot, "local-jk");
+    await fs.mkdir(localJkRoot, { recursive: true });
+    const worker = await startFakeWindowsExecutor(stateDir);
+    const server = await startApp(makeCtx(stateDir, projectRoot, [
+      { projectId: "chatgpt2codex", name: "chatgpt2codex", root: localJkRoot },
+    ]));
+    stop = server.stop;
+    const remoteProjectId = "windows-main::chatgpt2codex";
+    try {
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId,
+        preset: "full-write",
+        reason: "remote missing resume setup",
+      })).status).toBe(200);
+
+      const goalRes = await postAction(server.baseUrl, "/actions/goal-loop", {
+        goal: "remember remote files that may later disappear",
+        projectId: remoteProjectId,
+        maxTurns: 4,
+        currentTask: "read resume files",
+      });
+      const goal = (await goalRes.json()) as { structuredContent: { workSessionId?: string } };
+      const workSessionId = goal.structuredContent.workSessionId;
+      expect(workSessionId).toMatch(/^ws_/u);
+
+      expect((await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: remoteProjectId, workSessionId, path: "old.txt", start: 1, end: 1,
+      })).status).toBe(200);
+      expect((await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: remoteProjectId, workSessionId, path: "resume.txt", start: 1, end: 1,
+      })).status).toBe(200);
+
+      worker.setMissingPath("old.txt");
+      worker.setMissingPath("resume.txt");
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj",
+        preset: "full-write",
+        reason: "switch away before missing remote resume",
+        confirmSwitch: true,
+      })).status).toBe(200);
+
+      const resumedRes = await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId,
+        workSessionId,
+        preset: "full-write",
+        reason: "resume after remote files were deleted",
+        confirmSwitch: true,
+        includeResumeContext: true,
+        includeResumeSlice: true,
+        resumeValidationScope: "recent",
+      });
+      const resumed = (await resumedRes.json()) as {
+        ok: boolean;
+        structuredContent: {
+          resumeContext?: {
+            activeArtifact?: string | null;
+            activeArtifactStale?: boolean | null;
+            activeSlice?: unknown;
+            activeSliceReason?: string | null;
+            recentFiles?: Array<{ path: string; validated: boolean; exists: boolean | null; stale: boolean | null }>;
+          } | null;
+        };
+      };
+      expect(resumedRes.status).toBe(200);
+      expect(resumed.ok).toBe(true);
+      expect(resumed.structuredContent.resumeContext).toMatchObject({
+        activeArtifact: "resume.txt",
+        activeArtifactStale: true,
+        activeSlice: null,
+        activeSliceReason: "active-artifact-missing",
+      });
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it("native-evolution R3 exposes missing legacy worker digest without claiming a CAS token", async () => {
+    const worker = await startFakeWindowsExecutor(stateDir, false);
+    const localJkRoot = path.join(projectRoot, "local-jk"); await fs.mkdir(localJkRoot);
+    const server = await startApp(makeCtx(stateDir, projectRoot, [{ projectId: "chatgpt2codex", name: "chatgpt2codex", root: localJkRoot }])); stop = server.stop;
+    const identity = { projectId: "windows-main::chatgpt2codex", workSessionId: "ws_legacy_digest" };
+    try {
+      expect((await postAction(server.baseUrl, "/actions/project-select", { ...identity, reason: "legacy digest", preset: "read-only" })).status).toBe(200);
+      expect((await postAction(server.baseUrl, "/actions/file-read-slice", { ...identity, path: "resume.txt", start: 1, end: 1 })).status).toBe(200);
+      const resumed = z.object({ structuredContent: z.record(z.unknown()) }).parse(await (await postAction(server.baseUrl, "/actions/session-resume", {
+        ...identity, includeActiveSlice: true,
+      })).json()).structuredContent;
+      expect(resumed).toMatchObject({ activeArtifactStale: null, activePatchPreconditionHashes: null, activeSliceReason: "unverified-worker-digest",
+        activeSlice: { currentHash: null, staleAtResume: null }, validatedRecentFileCount: 0 });
+      expect(worker.calls.filter((job) => job.tool === "file_read_slice")).toHaveLength(2);
+    } finally { await worker.stop(); }
+  });
+
+  it.each(["read-token", "currentHash", "CAS", "stale", "validated"] as const)("C evidence legacy digest %s is independently unverified", async (assertion) => {
+    const worker = await startFakeWindowsExecutor(stateDir, false);
+    const localJkRoot = path.join(projectRoot, "local-jk");
+    try {
+      await fs.mkdir(localJkRoot);
+      const server = await startApp(makeCtx(stateDir, projectRoot, [{ projectId: "chatgpt2codex", name: "chatgpt2codex", root: localJkRoot }]));
+      stop = server.stop;
+      const identity = { projectId: "windows-main::chatgpt2codex", workSessionId: "ws_legacy_evidence" };
+      expect((await postAction(server.baseUrl, "/actions/project-select", { ...identity, reason: "legacy evidence", preset: "read-only" })).status).toBe(200);
+      const read = await postAction(server.baseUrl, "/actions/file-read-slice", { ...identity, path: "resume.txt", start: 1, end: 1 });
+      expect(read.status).toBe(200);
+      if (assertion === "read-token") {
+        const data = z.object({ structuredContent: z.record(z.unknown()) }).parse(await read.json()).structuredContent;
+        expect(data).toMatchObject({ workContextFileHash: null, tokenStatus: "unverified-worker-digest" });
+        return;
+      }
+      await read.arrayBuffer();
+      const response = await postAction(server.baseUrl, "/actions/session-resume", { ...identity, includeActiveSlice: true });
+      expect(response.status).toBe(200);
+      const data = z.object({ structuredContent: z.record(z.unknown()) }).parse(await response.json()).structuredContent;
+      if (assertion === "currentHash") expect(data.activeSlice).toMatchObject({ currentHash: null });
+      else if (assertion === "CAS") expect(data.activePatchPreconditionHashes).toBeNull();
+      else if (assertion === "stale") expect(data).toMatchObject({ activeArtifactStale: null, activeSlice: { staleAtResume: null } });
+      else expect(data).toMatchObject({ validatedRecentFileCount: 0, activeSliceReason: "unverified-worker-digest" });
+    } finally { await worker.stop(); }
+  });
+
+  it("centralizes remote Windows runtime_upgrade approval and retains the exact result without executing it again", async () => {
     const localJkRoot = path.join(projectRoot, "local-jk");
     await fs.mkdir(localJkRoot, { recursive: true });
     const worker = await startFakeWindowsExecutor(stateDir);
@@ -3218,10 +4621,19 @@ describe("Custom GPT action bridge", () => {
       expect(second.structuredContent.approvalReused).toBe("existing-job");
 
       const approvalsBefore = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-        approvals?: Array<{ id?: string; projectId?: string }>;
+        approvals?: Array<{ id?: string; projectId?: string; scopeKey?: string }>;
       };
       expect(approvalsBefore.approvals?.filter((item) => item.projectId === remoteProjectId)).toHaveLength(1);
+      const target = (await readLocalShellJob(stateDir, first.structuredContent.jobId ?? ""))?.executionTarget;
+      expect(target).toBeDefined();
+      const { instanceId: _instanceId, ...stableTarget } = target ?? {};
+      const scopeTarget = createHash("sha256").update(JSON.stringify([stableTarget, null])).digest("hex");
+      const manifest = createHash("sha256").update("build-a\n").digest("hex");
+      expect(approvalsBefore.approvals?.find((item) => item.id === first.structuredContent.approvalId)?.scopeKey)
+        .toBe(`maintenance:jk:runtime-reload:target:${scopeTarget}:${manifest}`);
 
+      const queued = worker.waitForRuntimeQueued();
+      const finished = once(jobEvents, "terminal", { signal: AbortSignal.timeout(15000) });
       const approve = await fetch(`${server.baseUrl}/api/jk/control/approvals/${first.structuredContent.approvalId}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -3229,28 +4641,46 @@ describe("Custom GPT action bridge", () => {
       });
       expect(approve.status).toBe(200);
 
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await queued;
       const beforeStableProof = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
         jobs?: Array<{ id?: string; status?: string }>;
       };
       expect(beforeStableProof.jobs?.find((job) => job.id === first.structuredContent.jobId)?.status).toBe("running");
 
-      let succeeded = false;
-      for (let i = 0; i < 160 && !succeeded; i += 1) {
-        const approvals = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
-          jobs?: Array<{ id?: string; status?: string }>;
-        };
-        succeeded = approvals.jobs?.some((job) => job.id === first.structuredContent.jobId && job.status === "succeeded") ?? false;
-        if (!succeeded) await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      expect(succeeded).toBe(true);
+      const readsBeforeRunningReplay = worker.calls.filter((job) => job.tool === "file_read_slice").length;
+      const runningReplay = (await (await upgrade()).json()) as {
+        structuredContent: { code?: string; jobId?: string; status?: string; reusedJob?: boolean };
+      };
+      expect(runningReplay.structuredContent).toMatchObject({
+        jobId: first.structuredContent.jobId,
+        status: "running",
+        reusedJob: true,
+      });
+      expect(runningReplay.structuredContent.code).toBeUndefined();
+      expect(worker.calls.filter((job) => job.tool === "file_read_slice")).toHaveLength(readsBeforeRunningReplay);
+
+      worker.proveReconnect();
+      await finished;
+      expect((await readLocalShellJob(stateDir, first.structuredContent.jobId ?? ""))?.status).toBe("succeeded");
       const runtimeCalls = worker.calls.filter((job) => job.tool === "local_shell_run");
       expect(runtimeCalls).toHaveLength(1);
       expect(String(runtimeCalls[0]?.payload.command ?? "")).toContain("reload-jk-runtime.ps1");
       expect(String(runtimeCalls[0]?.payload.command ?? "")).toContain("-ExecutorOnly");
 
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId, preset: "full-write", reason: "select the replacement instance", confirmSwitch: true,
+      })).status).toBe(200);
+      const replay = (await (await upgrade()).json()) as {
+        structuredContent: { code?: string; jobId?: string; reusedJob?: boolean };
+      };
+      expect(replay.structuredContent.code).toBeUndefined();
+      expect(replay.structuredContent.jobId).toBe(first.structuredContent.jobId);
+      expect(replay.structuredContent.reusedJob).toBe(true);
+      expect(worker.calls.filter((job) => job.tool === "local_shell_run")).toHaveLength(1);
       const peek = async () => {
-        const res = await postAction(server.baseUrl, "/actions/project-status", { projectId: remoteProjectId });
+        const res = await postAction(server.baseUrl, "/actions/project-status", {
+          projectId: remoteProjectId, continuationDetail: "full",
+        });
         return (await res.json()) as { structuredContent: { taskContinuation?: { jobResult?: { jobId?: string; status?: string } } } };
       };
       const peekOne = await peek();
@@ -3271,6 +4701,7 @@ describe("Custom GPT action bridge", () => {
         pending: [],
         phase: "release",
         verificationStatus: "pass",
+        reviewVerdict: "approve",
         lastResult: "Windows executor reconnected with upgraded heartbeat",
       });
       const finalLoop = (await finalLoopRes.json()) as {
@@ -3280,15 +4711,29 @@ describe("Custom GPT action bridge", () => {
           taskContinuation?: { jobResult?: { jobId?: string; status?: string } };
         };
       };
-      expect(finalLoop.structuredContent.terminal).toBe(true);
-      expect(finalLoop.structuredContent.terminalStatus).toBe("succeeded");
+      expect(finalLoop.structuredContent.terminal).toBe(false);
+      expect(finalLoop.structuredContent.terminalStatus).toBeNull();
       expect(finalLoop.structuredContent.taskContinuation?.jobResult).toMatchObject({
         jobId: first.structuredContent.jobId,
         status: "succeeded",
       });
 
       const afterConsume = await peek();
-      expect(afterConsume.structuredContent.taskContinuation).toBeUndefined();
+      expect(afterConsume.structuredContent.taskContinuation?.jobResult?.jobId).toBe(first.structuredContent.jobId);
+
+      worker.setRuntimeManifestVersion("build-b");
+      const scopedUpgrade = (await (await upgrade()).json()) as {
+        ok?: boolean;
+        structuredContent: { code?: string; approvalReused?: string; scopeKey?: string; exitCode?: number };
+      };
+      expect(scopedUpgrade.structuredContent.code).toBe("APPROVAL_REQUIRED");
+      expect(scopedUpgrade.structuredContent.approvalReused).toBeUndefined();
+      expect(scopedUpgrade.structuredContent.exitCode).toBeUndefined();
+      expect(worker.calls.filter((job) => job.tool === "local_shell_run")).toHaveLength(1);
+      const approvalsAfterScopedReuse = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
+        approvals?: Array<{ projectId?: string }>;
+      };
+      expect(approvalsAfterScopedReuse.approvals?.filter((item) => item.projectId === remoteProjectId)).toHaveLength(1);
 
       const executorRes = await fetch(`${server.baseUrl}/api/executors`, {
         headers: { authorization: `Bearer ${OWNER_TOKEN}` },

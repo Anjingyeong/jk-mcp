@@ -1,5 +1,7 @@
-import { open, readFile, stat } from "node:fs/promises";
+import { chmod, open, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { isTaskWorkspaceId, TaskWorkspaceStore } from "../workspace/task-workspaces.js";
+import { canonicalDirectory, ExecutionTargetSchema } from "../executors/target-protocol.js";
 import { json } from "express";
 import type { Express, Response } from "express";
 import { z } from "zod";
@@ -13,6 +15,7 @@ import {
   markLocalShellJobDenied,
   publicLocalShellJob,
   queueLocalShellJob,
+  targetApprovalIdentity,
   readLocalShellJob,
   updateLocalShellJob,
   type LocalShellJobRecord,
@@ -23,12 +26,11 @@ import { runCommand } from "../exec/command-runner.js";
 import { redact } from "../policy/secrets.js";
 import {
   dispatchExecutorJob,
-  getExecutorProjectRegistry,
   getProjectExecutorRoutes,
   listExecutorStatus,
   setProjectExecutorRoute,
 } from "../executors/broker.js";
-import { issueExecutorToken, revokeExecutorToken } from "../executors/auth.js";
+import { issueExecutorToken, revokeExecutorToken, verifyExecutorToken } from "../executors/auth.js";
 import { WINDOWS_EXECUTOR_BOOTSTRAP_JS } from "../executors/windows-bootstrap.js";
 import { WINDOWS_EXECUTOR_SUPERVISOR_JS } from "../executors/windows-supervisor.js";
 import { makeLease } from "../workspace/project-select.js";
@@ -36,6 +38,9 @@ import { readTaskExecutionView, type TaskExecutionSnapshot } from "./execution.j
 import { CONTROL_CENTER_HTML } from "./ui.js";
 import { readNtfySettings, saveNtfySettings, sendJkPush } from "../notifications/ntfy.js";
 import { getRuntimeSchemaHealth } from "../server/runtime-schema-health.js";
+import { assertExecutionTarget, bindExecutionLease, leaseTtlMs, resolveExecutionProject } from "../server/tools.js";
+import { clearKill } from "../control/queue.js";
+import { isSensitiveApp } from "../control/policy.js";
 import {
   CONTROL_CENTER_LOGIN_HTML,
   canServeRemoteLogin,
@@ -46,7 +51,8 @@ import {
 } from "./auth.js";
 
 const ActivateProjectSchema = z.object({
-  preset: z.enum(["read-only", "tests-only", "full-write", "image-only"]).default("full-write"),
+  preset: z.enum(["read-only", "tests-only", "full-write", "image-only", "control"]).default("full-write"),
+  controlApps: z.array(z.string().trim().min(1).max(80)).max(32).optional(),
 });
 const ResolveApprovalSchema = z.object({ decision: z.enum(["approve", "supervise", "deny"]) });
 
@@ -74,6 +80,62 @@ function modeForPreset(preset: LeasePreset): "observe" | "read" | "edit" | "veri
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+type GoalLoopTelemetryRow = {
+  coordinationMode?: "standard" | "dispatcher";
+  durationMs?: number;
+  responseBytes?: number;
+  turn?: number;
+  failureCount?: number;
+  retryCount?: number;
+};
+
+function summarizeGoalLoopTelemetryRows(rows: GoalLoopTelemetryRow[]) {
+  const summarize = (mode: "standard" | "dispatcher") => {
+    const selected = rows.filter((row) => row.coordinationMode === mode);
+    const samples = selected.length;
+    const avg = (key: "durationMs" | "responseBytes" | "turn") =>
+      samples === 0
+        ? null
+        : Number((selected.reduce((sum, row) => sum + Number(row[key] ?? 0), 0) / samples).toFixed(key === "turn" ? 2 : 0));
+    const rate = (key: "failureCount" | "retryCount") =>
+      samples === 0 ? null : Number((selected.filter((row) => Number(row[key] ?? 0) > 0).length / samples).toFixed(4));
+    return {
+      samples,
+      avgResponseBytes: avg("responseBytes"),
+      avgDurationMs: avg("durationMs"),
+      avgTurn: avg("turn"),
+      failureRate: rate("failureCount"),
+      retryRate: rate("retryCount"),
+    };
+  };
+  const standard = summarize("standard");
+  const dispatcher = summarize("dispatcher");
+  const delta = (next: number | null, base: number | null) =>
+    next === null || base === null || base === 0 ? null : Number((((next - base) / base) * 100).toFixed(1));
+  return {
+    windowSize: 200,
+    samples: rows.length,
+    standard,
+    dispatcher,
+    dispatcherVsStandard: {
+      responseBytesDeltaPct: delta(dispatcher.avgResponseBytes, standard.avgResponseBytes),
+      durationDeltaPct: delta(dispatcher.avgDurationMs, standard.avgDurationMs),
+    },
+  };
+}
+
+async function readGoalLoopTelemetryForControlCenter(stateDir: string) {
+  try {
+    const raw = await readFile(path.join(stateDir, "telemetry", "goal-loop.jsonl"), "utf8");
+    const rows = raw.trim().split("\n").filter(Boolean).slice(-200).flatMap((line) => {
+      try { return [JSON.parse(line) as GoalLoopTelemetryRow]; } catch { return []; }
+    });
+    return summarizeGoalLoopTelemetryRows(rows);
+  } catch {
+    return summarizeGoalLoopTelemetryRows([]);
+  }
 }
 
 type TaskContinuationStatus = "waiting-approval" | "running" | "ready-to-resume" | "blocked" | "denied";
@@ -153,7 +215,9 @@ function summarizeTaskState(
   const currentTask = typeof task.currentTask === "string" ? task.currentTask : null;
   const goalId = typeof task.goalId === "string" ? task.goalId : null;
   const loopId = typeof task.loopId === "string" ? task.loopId : null;
+  const lifecycle = typeof task.lifecycle === "string" ? task.lifecycle : null;
   if (!currentGoal && !currentTask && !goalId && !loopId) return null;
+  const liveLifecycle = lifecycle === null || lifecycle === "active" || lifecycle === "yielded" || lifecycle === "reasoning-needed";
   return {
     projectId,
     projectName: projectName(ctx, projectId),
@@ -170,7 +234,8 @@ function summarizeTaskState(
     updatedAt: typeof task.updatedAt === "number" ? task.updatedAt : typeof context.lastActivityAt === "number" ? context.lastActivityAt : 0,
     lastMutation: context.lastMutation ?? null,
     lastVerification: context.lastVerification ?? null,
-    active: projectId === activeProjectId && Boolean(loopId || goalId),
+    lifecycle,
+    active: projectId === activeProjectId && Boolean(loopId || goalId) && liveLifecycle,
   };
 }
 
@@ -421,16 +486,18 @@ async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string):
     });
   }
 
-  const remoteProjects = await getExecutorProjectRegistry(ctx.stateDir, ctx.registry);
-  const project = [...ctx.registry, ...remoteProjects].find((entry) => entry.projectId === job.projectId);
-  if (!project) {
+  let project;
+  try {
+    project = await assertExecutionTarget(ctx, job.projectId, job.executionTarget);
+  } catch (error) {
     const failed = await updateLocalShellJob(ctx.stateDir, approvalId, (current) => ({
       ...current,
       status: "failed",
       finishedAt: Date.now(),
-      error: "Project is no longer registered",
+      error: redact((error as Error).message),
     }));
     if (failed) await updateJobTaskContinuation(ctx, failed, "blocked");
+    await ctx.ledger.append({ type: "local.job.failed", projectId: job.projectId, approvalId });
     return failed ? publicLocalShellJob(failed) : null;
   }
 
@@ -452,7 +519,14 @@ async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string):
   });
 
   void (async () => {
+    let taskLock: { release(): Promise<void> } | undefined;
     try {
+      if (isTaskWorkspaceId(job.projectId)) {
+        const tasks = new TaskWorkspaceStore(ctx.stateDir);
+        taskLock = await tasks.acquire(job.projectId);
+        await tasks.assertActive(job.projectId);
+      }
+      project = await assertExecutionTarget(ctx, job.projectId, job.executionTarget);
       const executorId =
         project.executorKind === "remote" && typeof project.executorId === "string" && project.executorId.length > 0
           ? project.executorId
@@ -465,6 +539,7 @@ async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string):
               "command_run",
               {
                 sourceProjectId: project.sourceProjectId ?? project.projectId,
+                executionTarget: job.executionTarget,
                 commandId: job.commandId,
                 args: job.args,
                 timeoutSec: job.timeoutSec ?? undefined,
@@ -488,6 +563,7 @@ async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string):
               "local_shell_run",
               {
                 sourceProjectId: project.sourceProjectId ?? project.projectId,
+                executionTarget: job.executionTarget,
                 command: job.command,
                 cwd: job.cwd ?? undefined,
                 timeoutSec: job.timeoutSec ?? undefined,
@@ -534,6 +610,8 @@ async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string):
         projectId: job.projectId,
         approvalId,
       });
+    } finally {
+      await taskLock?.release();
     }
   })();
 
@@ -624,6 +702,67 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
     }
   });
 
+  app.get("/oci-auth", pageAccess, async (_req, res) => {
+    setLocalPageHeaders(res);
+    try {
+      const secretsDir = path.join(process.cwd(), "oci-jk-bootstrap", ".secrets");
+      const publicKey = (await readFile(path.join(secretsDir, "oci_api_key_public.pem"), "utf8"))
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const fingerprint = (await readFile(path.join(secretsDir, "fingerprint.txt"), "utf8")).trim();
+      res.type("html").send(`<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JK · OCI API Key 설정</title><style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d10;color:#f2f4f7;margin:0;display:grid;place-items:center;min-height:100vh}
+main{width:min(760px,calc(100% - 40px));background:#111419;border:1px solid #262c35;border-radius:12px;padding:28px}
+h1{font-size:22px;margin:0 0 10px}p{color:#9aa3b2;line-height:1.55}label{display:block;margin:22px 0 8px;font-weight:650}
+textarea{box-sizing:border-box;width:100%;min-height:150px;padding:12px 14px;border-radius:9px;border:1px solid #343b46;background:#0b0d10;color:#fff;font:13px ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical}
+button{margin-top:14px;width:100%;padding:12px 14px;border:0;border-radius:9px;background:#f97316;color:#fff;font-weight:750;font-size:15px;cursor:pointer}
+small,.hint{display:block;margin-top:10px;color:#788291;line-height:1.5}.fp{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#f2f4f7}.status{margin-top:14px}</style></head>
+<body><main><h1>OCI API Key 설정</h1>
+<p>1) OCI Console → User settings → API Keys → Add API Key → <b>Paste Public Key</b>에서 아래 공개키를 등록하세요.</p>
+<label>Public key</label><textarea readonly onclick="this.select()">${publicKey}</textarea>
+<div class="hint">Fingerprint: <span class="fp">${fingerprint}</span></div>
+<p>2) 등록 직후 OCI가 보여주는 <b>Configuration File Preview</b> 전체를 아래에 붙여넣으세요. 개인키는 JK OCI 서버에만 있고 브라우저로 전송되지 않습니다.</p>
+<label for="preview">Configuration File Preview</label><textarea id="preview" placeholder="[DEFAULT]\nuser=ocid1.user...\nfingerprint=...\ntenancy=ocid1.tenancy...\nregion=ap-chuncheon-1"></textarea>
+<button id="save">JK에 OCI 설정 저장</button><div id="status" class="status hint"></div>
+<script>
+document.getElementById('save').onclick=async()=>{const status=document.getElementById('status');status.textContent='검증 중...';
+const r=await fetch('/api/jk/oci-auth/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({configPreview:document.getElementById('preview').value})});
+const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니다.'}));status.textContent=j.ok?'저장 완료. 이제 preflight를 실행할 수 있습니다.':('오류: '+(j.error||r.status));};
+</script></main></body></html>`);
+    } catch (err) {
+      res.status(409).type("text/plain").send(`OCI API key setup is not ready: ${redact((err as Error).message)}`);
+    }
+  });
+
+  app.post("/api/jk/oci-auth/config", apiAccess, json({ limit: "32kb" }), async (req, res) => {
+    try {
+      const preview = typeof req.body?.configPreview === "string" ? req.body.configPreview : "";
+      const fields = new Map<string, string>();
+      for (const match of preview.matchAll(/^\s*(user|fingerprint|tenancy|region)\s*=\s*([^\r\n]+)\s*$/gmi)) {
+        fields.set(match[1].toLowerCase(), match[2].trim());
+      }
+      const user = fields.get("user") ?? "";
+      const tenancy = fields.get("tenancy") ?? "";
+      const fingerprint = fields.get("fingerprint") ?? "";
+      const region = fields.get("region") ?? "";
+      if (!user.startsWith("ocid1.user.")) throw new Error("Configuration Preview의 user OCID가 없습니다.");
+      if (!tenancy.startsWith("ocid1.tenancy.")) throw new Error("Configuration Preview의 tenancy OCID가 없습니다.");
+      if (region !== "ap-chuncheon-1") throw new Error(`region은 ap-chuncheon-1이어야 합니다. 현재: ${region || "없음"}`);
+      const secretsDir = path.join(process.cwd(), "oci-jk-bootstrap", ".secrets");
+      const expectedFingerprint = (await readFile(path.join(secretsDir, "fingerprint.txt"), "utf8")).trim().toLowerCase();
+      if (fingerprint.toLowerCase() !== expectedFingerprint) throw new Error("등록된 API Key fingerprint가 JK OCI 공개키와 일치하지 않습니다.");
+      const keyFile = path.join(secretsDir, "oci_api_key.pem");
+      const config = `[OCI_GRABBER]\nuser=${user}\nfingerprint=${fingerprint}\ntenancy=${tenancy}\nregion=${region}\nkey_file=${keyFile}\n`;
+      const configPath = path.join(secretsDir, "config");
+      await writeFile(configPath, config, { encoding: "utf8", mode: 0o600 });
+      await chmod(configPath, 0o600);
+      res.json({ ok: true, profile: "OCI_GRABBER", region });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: redact((err as Error).message) });
+    }
+  });
+
   app.use("/api/jk/control", apiAccess, json({ limit: "128kb" }));
 
   app.get("/api/jk/control/status", async (_req, res) => {
@@ -632,9 +771,10 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
       const activeProjectId = typeof session.activeProjectId === "string" ? session.activeProjectId : null;
       const roleContext = activeProjectId ? await buildActiveRoleContext(ctx, activeProjectId) : null;
       const lease = asRecord(session.lease);
-      const [executorItems, executorRoutes] = await Promise.all([
+      const [executorItems, executorRoutes, goalLoopTelemetry] = await Promise.all([
         listExecutorStatus(ctx.stateDir),
         getProjectExecutorRoutes(ctx.stateDir),
+        readGoalLoopTelemetryForControlCenter(ctx.stateDir),
       ]);
       const schema = await getRuntimeSchemaHealth();
       let deployment: Record<string, unknown> | null = null;
@@ -681,8 +821,8 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
         },
         executors: {
           local: {
-            executorId: "local",
-            label: "Local runtime",
+            executorId: "oci-main",
+            label: "OCI Hub",
             online: true,
             platform: `${process.platform}/${process.arch}`,
             workspaceRoot: ctx.workspaceRoot,
@@ -696,10 +836,14 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
           mode: typeof session.mode === "string" ? session.mode : null,
           leasePreset: typeof lease.preset === "string" ? lease.preset : null,
           leaseExpiresAt: typeof lease.expiresAt === "number" ? lease.expiresAt : null,
+          controlAllowlist: Array.isArray(session.controlAllowlist)
+            ? session.controlAllowlist.filter((entry): entry is string => typeof entry === "string")
+            : [],
         },
         quickLinks,
         deployment,
         roleContext,
+        goalLoopTelemetry,
       });
     } catch (err) {
       sendApiError(res, err);
@@ -766,7 +910,7 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
       const projectId = typeof req.body?.projectId === "string" ? req.body.projectId.trim() : "";
       const executorId = typeof req.body?.executorId === "string" ? req.body.executorId.trim() : "";
       if (!projectId || !executorId) throw new Error("projectId and executorId are required");
-      await setProjectExecutorRoute(ctx.stateDir, projectId, executorId === "local" ? null : executorId);
+      await setProjectExecutorRoute(ctx.stateDir, projectId, executorId === "oci-main" ? null : executorId);
       res.json({ ok: true, projectId, executorId });
     } catch (err) {
       sendApiError(res, err);
@@ -812,8 +956,8 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
       const activeProjectId = typeof session.activeProjectId === "string" ? session.activeProjectId : null;
       const goals = collectGoals(ctx, session);
       const selectedGoal = activeProjectId
-        ? goals.find((goal) => goal.active === true && goal.projectId === activeProjectId) ?? goals.find((goal) => goal.projectId === activeProjectId) ?? null
-        : goals[0] ?? null;
+        ? goals.find((goal) => goal.active === true && goal.projectId === activeProjectId) ?? null
+        : null;
       const snapshot = taskExecutionSnapshot(selectedGoal);
       const execution = await readTaskExecutionView(ctx.stateDir, snapshot);
       const roleContext = activeProjectId ? await buildActiveRoleContext(ctx, activeProjectId) : null;
@@ -823,6 +967,56 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
         execution,
         effectivePermission: roleContext?.effectivePermission ?? null,
         projectPermission: roleContext?.projectPermission ?? null,
+      });
+    } catch (err) {
+      sendApiError(res, err);
+    }
+  });
+
+  app.get("/api/executors/:executorId/run-view", async (req, res) => {
+    try {
+      const executorId = routeParam(req.params.executorId);
+      const authHeader = req.header("authorization") ?? "";
+      const tokenMatch = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+      const token = tokenMatch?.[1]?.trim() ?? "";
+      if (!token || !(await verifyExecutorToken(ctx.stateDir, executorId, token))) {
+        res.status(401).json({ ok: false, error: "executor authentication required" });
+        return;
+      }
+
+      const executor = (await listExecutorStatus(ctx.stateDir)).find((item) => item.executorId === executorId) ?? null;
+      if (!executor) {
+        res.status(404).json({ ok: false, error: "executor is not registered" });
+        return;
+      }
+      const allowedProjectIds = new Set((executor.projects ?? []).map((project) => project.projectId));
+      const session = asRecord(await ctx.store.getSession());
+      const activeProjectId = typeof session.activeProjectId === "string" && allowedProjectIds.has(session.activeProjectId)
+        ? session.activeProjectId
+        : null;
+      const goals = collectGoals(ctx, session).filter((goal) => typeof goal.projectId === "string" && allowedProjectIds.has(goal.projectId));
+      const selectedGoal = activeProjectId
+        ? goals.find((goal) => goal.active === true && goal.projectId === activeProjectId) ?? null
+        : null;
+      const snapshot = taskExecutionSnapshot(selectedGoal);
+      const execution = await readTaskExecutionView(ctx.stateDir, snapshot);
+      const selectedProjectId = execution?.projectId ?? activeProjectId;
+      const [approvals, logs] = await Promise.all([
+        listPendingLocalShellApprovals(ctx.stateDir),
+        readRecentAuditEvents(ctx.stateDir, 24),
+      ]);
+      const scopedApprovals = selectedProjectId
+        ? approvals.filter((approval) => approval.projectId === selectedProjectId)
+        : [];
+      const scopedLogs = selectedProjectId
+        ? logs.filter((event) => event.projectId === selectedProjectId)
+        : [];
+      res.setHeader("Cache-Control", "no-store");
+      res.json({
+        ok: true,
+        execution,
+        approvalCount: scopedApprovals.length,
+        logs: scopedLogs,
       });
     } catch (err) {
       sendApiError(res, err);
@@ -840,14 +1034,117 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
     }
   });
 
+  const approvalStoreRevision = async (): Promise<string> => {
+    const readMtime = async (target: string): Promise<number> => {
+      try {
+        return (await stat(target)).mtimeMs;
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return 0;
+        throw error;
+      }
+    };
+    const root = path.join(ctx.stateDir, "approvals", "shell");
+    const [approvalsMtime, jobsMtime] = await Promise.all([
+      readMtime(root),
+      readMtime(path.join(root, "jobs")),
+    ]);
+    return `${approvalsMtime}:${jobsMtime}`;
+  };
+
+  app.get("/api/jk/control/approvals/summary", async (_req, res) => {
+    try {
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ ok: true, revision: await approvalStoreRevision() });
+    } catch (err) {
+      sendApiError(res, err);
+    }
+  });
+
   app.get("/api/jk/control/approvals", async (_req, res) => {
     try {
-      const [approvals, jobs] = await Promise.all([
+      const [approvals, jobs, revision] = await Promise.all([
         listPendingLocalShellApprovals(ctx.stateDir),
         listRecentLocalShellJobs(ctx.stateDir, 20),
+        approvalStoreRevision(),
       ]);
       res.setHeader("Cache-Control", "no-store");
-      res.json({ ok: true, approvals, jobs });
+      res.json({ ok: true, approvals, jobs, revision });
+    } catch (err) {
+      sendApiError(res, err);
+    }
+  });
+
+  app.post("/api/jk/control/deployment/sync", async (_req, res) => {
+    try {
+      if (process.platform === "win32") {
+        throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "JK deployment sync is available only on the Linux/OCI hub runtime");
+      }
+
+      const deploymentRoot = path.resolve(process.env.JK_DEPLOYMENT_PROJECT_ROOT?.trim() || process.cwd());
+      const project = ctx.registry.find((entry) => entry.executorKind !== "remote" && path.resolve(entry.root) === deploymentRoot) ?? null;
+      if (!project) {
+        throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, "The local JK deployment checkout was not found");
+      }
+      try {
+        await Promise.all([
+          stat(path.join(project.root, "src", "server", "tools.ts")),
+          stat(path.join(project.root, "scripts", "sync-jk-oci.sh")),
+          stat(path.join(project.root, "scripts", "reload-jk-runtime.sh")),
+        ]);
+      } catch {
+        throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "The configured JK deployment checkout is missing its fixed runtime sync scripts");
+      }
+
+      const command = "bash scripts/sync-jk-oci.sh --reload-current";
+      const resolved = await resolveExecutionProject(ctx, { projectId: project.projectId });
+      const executionTarget = ExecutionTargetSchema.parse(resolved.executionTarget);
+      if (executionTarget.kind !== "local" || resolved.root !== await canonicalDirectory(project.root)) {
+        throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Deployment sync requires an explicit local route to the configured checkout");
+      }
+      const taskIdentity = targetApprovalIdentity(executionTarget);
+      const reason = "Sync the OCI JK runtime from its configured upstream, verify the build, then reload through JK's health-checked rollback-capable runtime path";
+      const jobInput = {
+        projectId: project.projectId,
+        executionTarget,
+        taskIdentity,
+        command,
+        reason,
+        needsNetwork: true,
+        destructive: true,
+        writesWorkspace: true,
+      };
+      const reusable = await findReusableLocalShellJob(ctx.stateDir, jobInput);
+      if (reusable && (reusable.status === "pending" || reusable.status === "running")) {
+        res.status(reusable.status === "pending" ? 202 : 200).json({
+          ok: true,
+          status: reusable.status,
+          approvalId: reusable.id,
+          job: publicLocalShellJob(reusable),
+          reused: true,
+        });
+        return;
+      }
+
+      const approval = await requestLocalShellApproval(ctx.stateDir, {
+        projectId: project.projectId,
+        taskIdentity,
+        command,
+        reason,
+        needsNetwork: true,
+        destructive: true,
+      });
+      const job = await queueLocalShellJob(ctx.stateDir, approval, {
+        executionTarget,
+        taskIdentity,
+        command,
+        reason,
+        needsNetwork: true,
+        destructive: true,
+        writesWorkspace: true,
+        timeoutSec: 300,
+      });
+      await ctx.ledger.append({ type: "deployment.sync.queued", projectId: project.projectId, approvalId: approval.id });
+      res.status(202).json({ ok: true, status: "pending", approvalId: approval.id, job: publicLocalShellJob(job), reused: false });
     } catch (err) {
       sendApiError(res, err);
     }
@@ -857,14 +1154,15 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
     try {
       const input = ResolveApprovalSchema.parse(req.body ?? {});
       const approval = await resolveLocalShellApproval(ctx.stateDir, req.params.id, input.decision);
+      const decision = approval.resolvedDecision ?? (approval.status === "denied" ? "deny" : "approve");
       await ctx.ledger.append({
         type: "local.approval.resolved",
         projectId: approval.projectId,
         approvalId: approval.id,
-        decision: input.decision,
+        decision,
       });
       let job = null;
-      if (input.decision === "deny") {
+      if (decision === "deny") {
         const denied = await markLocalShellJobDenied(ctx.stateDir, approval.id);
         if (denied) await updateJobTaskContinuation(ctx, denied, "denied");
         job = denied ? publicLocalShellJob(denied) : null;
@@ -880,17 +1178,30 @@ export function registerControlCenterRoutes(app: Express, ctx: ToolContext): voi
   app.post("/api/jk/control/projects/:projectId/activate", async (req, res) => {
     try {
       const body = ActivateProjectSchema.parse(req.body ?? {});
+      const controlApps = [...new Set((body.controlApps ?? []).map((entry) => entry.trim()).filter(Boolean))];
+      if (body.preset === "control") {
+        const blocked = controlApps.find((entry) => isSensitiveApp(entry));
+        if (blocked) {
+          throw new DomainError(
+            ErrorCode.SENSITIVE_TARGET_BLOCKED,
+            `Sensitive app cannot be allowlisted for computer control: ${blocked}`,
+          );
+        }
+        if (controlApps.length === 0) {
+          throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Computer Control requires at least one allowlisted app");
+        }
+      }
       const projectId = await resolveCanonicalRoleProjectId(ctx, req.params.projectId);
-      const remoteProjects = await getExecutorProjectRegistry(ctx.stateDir, ctx.registry);
-      const entry = [...ctx.registry, ...remoteProjects].find((project) => project.projectId === projectId);
-      if (!entry) throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, `Project not found: ${req.params.projectId}`);
-      const lease = makeLease(entry, body.preset);
+      const entry = await resolveExecutionProject(ctx, { projectId });
+      const lease = bindExecutionLease(makeLease(entry, body.preset, leaseTtlMs(ctx)), entry);
       await updateSession(ctx, (current) => ({
         ...current,
         activeProjectId: entry.projectId,
         mode: modeForPreset(body.preset),
         lease,
+        ...(body.preset === "control" ? { controlAllowlist: controlApps } : {}),
       }));
+      if (body.preset === "control") await clearKill(ctx.stateDir);
       const roleContext = await buildActiveRoleContext(ctx, entry.projectId, body.preset);
       await ctx.ledger.append({
         type: "project.selected.web",

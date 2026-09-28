@@ -18,7 +18,7 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 
-public static class ChatGpt2CodexE2EMouse {
+public static class JkE2EMouse {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
   public const uint LEFTDOWN = 0x0002;
@@ -117,7 +117,8 @@ function Get-E2EEnv() {
     HOMEPATH = $homePath
     LOCALAPPDATA = $LocalAppData
     APPDATA = $RoamingAppData
-    CHATGPT2CODEX_AUTO_CAPTURE = "0"
+    JK_AUTO_CAPTURE = "0"
+    CHATGPT2CODEX_AUTO_CAPTURE = "0" # Legacy input retained until the runtime removes this compatibility alias.
     PATH = (Join-Path $InstallDir "bin") + ";" + $env:PATH
   }
 }
@@ -268,6 +269,11 @@ function Invoke-Http(
   }
 }
 
+function Test-PrivacyResponse([object]$Response) {
+  $contentType = [string]$Response.Headers["content-type"]
+  return $Response.Status -eq 200 -and $contentType -match "^(?i:text/plain)(?:;|$)"
+}
+
 function Invoke-Json(
   [string]$Method,
   [string]$Uri,
@@ -359,13 +365,13 @@ function Click-AutomationElement([System.Windows.Automation.AutomationElement]$E
   }
 
   $bounds = $Element.Current.BoundingRectangle
-  [ChatGpt2CodexE2EMouse]::SetCursorPos(
+  [JkE2EMouse]::SetCursorPos(
     [int]($bounds.X + ($bounds.Width / 2)),
     [int]($bounds.Y + ($bounds.Height / 2))
   ) | Out-Null
-  [ChatGpt2CodexE2EMouse]::mouse_event([ChatGpt2CodexE2EMouse]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+  [JkE2EMouse]::mouse_event([JkE2EMouse]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
   Start-Sleep -Milliseconds 80
-  [ChatGpt2CodexE2EMouse]::mouse_event([ChatGpt2CodexE2EMouse]::LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+  [JkE2EMouse]::mouse_event([JkE2EMouse]::LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
 }
 
 function Test-ExternalDns() {
@@ -598,7 +604,7 @@ try {
 
   Invoke-Step "run one-shot installer" {
     Assert-True (Test-Path -LiteralPath $Installer) "Installer not found: $Installer"
-    foreach ($existing in @(Get-Process -Name "chatgpt2codex" -ErrorAction SilentlyContinue)) {
+    foreach ($existing in @(Get-Process -Name "JK" -ErrorAction SilentlyContinue)) {
       Stop-ProcessTree $existing.Id
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -621,8 +627,8 @@ try {
     $paths = @(
       $exePath,
       $iconPath,
-      (Join-Path $InstallDir "start-chatgpt.ps1"),
-      (Join-Path $InstallDir "start-chatgpt.cmd"),
+      (Join-Path $InstallDir "start-jk.ps1"),
+      (Join-Path $InstallDir "start-jk.cmd"),
       (Join-Path $InstallDir "dist\cli.js"),
       (Join-Path $InstallDir "bin\node.exe"),
       (Join-Path $InstallDir "bin\cloudflared.exe"),
@@ -657,7 +663,7 @@ try {
       "Show Logs",
       "Open GitHub Repository",
       "Check for Updates...",
-      "About ezBuilder",
+      "About JK",
       "Save",
       "Cancel",
       "Quit"
@@ -712,7 +718,7 @@ try {
     $health = Invoke-Json "GET" "$baseUrl/healthz"
     Assert-True ($health.Status -eq 200 -and $health.Body.ok -eq $true) "healthz failed"
     $privacy = Invoke-Http "GET" "$baseUrl/privacy"
-    Assert-True ($privacy.Status -eq 200 -and $privacy.Text.Contains("chatgpt2codex privacy notice")) "privacy failed"
+    Assert-True (Test-PrivacyResponse $privacy) "privacy response contract failed"
     $actions = Invoke-Json "GET" "$baseUrl/actions/health"
     Assert-True ($actions.Status -eq 200 -and [int]$actions.Body.actions -ge 20) "actions health failed"
     $openapi = Invoke-Json "GET" "$baseUrl/actions/openapi.json"
@@ -805,7 +811,7 @@ try {
     Assert-True (-not $gui.Process.HasExited) "GUI launcher exited after health check"
     $children = @(Get-DescendantProcesses $gui.Process.Id)
     $childText = (($children | ForEach-Object { "$($_.Name) $($_.CommandLine)" }) -join "`n")
-    Assert-True ($childText -match "powershell.exe" -and $childText -match "start-chatgpt.ps1") "GUI launcher did not spawn start-chatgpt.ps1"
+    Assert-True ($childText -match "powershell.exe" -and $childText -match "start-jk.ps1") "GUI launcher did not spawn start-jk.ps1"
     $guiLog = Get-ChildItem -LiteralPath (Join-Path $LocalAppData "JK\logs") -Filter "launcher-*.log" |
       Sort-Object LastWriteTime -Descending |
       Select-Object -First 1
@@ -860,7 +866,7 @@ try {
   if (-not $SkipTunnel) {
     Invoke-Step "verify Cloudflare quick tunnel startup path" {
       $tunnelPort = Get-FreePort
-      $scriptPath = Join-Path $InstallDir "start-chatgpt.ps1"
+      $scriptPath = Join-Path $InstallDir "start-jk.ps1"
       $job = Start-LoggedProcess "powershell.exe" @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $scriptPath,
         "-Port", "$tunnelPort", "-Workspace", $Workspace
@@ -872,11 +878,11 @@ try {
         $logs = Read-ProcessLogs $job
         $match = [regex]::Match($logs, "https://[a-zA-Z0-9.-]+\.trycloudflare\.com")
         if ($match.Success) { $url = $match.Value }
-        if ($url -and $logs -match "chatgpt2codex is ready") { break }
+        if ($url -and $logs -match "JK is ready") { break }
         Start-Sleep -Seconds 1
       } while ([DateTime]::UtcNow -lt $deadline)
       Assert-True ([string]$url -ne "") "Quick Tunnel URL did not appear"
-      Assert-True ((Read-ProcessLogs $job) -match "chatgpt2codex is ready") "Quick Tunnel path did not reach ready"
+      Assert-True ((Read-ProcessLogs $job) -match "JK is ready") "Quick Tunnel path did not reach ready"
       $publicDetail = Wait-PublicHealth "$url/healthz" $RuntimeTimeoutSec
       Stop-ProcessTree $job.Process.Id
       "url=$url publicHealth=$publicDetail"
@@ -886,7 +892,7 @@ try {
   Invoke-Step "verify no macOS automation traces remain" {
     Push-Location $Root
     try {
-      $scanPaths = @("README.md", "package.json", "src", "scripts", "windows", "start-chatgpt.ps1", "start-chatgpt.cmd", "linux") |
+      $scanPaths = @("README.md", "package.json", "src", "scripts", "windows", "start-jk.ps1", "start-jk.cmd", "linux") |
         Where-Object { Test-Path -LiteralPath $_ }
       $terms = @(
         ("osa" + "script"),

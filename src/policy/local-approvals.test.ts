@@ -1,7 +1,8 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { promises as fsPromises } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   consumeLocalShellApproval,
   listPendingLocalShellApprovals,
@@ -35,6 +36,24 @@ function input(overrides: Partial<LocalShellApprovalInput> = {}): LocalShellAppr
 }
 
 describe("local shell approvals", () => {
+  it("consumes distinct approved bundle commands concurrently without losing a grant", async () => {
+    const dir = await stateDir();
+    const commands = Array.from({ length: 8 }, (_, i) => `release-part-${i}`);
+    const common = { taskIdentity: "goal:parallel-bundle", workSessionId: "ws_parallel", destructive: true };
+    const requested = await requestLocalShellApproval(dir, input({
+      ...common, command: "release-start",
+      bundle: { label: "parallel release", entries: ["release-start", "release-once", ...commands].map((command) => ({ command, needsNetwork: true, destructive: true })) },
+    }));
+    await resolveLocalShellApproval(dir, requested.id, "approve");
+    expect(await consumeLocalShellApproval(dir, input({ ...common, command: "release-start" }))).toBe(true);
+    const results = await Promise.allSettled(commands.map((command) => consumeLocalShellApproval(dir, input({ ...common, command }))));
+    expect(results).toEqual(commands.map(() => ({ status: "fulfilled", value: true })));
+    const duplicate = await Promise.allSettled(Array.from({ length: 4 }, () => consumeLocalShellApproval(dir, input({ ...common, command: "release-once" }))));
+    expect(duplicate.filter((result) => result.status === "fulfilled" && result.value)).toHaveLength(1);
+    expect(duplicate.filter((result) => result.status === "rejected")).toHaveLength(0);
+    expect(await consumeLocalShellApproval(dir, input({ ...common, command: commands[0] }))).toBe(false);
+  });
+
   it("creates a pending exact-command approval with a bounded preview", async () => {
     const dir = await stateDir();
     const record = await requestLocalShellApproval(dir, input());
@@ -46,6 +65,64 @@ describe("local shell approvals", () => {
     const pending = await listPendingLocalShellApprovals(dir);
     expect(pending).toHaveLength(1);
     expect(pending[0]?.id).toBe(record.id);
+  });
+
+  it("moves expired approval history out of the hot directory without deleting the audit record", async () => {
+    const dir = await stateDir();
+    const record = await requestLocalShellApproval(dir, input());
+    const hotPath = path.join(dir, "approvals", "shell", `${record.id}.json`);
+    const persisted = JSON.parse(await readFile(hotPath, "utf8"));
+    persisted.createdAt = Date.now() - 10 * 60 * 1000;
+    persisted.expiresAt = persisted.createdAt + 5 * 60 * 1000;
+    await writeFile(hotPath, `${JSON.stringify(persisted, null, 2)}\n`);
+
+    expect(await listPendingLocalShellApprovals(dir)).toEqual([]);
+    const archiveDir = path.join(dir, "approvals", "shell", "archive");
+    let archived: string[] = [];
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      archived = await readdir(archiveDir).catch(() => []);
+      if (archived.some((name) => name.startsWith(`${record.id}.`))) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(await readdir(path.join(dir, "approvals", "shell"))).not.toContain(`${record.id}.json`);
+    const archivedFile = archived.find((name) => name.startsWith(`${record.id}.`));
+    expect(archivedFile).toBeDefined();
+    const archivedRecord = JSON.parse(await readFile(path.join(dir, "approvals", "shell", "archive", archivedFile!), "utf8"));
+    expect(archivedRecord.id).toBe(record.id);
+  });
+
+  it("does not re-read a large unchanged approval history on repeated pending-list calls", async () => {
+    const dir = await stateDir();
+    const shellDir = path.join(dir, "approvals", "shell");
+    await mkdir(shellDir, { recursive: true });
+    const now = Date.now();
+    const records = Array.from({ length: 1501 }, (_, index) => ({
+      id: index.toString(16).padStart(64, "0"),
+      projectId: "proj",
+      commandPreview: `fixture-${index}`,
+      cwd: ".",
+      reason: null,
+      needsNetwork: false,
+      destructive: false,
+      createdAt: now - index,
+      expiresAt: now + 5 * 60 * 1000,
+      status: index === 1500 ? "pending" : "denied",
+    }));
+    await Promise.all(records.map((record) =>
+      writeFile(path.join(shellDir, `${record.id}.json`), `${JSON.stringify(record)}\n`),
+    ));
+
+    const readSpy = vi.spyOn(fsPromises, "readFile");
+    const first = await listPendingLocalShellApprovals(dir);
+    const readsAfterFirst = readSpy.mock.calls.length;
+    const second = await listPendingLocalShellApprovals(dir);
+    const readsAfterSecond = readSpy.mock.calls.length;
+    readSpy.mockRestore();
+
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(1);
+    expect(readsAfterFirst).toBeGreaterThanOrEqual(1500);
+    expect(readsAfterSecond).toBe(readsAfterFirst);
   });
 
   it("approves exactly once and consumes the grant atomically", async () => {
@@ -132,19 +209,19 @@ describe("local shell approvals", () => {
 
   it("reuses a task bundle only for predeclared command and risk hashes", async () => {
     const dir = await stateDir();
-    const workSessionId = "ws_sampleapp_release";
-    const taskIdentity = `goal:sampleapp-release:work-session:${workSessionId}`;
-    const releaseUpload = "gh release upload android-channel SampleApp-Android-0.1.12.apk --clobber";
+    const workSessionId = "ws_cleantube_release";
+    const taskIdentity = `goal:cleantube-release:work-session:${workSessionId}`;
+    const releaseUpload = "gh release upload android-channel CleanTube-Android-0.1.12.apk --clobber";
     const manifestUpload = "gh release upload android-channel android-latest.json --clobber";
     const verify = "curl -I https://updates.example.com/android/latest.apk";
     const first = {
       ...input({
       command: releaseUpload,
-      reason: "Publish SampleApp Android stable release",
+      reason: "Publish CleanTube Android stable release",
       taskIdentity,
       destructive: true,
       bundle: {
-        label: "SampleApp v0.1.12 stable release",
+        label: "CleanTube v0.1.12 stable release",
         entries: [
           { command: releaseUpload, needsNetwork: true, destructive: true },
           { command: manifestUpload, needsNetwork: true, destructive: true },
@@ -155,7 +232,7 @@ describe("local shell approvals", () => {
       workSessionId,
     } satisfies LocalShellApprovalInput & { workSessionId: string };
     const requested = await requestLocalShellApproval(dir, first);
-    expect(requested.bundleLabel).toBe("SampleApp v0.1.12 stable release");
+    expect(requested.bundleLabel).toBe("CleanTube v0.1.12 stable release");
     expect(requested.bundleCommandKeys).toHaveLength(3);
     expect(requested).toMatchObject({
       workSessionId,
@@ -205,18 +282,18 @@ describe("local shell approvals", () => {
 
   it("reuses one pending release bundle for predeclared upload, deploy, and verify commands", async () => {
     const dir = await stateDir();
-    const taskIdentity = "goal:sampleapp-friends-release";
+    const taskIdentity = "goal:cleantube-friends-release";
     const upload = "gh release upload friends-assets YouTube-Music.apk --clobber";
     const deploy = "npx wrangler deploy --config update-proxy/wrangler.jsonc";
     const verify = "curl -I https://updates.example.com/android/latest.apk";
     const musicVerify = "curl -I https://updates.example.com/music/youtube-music.apk";
     const first = await requestLocalShellApproval(dir, input({
       command: upload,
-      reason: "Finish SampleApp friends release",
+      reason: "Finish CleanTube friends release",
       taskIdentity,
       destructive: true,
       bundle: {
-        label: "SampleApp friends release",
+        label: "CleanTube friends release",
         entries: [
           { command: upload, needsNetwork: true, destructive: true },
           { command: deploy, needsNetwork: true, destructive: true },
@@ -260,7 +337,7 @@ describe("local shell approvals", () => {
     expect(await listPendingLocalShellApprovals(dir)).toHaveLength(3);
   });
 
-  it("upgrades an exact pending approval to a wider predeclared bundle without creating a second approval", async () => {
+  it("keeps an exact pending approval unchanged when a wider bundle is requested", async () => {
     const dir = await stateDir();
     const workSessionId = "ws_pending_upgrade";
     const taskIdentity = `goal:pending-upgrade:work-session:${workSessionId}`;
@@ -292,8 +369,9 @@ describe("local shell approvals", () => {
     }));
 
     expect(upgraded.id).toBe(first.id);
-    expect(upgraded.bundleLabel).toBe("Release and verify");
-    expect(upgraded.bundleCommandKeys).toHaveLength(3);
+    expect(upgraded).toEqual(first);
+    expect(upgraded.bundleLabel).toBeUndefined();
+    expect(upgraded.bundleCommandKeys).toBeUndefined();
     expect(await listPendingLocalShellApprovals(dir)).toHaveLength(1);
 
     await resolveLocalShellApproval(dir, upgraded.id, "approve");
@@ -308,13 +386,13 @@ describe("local shell approvals", () => {
       taskIdentity,
       workSessionId,
       destructive: true,
-    }))).toBe(true);
+    }))).toBe(false);
     expect(await consumeLocalShellApproval(dir, input({
       command: verifyCommand,
       taskIdentity,
       workSessionId,
       destructive: false,
-    }))).toBe(true);
+    }))).toBe(false);
   });
 
   it("never widens a bundle after the owner has already approved it", async () => {
@@ -424,9 +502,9 @@ describe("local shell approvals", () => {
   it("reuses a supervised grant by stable task identity even when the reason text changes", async () => {
     const dir = await stateDir();
     const first = input({
-      command: "npx wrangler pages deploy dist --project-name sample-portfolio",
-      reason: "Deploy the sample portfolio",
-      taskIdentity: "loop:sample-portfolio-release",
+      command: "npx wrangler pages deploy dist --project-name jingyeong-vibe",
+      reason: "Deploy the vibe portfolio",
+      taskIdentity: "loop:vibe-release",
     });
     const requested = await requestLocalShellApproval(dir, first);
     await resolveLocalShellApproval(dir, requested.id, "supervise");
@@ -435,9 +513,9 @@ describe("local shell approvals", () => {
       await consumeLocalShellApproval(
         dir,
         input({
-          command: "curl -I https://portfolio.example.com",
+          command: "curl -I https://vibe.example.com",
           reason: "Verify the live portfolio",
-          taskIdentity: "loop:sample-portfolio-release",
+          taskIdentity: "loop:vibe-release",
         }),
       ),
     ).toBe(true);
@@ -446,12 +524,57 @@ describe("local shell approvals", () => {
       await consumeLocalShellApproval(
         dir,
         input({
-          command: "curl -I https://portfolio.example.com",
-          reason: "Deploy the sample portfolio",
+          command: "curl -I https://vibe.example.com",
+          reason: "Deploy the vibe portfolio",
           taskIdentity: "loop:other-release",
         }),
       ),
     ).toBe(false);
+  });
+
+  it("lets a supervised release bundle reuse only non-destructive network work in the same work session", async () => {
+    const dir = await stateDir();
+    const workSessionId = "ws_supervised_release";
+    const taskIdentity = `loop:supervised-release:work-session:${workSessionId}`;
+    const publish = "npm run release:publish";
+    const deploy = "npm run cf:update-proxy:deploy";
+    const requested = await requestLocalShellApproval(dir, input({
+      command: publish,
+      reason: "Finish the supervised release",
+      taskIdentity,
+      workSessionId,
+      destructive: true,
+      bundle: {
+        label: "Release bundle",
+        entries: [
+          { command: publish, needsNetwork: true, destructive: true },
+          { command: deploy, needsNetwork: true, destructive: true },
+        ],
+      },
+    }));
+    await resolveLocalShellApproval(dir, requested.id, "supervise");
+
+    expect(await consumeLocalShellApproval(dir, input({
+      command: "curl -I https://updates.example.com",
+      reason: "Verify the deployed release",
+      taskIdentity,
+      workSessionId,
+      destructive: false,
+    }))).toBe(true);
+    expect(await consumeLocalShellApproval(dir, input({
+      command: "gh release delete v-old --yes",
+      reason: "Delete an unrelated release",
+      taskIdentity,
+      workSessionId,
+      destructive: true,
+    }))).toBe(false);
+    expect(await consumeLocalShellApproval(dir, input({
+      command: "curl -I https://updates.example.com",
+      reason: "Verify from another work session",
+      taskIdentity: "loop:supervised-release:work-session:ws_other",
+      workSessionId: "ws_other",
+      destructive: false,
+    }))).toBe(false);
   });
 
   it("does not persist a supervised grant for destructive work", async () => {

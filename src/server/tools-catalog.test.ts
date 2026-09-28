@@ -96,7 +96,9 @@ describe("tool catalog", () => {
     expect(shape?.decisions).toBeDefined();
     expect(shape?.phase).toBeDefined();
     expect(shape?.verificationStatus).toBeDefined();
+    expect(shape?.reviewVerdict).toBeDefined();
     expect(shape?.failureCount).toBeDefined();
+    expect(shape?.coordinationMode).toBeDefined();
     expect(tools?.work_session_list).toBeDefined();
     expect(tools?.session_resume?.inputSchema?.shape?.workSessionId).toBeDefined();
     expect(tools?.session_resume?.inputSchema?.shape?.includeActiveSlice).toBeDefined();
@@ -231,7 +233,7 @@ describe("tool catalog", () => {
       ok: true,
     });
     expect(result.structuredContent?.toolAvailabilityGate?.namespace).toBe("ChatGPT_To_Codex");
-    expect(result.structuredContent?.doThis?.join(" ")).toContain("reselect ChatGPT To Codex");
+    expect(result.structuredContent?.toolAvailabilityGate).toMatchObject({ app: "jk" });
     expect(result.structuredContent?.doThis?.join(" ")).toContain("Generate with ChatGPT's native image surface");
     expect(result.structuredContent?.doThis?.join(" ")).toContain("chatgpt.com/s/m_...");
     expect(result.structuredContent?.fallback?.join(" ")).toContain("Share/Copy Link");
@@ -268,7 +270,7 @@ describe("tool catalog", () => {
     expect(listed?.tools.map((tool) => tool.name)).not.toContain("code_context_pack");
   });
 
-  it("agent_guide exposes Codex-grade loop, tool surface, and safety model", async () => {
+  it("agent_guide defaults to a compact context-safe response", async () => {
     const server = await createServer(makeCtx());
     const tools = (
       server as unknown as {
@@ -277,6 +279,24 @@ describe("tool catalog", () => {
     )._registeredTools;
 
     const result = (await tools?.agent_guide?.handler?.({})) as {
+      structuredContent?: Record<string, unknown> & { guideMode?: string; fullGuideHint?: string };
+    };
+
+    expect(result.structuredContent?.guideMode).toBe("compact");
+    expect(result.structuredContent?.fullGuideHint).toContain("detail=full");
+    expect(result.structuredContent?.customGptActions).toBeUndefined();
+    expect(JSON.stringify(result.structuredContent ?? {}).length).toBeLessThan(5_000);
+  });
+
+  it("agent_guide detail=full exposes Codex-grade loop, tool surface, and safety model", async () => {
+    const server = await createServer(makeCtx());
+    const tools = (
+      server as unknown as {
+        _registeredTools?: Record<string, { handler?: (input: unknown) => Promise<unknown> }>;
+      }
+    )._registeredTools;
+
+    const result = (await tools?.agent_guide?.handler?.({ detail: "full" })) as {
       structuredContent?: {
         codexGradeLoop?: string[];
         toolSurfaceMap?: Record<string, string[]>;

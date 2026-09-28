@@ -14,13 +14,25 @@ USER_SYSTEMD=0
 WORKSPACE="${WORKSPACE:-$HOME/workspace}"
 PORT="${PORT:-7979}"
 
+if [ "$(id -u)" -eq 0 ]; then
+  CANONICAL_PREFIX="/opt/jk"
+  LEGACY_PREFIX="/opt/chatgpt2codex"
+else
+  CANONICAL_PREFIX="$HOME/.local/share/jk-app"
+  LEGACY_PREFIX="$HOME/.local/share/chatgpt2codex-app"
+fi
+LEGACY_SYSTEMD_UNIT="/etc/systemd/system/chatgpt2codex.service"
+LEGACY_USER_SYSTEMD_UNIT="$HOME/.config/systemd/user/chatgpt2codex.service"
+LEGACY_INSTALL=0
+
 usage() {
   cat <<'EOF'
 Usage: install-linux.sh [options]
 
 Options:
-  --prefix PATH       Install path. Default: /opt/chatgpt2codex as root, otherwise ~/.local/share/chatgpt2codex-app
-  --launch           Start chatgpt2codex after installing
+  --prefix PATH       Default: /opt/jk as root, otherwise ~/.local/share/jk-app
+                      Existing legacy installations retain their current prefix.
+  --launch           Start JK after installing
   --no-launch        Install only
   --systemd          Install and start a system service (root)
   --user-systemd     Install and start a user systemd service
@@ -72,11 +84,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ -e "$LEGACY_PREFIX" ] || [ -f "$LEGACY_SYSTEMD_UNIT" ] || [ -f "$LEGACY_USER_SYSTEMD_UNIT" ]; then
+  LEGACY_INSTALL=1
+fi
+
 if [ -z "$PREFIX" ]; then
-  if [ "$(id -u)" -eq 0 ]; then
-    PREFIX="/opt/chatgpt2codex"
+  if [ "$LEGACY_INSTALL" -eq 1 ]; then
+    PREFIX="$LEGACY_PREFIX"
   else
-    PREFIX="$HOME/.local/share/chatgpt2codex-app"
+    PREFIX="$CANONICAL_PREFIX"
   fi
 fi
 
@@ -118,8 +134,13 @@ link_bin() {
     target_dir="$HOME/.local/bin"
     mkdir -p "$target_dir"
   fi
-  ln -sfn "$PREFIX/chatgpt2codex" "$target_dir/chatgpt2codex"
-  ln -sfn "$PREFIX/start-chatgpt2codex.sh" "$target_dir/chatgpt2codex-start"
+  ln -sfn "$PREFIX/jk" "$target_dir/jk"
+  ln -sfn "$PREFIX/start-jk.sh" "$target_dir/jk-start"
+  if [ "$LEGACY_INSTALL" -eq 1 ]; then
+    # Preserve legacy command links only when upgrading that installation.
+    ln -sfn "$PREFIX/jk" "$target_dir/chatgpt2codex"
+    ln -sfn "$PREFIX/start-jk.sh" "$target_dir/chatgpt2codex-start"
+  fi
   echo "$target_dir"
 }
 
@@ -131,7 +152,7 @@ install_systemd_service() {
   mkdir -p "$(dirname "$unit_path")"
   cat >"$unit_path" <<EOF
 [Unit]
-Description=ChatGPT To Codex local MCP bridge
+Description=JK local MCP bridge
 After=network-online.target
 Wants=network-online.target
 
@@ -140,7 +161,7 @@ Type=simple
 WorkingDirectory=$WORKSPACE
 Environment=WORKSPACE=$WORKSPACE
 Environment=PORT=$PORT
-ExecStart=$PREFIX/start-chatgpt2codex.sh --workspace $WORKSPACE --port $PORT
+ExecStart=$PREFIX/start-jk.sh --workspace $WORKSPACE --port $PORT
 Restart=on-failure
 RestartSec=5
 
@@ -150,17 +171,17 @@ EOF
 
   if [ "$user_mode" = "1" ]; then
     systemctl --user daemon-reload
-    systemctl --user enable --now chatgpt2codex.service
+    systemctl --user enable --now "$SERVICE_NAME.service"
   else
     systemctl daemon-reload
-    systemctl enable --now chatgpt2codex.service
+    systemctl enable --now "$SERVICE_NAME.service"
   fi
 }
 
-echo "[chatgpt2codex] installing to $PREFIX"
+echo "[jk] installing to $PREFIX"
 stop_existing
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt2codex-install.XXXXXX")"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/jk-install.XXXXXX")"
 cleanup() {
   rm -rf "$tmp"
 }
@@ -173,34 +194,48 @@ rm -rf "$PREFIX"
 mkdir -p "$(dirname "$PREFIX")"
 mv "$tmp/app" "$PREFIX"
 
-chmod +x "$PREFIX/chatgpt2codex" "$PREFIX/start-chatgpt2codex.sh" "$PREFIX/install-linux.sh" 2>/dev/null || true
+chmod +x "$PREFIX/jk" "$PREFIX/start-jk.sh" "$PREFIX/install-linux.sh" 2>/dev/null || true
 find "$PREFIX/bin" -maxdepth 1 -type f -exec chmod +x {} \; 2>/dev/null || true
 
 bin_dir="$(link_bin)"
+SERVICE_NAME="jk"
+[ "$LEGACY_INSTALL" -eq 1 ] && SERVICE_NAME="chatgpt2codex"
 
 if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
   if [ "$(id -u)" -ne 0 ]; then
     echo "--systemd requires root. Use --user-systemd for a user service." >&2
     exit 1
   fi
-  install_systemd_service "/etc/systemd/system/chatgpt2codex.service" 0
+  install_systemd_service "/etc/systemd/system/$SERVICE_NAME.service" 0
 fi
 
 if [ "$USER_SYSTEMD" -eq 1 ]; then
-  install_systemd_service "$HOME/.config/systemd/user/chatgpt2codex.service" 1
+  install_systemd_service "$HOME/.config/systemd/user/$SERVICE_NAME.service" 1
 fi
 
 cat <<EOF
 
-ChatGPT To Codex installed.
+JK installed.
   app: $PREFIX
-  commands: $bin_dir/chatgpt2codex, $bin_dir/chatgpt2codex-start
+  commands: $bin_dir/jk, $bin_dir/jk-start
+  service: $SERVICE_NAME.service
+
+EOF
+
+if [ "$LEGACY_INSTALL" -eq 1 ]; then
+  cat <<EOF
+  legacy aliases: $bin_dir/chatgpt2codex, $bin_dir/chatgpt2codex-start
+
+EOF
+fi
+
+cat <<EOF
 
 Start now:
-  chatgpt2codex-start --workspace "$WORKSPACE" --port "$PORT"
+  jk-start --workspace "$WORKSPACE" --port "$PORT"
 
 EOF
 
 if [ "$LAUNCH" -eq 1 ]; then
-  exec "$PREFIX/start-chatgpt2codex.sh" --workspace "$WORKSPACE" --port "$PORT"
+  exec "$PREFIX/start-jk.sh" --workspace "$WORKSPACE" --port "$PORT"
 fi

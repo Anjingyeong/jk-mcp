@@ -1,114 +1,101 @@
 # JK for Windows
 
-JK의 일반 사용자 배포 경로는 **로컬 Windows 앱**입니다. OCI나 유지보수자의 서버는 필요하지 않습니다.
+Beginner install:
 
-## 무엇을 다운로드하나요?
+1. Download `JK-Setup.exe` from the official JK GitHub releases page:
+   <https://github.com/Anjingyeong/jk-mcp/releases>
+2. Double-click the installer.
+3. If Windows SmartScreen appears, choose **More info** -> **Run anyway** only
+   when the file came from the official release page.
+4. Open **JK**.
+5. Confirm the tray icon appears near the clock.
+6. Open **Settings...**, choose a project folder, enable the ChatGPT web
+   connector if needed, then click **Start MCP**.
+7. Copy the `/mcp` Connector URL and approve it in ChatGPT with the Owner Token.
 
-GitHub Releases에서 다음 중 하나를 받습니다.
+Keep the Owner Token private. Treat it like a password.
 
-- `JK-<version>-Windows-Setup.exe` — 권장. 설치 후 바로 실행
-- `JK-<version>-Windows-Portable.zip` — 설치 없이 압축 해제 후 `JK.exe` 실행
+Portable/source install:
 
-Windows 패키지는 release artifact로 배포하고 Git history에는 바이너리를 넣지 않습니다.
+- From a packaged folder, double-click `JK.exe`.
+- If the exe has not been built yet, run `windows\Build-JKExe.ps1`
+  once on Windows.
+- Fallback launcher: `windows\Start-JKTray.cmd`.
 
-## 처음 연결하기
+Runtime modes:
 
-1. JK를 실행합니다.
-2. 시스템 트레이의 JK 아이콘에서 **Settings...**를 엽니다.
-3. **Project folder**를 선택합니다.
-4. ChatGPT 웹에서 사용할 경우 **ChatGPT web connector**를 켭니다.
-5. 도메인이 없다면 hostname은 비워둡니다. 임시 Cloudflare Quick Tunnel을 사용할 수 있습니다.
-6. **Start MCP**를 누릅니다.
-7. **Copy Connector URL**을 눌러 `/mcp` URL을 복사합니다.
-8. ChatGPT의 **Apps / Connectors**에서 URL을 등록합니다.
-9. 승인 요청에는 로컬 JK 앱의 **Owner Token**을 사용합니다.
+- **Development**: launch the repository-root `JK.exe` or `start-jk.ps1`.
+  The source launcher owns the repository-root `dist\cli.js` and rebuilds it when
+  `src`, package metadata, or `tsconfig.json` is newer.
+- **Portable**: launch `build\windows\JK\JK.exe` (or an installed/extracted
+  release). It always uses the `dist` bundled next to that executable and never
+  silently delegates to a nearby source checkout.
+- The launcher exports `JK_RUNTIME_MODE` and `JK_RUNTIME_ROOT`; the Control Center
+  shows the active mode so the runtime source of truth is visible.
+- Run `npm run windows:launcher:test` to verify mode detection, stale-build
+  detection, PowerShell parsing, and, when present, generated-launcher sync.
 
-Owner Token은 비밀번호처럼 취급하세요.
+The app uses `winget` to install Node.js LTS and `cloudflared` only when they
+are missing, then opens a tray controller. Starting MCP is loopback-only by
+default. For ChatGPT web, prefer your own stable hostname; use temporary Quick
+Tunnel URLs only for short tests because they change after restart.
 
-## OCI가 없어도 되는 이유
+The tray menu stays deliberately small:
 
-JK는 사용자 PC에서 직접 실행됩니다.
+- Start/Stop/Restart MCP.
+- Open Settings.
+- Quit.
 
-```text
-ChatGPT web
-  -> HTTPS connector
-  -> Quick Tunnel (default beginner path)
-  -> JK on this Windows PC
-  -> selected project folder
-```
+Settings contains the busy stuff: project folder, ChatGPT web connector, owned
+fixed domain, port, launch-at-login, start-on-open, update checks, language
+override, connector URL, health links, logs, releases, and the copyright footer.
+GitHub is a direct button, not a text setting.
 
-따라서 Oracle Cloud VM, AWS 같은 별도 클라우드 인프라나 유지보수자 개인 서버는 일반 사용자에게 필요하지 않습니다.
-
-ChatGPT 웹은 localhost에 직접 접근할 수 없기 때문에 웹 커넥터에는 HTTPS 경로가 필요합니다. 가장 쉬운 방법은 임시 Quick Tunnel입니다. 앱을 재시작하면 주소가 바뀔 수 있으므로 그때 ChatGPT Connector URL도 갱신합니다.
-
-고정 URL이 필요한 사용자만 본인 Cloudflare Named Tunnel + 도메인 또는 다른 HTTPS reverse proxy를 설정하면 됩니다.
-
-## Runtime modes
-
-- **Installed / Portable**: `JK.exe` 옆에 패키징된 `dist`를 사용합니다. 주변 source checkout으로 조용히 넘어가지 않습니다.
-- **Development**: 저장소 루트의 launcher 또는 `npm run chatgpt:windows`를 사용합니다. 소스가 새로우면 개발용 `dist`를 다시 빌드할 수 있습니다.
-- Control Center에서 active runtime mode를 확인할 수 있습니다.
-
-지인에게 전달하는 것은 **Installed / Portable** 모드입니다. 개발용 checkout을 같이 전달할 필요가 없습니다.
-
-## 기본 로컬 주소
-
-기본 포트는 `7979`입니다.
-
-- Dashboard: `http://127.0.0.1:7979/`
-- MCP: `http://127.0.0.1:7979/mcp`
-- Health: `http://127.0.0.1:7979/healthz`
-
-ChatGPT 웹에는 localhost 주소가 아니라 JK가 복사해 주는 HTTPS Connector URL을 등록하세요.
-
-## 문제 해결
-
-- **SmartScreen 경고**: 현재 unsigned 개발 빌드일 수 있습니다. 이 저장소의 GitHub Release에서 받은 파일인지 확인한 뒤 실행하세요.
-- **Connector URL이 비어 있음**: web connector를 켜고 **Start MCP** 후 다시 복사하세요.
-- **포트 7979 충돌**: 트레이 메뉴의 **Restart MCP**를 먼저 사용하세요.
-- **Quick Tunnel 주소가 바뀜**: ChatGPT Connector의 URL도 새 `/mcp` 주소로 갱신하세요.
-- **ChatGPT 승인 요청**: JK 앱의 Owner Token을 사용합니다.
-- **E2E 웹 캡처 실패**: Microsoft Edge 또는 Google Chrome이 설치되어 있는지 확인하세요.
-
-## 처음 써볼 프롬프트
+First prompt to try in ChatGPT:
 
 ```text
-@jk 이 프로젝트를 선택하고 README와 package scripts를 확인해.
-수정은 하지 말고 구조와 실행 방법만 설명해줘.
+Use JK. Select my project, read the README and package scripts,
+run the safest available check, then summarize the result with exact evidence.
 ```
+
+E2E screenshot prompt:
 
 ```text
-@jk 이 버그 원인을 찾고 최소 수정한 뒤 관련 테스트까지 실행해줘.
+Use JK to run E2E, open the app, capture screenshots, and show them inline.
 ```
 
-## 개발자용 빌드
+For local web projects, Windows E2E capture launches an installed Microsoft Edge
+or Google Chrome with an isolated temporary profile and uses the local Chrome
+DevTools Protocol to save deterministic browser viewports under
+`.jk/e2e/screenshots` (legacy installations may still use `.chatgpt2codex/e2e/screenshots`). The one-shot E2E flow captures desktop
+top/middle/bottom plus mobile (390x844) top/middle/bottom views. It does not
+require the target browser window to remain visible on screen.
 
-요구사항: Node.js 22+, npm, PowerShell.
+Troubleshooting:
+
+- If SmartScreen appears, verify the installer came from the official GitHub
+  release before running it.
+- If the connector URL is empty, open Settings, enable ChatGPT web connector,
+  click **Start MCP**, then copy the URL again.
+- If port 7676 is busy, use **Restart MCP** from the tray menu. The launcher
+  cleans up stale runtime processes before restart.
+- For local web screenshots, confirm Microsoft Edge or Google Chrome is installed.
+  Desktop-app window capture still has separate platform limitations.
+- If ChatGPT asks for approval, paste the Owner Token from the Windows app.
+
+The tray UI follows the Windows display language by default and can be changed
+in Settings. Supported UI languages: English, Korean, Japanese, Simplified
+Chinese, Traditional Chinese, Spanish, French, German, Brazilian Portuguese,
+Italian, Dutch, Polish, Russian, Turkish, Vietnamese, Indonesian, Thai, Arabic,
+Hindi, and Ukrainian.
+
+For first-time machine setup from a source checkout:
 
 ```powershell
-npm ci
-npm run typecheck
-npm test
-npm run build
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -RepoUrl https://github.com/Anjingyeong/jk-mcp.git -Launch
 ```
 
-설치 파일 생성:
+For source-free users, ship the Windows zip from `npm run windows:package`.
+They only need to unzip it and double-click `JK.exe`.
 
-```powershell
-npm run windows:package
-```
-
-Portable 앱 폴더 생성:
-
-```powershell
-npm run windows:portable
-```
-
-GitHub Actions의 Windows Release workflow는 `v*` 태그 또는 수동 실행으로 다음 artifact를 만듭니다.
-
-- `JK-<version>-Windows-Setup.exe`
-- `JK-<version>-Windows-Portable.zip`
-
-릴리스 바이너리를 배포하기 전 upstream 라이선스/재배포 조건은 별도로 확인해야 합니다. 자세한 내용은 `docs/ATTRIBUTION_AND_COMPLIANCE.md`를 참고하세요.
-
-Original work © 2026 ezBuilder. All rights reserved.
+JK © 2026 Anjingyeong. See `ACKNOWLEDGEMENTS.md` for historical attribution.

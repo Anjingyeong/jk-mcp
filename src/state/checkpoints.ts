@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -17,15 +17,15 @@ export interface CheckpointRecord {
   diff: string;
 }
 
-function checkpointDir(root: string): string {
-  return path.join(root, ".chatgpt2codex", "checkpoints");
+function checkpointDir(root: string, namespace = ".jk"): string {
+  return path.join(root, namespace, "checkpoints");
 }
 
-function checkpointPath(root: string, checkpointId: string): string {
+function checkpointPath(root: string, checkpointId: string, namespace = ".jk"): string {
   if (!/^cp_[A-Za-z0-9_.-]+$/.test(checkpointId)) {
     throw new DomainError(ErrorCode.CHECKPOINT_NOT_FOUND, "Invalid checkpoint id", { checkpointId });
   }
-  return path.join(checkpointDir(root), `${checkpointId}.json`);
+  return path.join(checkpointDir(root, namespace), `${checkpointId}.json`);
 }
 
 async function git(root: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -72,6 +72,35 @@ export async function getWorkingDiff(root: string): Promise<string> {
   }
 }
 
+const DEFAULT_CHECKPOINT_RETENTION = 200;
+const LIST_LIMIT = 50;
+
+/** Max checkpoint files kept per namespace dir. `JK_CHECKPOINT_RETENTION=0` disables pruning. */
+export function checkpointRetention(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.JK_CHECKPOINT_RETENTION;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_CHECKPOINT_RETENTION;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_CHECKPOINT_RETENTION;
+}
+
+/**
+ * Every patch/create writes a full working-tree diff, so without a bound the
+ * directory grows without limit (hundreds of MB observed). Ids embed a
+ * millisecond timestamp, so lexical order is creation order. Best-effort.
+ */
+export async function pruneCheckpoints(root: string, keep = checkpointRetention(), namespace = ".jk"): Promise<number> {
+  if (keep <= 0) return 0;
+  let names: string[];
+  try {
+    names = (await readdir(checkpointDir(root, namespace))).filter((n) => /^cp_.+\.json$/.test(n)).sort();
+  } catch {
+    return 0;
+  }
+  const excess = names.slice(0, Math.max(0, names.length - keep));
+  await Promise.all(excess.map((name) => rm(path.join(checkpointDir(root, namespace), name), { force: true }).catch(() => undefined)));
+  return excess.length;
+}
+
 export async function createCheckpoint(root: string, projectId: string, reason: string): Promise<CheckpointRecord> {
   await mkdir(checkpointDir(root), { recursive: true, mode: 0o700 });
   const checkpointId = `cp_${Date.now()}_${randomUUID().slice(0, 8)}`;
@@ -82,18 +111,28 @@ export async function createCheckpoint(root: string, projectId: string, reason: 
     reason,
     diff: await getWorkingDiff(root),
   };
-  await writeFile(checkpointPath(root, checkpointId), JSON.stringify(record, null, 2), { mode: 0o600 });
+  // Compact JSON: the diff dominates size and pretty-printing only adds bytes.
+  await writeFile(checkpointPath(root, checkpointId), JSON.stringify(record), { mode: 0o600 });
+  await pruneCheckpoints(root);
   return record;
 }
 
 export async function listCheckpoints(root: string, projectId: string): Promise<Omit<CheckpointRecord, "diff">[]> {
-  let names: string[] = [];
-  try { names = await readdir(checkpointDir(root)); } catch { return []; }
-  const out: Omit<CheckpointRecord, "diff">[] = [];
-  for (const name of names.filter((n) => n.endsWith(".json")).sort().reverse().slice(0, 50)) {
+  const names = new Set<string>();
+  for (const namespace of [".jk", ".chatgpt2codex"]) {
     try {
-      const raw = await readFile(path.join(checkpointDir(root), name), "utf8");
-      const rec = JSON.parse(raw) as CheckpointRecord;
+      for (const name of await readdir(checkpointDir(root, namespace))) names.add(name);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  const out: Omit<CheckpointRecord, "diff">[] = [];
+  // Filter by project before limiting, otherwise another project's recent
+  // checkpoints sharing this root could hide all of this project's entries.
+  for (const name of [...names].filter((n) => n.endsWith(".json")).sort().reverse()) {
+    if (out.length >= LIST_LIMIT) break;
+    try {
+      const rec = await readCheckpoint(root, name.slice(0, -5));
       if (rec.projectId === projectId) {
         const { diff: _diff, ...meta } = rec;
         out.push(meta);
@@ -104,9 +143,21 @@ export async function listCheckpoints(root: string, projectId: string): Promise<
 }
 
 export async function readCheckpoint(root: string, checkpointId: string): Promise<CheckpointRecord> {
+  const canonical = checkpointPath(root, checkpointId);
+  let raw: string;
   try {
-    return JSON.parse(await readFile(checkpointPath(root, checkpointId), "utf8")) as CheckpointRecord;
-  } catch {
+    raw = await readFile(canonical, "utf8");
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    try {
+      raw = await readFile(checkpointPath(root, checkpointId, ".chatgpt2codex"), "utf8");
+    } catch (legacyError) {
+      if (!(legacyError instanceof Error && "code" in legacyError && legacyError.code === "ENOENT")) throw legacyError;
+      throw new DomainError(ErrorCode.CHECKPOINT_NOT_FOUND, "Checkpoint not found", { checkpointId });
+    }
+  }
+  try { return JSON.parse(raw) as CheckpointRecord; } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
     throw new DomainError(ErrorCode.CHECKPOINT_NOT_FOUND, "Checkpoint not found", { checkpointId });
   }
 }

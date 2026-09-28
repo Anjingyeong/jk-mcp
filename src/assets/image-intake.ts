@@ -16,7 +16,7 @@ const execFileAsync = promisify(execFile);
  * 10MB base64 ceiling in images.ts doesn't apply). */
 const MAX_LOCAL_IMAGE_BYTES = 50 * 1024 * 1024;
 
-const DEFAULT_IMAGE_DIR = path.join(".chatgpt2codex", "images");
+const DEFAULT_IMAGE_DIR = path.join(".jk", "images");
 const DOWNLOAD_IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif)$/i;
 
 export interface IntakeResult {
@@ -133,7 +133,7 @@ export async function intakeFromClipboard(
   destRel?: string,
   metadata?: Record<string, unknown>,
 ): Promise<IntakeResult> {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-clip-"));
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "jk-clip-"));
   const tmpFile = path.join(tmpDir, "clipboard-image");
 
   try {

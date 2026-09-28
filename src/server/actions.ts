@@ -1,9 +1,10 @@
 import type { Express, Request, Response } from "express";
-import { promises as fs, readFileSync } from "node:fs";
+import { promises as fs } from "node:fs";
+import { RUNTIME_VERSION } from "../runtime-version.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
-import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
-import { CONTROL_TOOL_NAMES, isControlChatGptExposed } from "../control/policy.js";
+import { createE2eScreenshotShare, readE2eScreenshotShare, isScreenshotPath } from "../e2e/screenshot-share.js";
+import { CONTROL_TOOL_NAMES, isControlChatGptExposedForContext } from "../control/policy.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
 import { normalizeObjectSchema, safeParseAsync, getParseErrorMessage } from "@modelcontextprotocol/sdk/server/zod-compat.js";
@@ -13,14 +14,7 @@ import {
   MASS_ULW_EXECUTE_INPUT_SCHEMA,
 } from "./mass-ulw-actions.js";
 
-const ACTION_BRIDGE_VERSION = (() => {
-  try {
-    const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version?: unknown };
-    return typeof packageJson.version === "string" && packageJson.version.trim() ? packageJson.version.trim() : "unknown";
-  } catch {
-    return "unknown";
-  }
-})();
+const ACTION_BRIDGE_VERSION = RUNTIME_VERSION;
 
 interface CallToolResultLike {
   content?: Array<{ type?: string; text?: string }>;
@@ -51,9 +45,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/agent-guide",
     tool: "agent_guide",
     operationId: "agent_guide",
-    summary: "Get the chatgpt2codex workflow guide",
+    summary: "Get the jk workflow guide",
     description:
-      "Call this first so the GPT knows the available chatgpt2codex tools and the ChatGPT image-save workflow. Do not proceed with local coding unless this or another chatgpt2codex action returns ok=true in the current turn.",
+      "Call this first so the GPT knows the available jk tools and the ChatGPT image-save workflow. Do not proceed with local coding unless this or another jk action returns ok=true in the current turn.",
     schema: "EmptyInput",
   },
   {
@@ -62,7 +56,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "goal_intake",
     summary: "Start a broad local coding goal",
     description:
-      "Call this immediately for /goal, deep research, vague large implementation, or 'proceed quickly' prompts. This uses the local chatgpt2codex execution bridge; ChatGPT remains the reasoning surface. It returns within seconds with the next tool calls so ChatGPT does not spend ~30 seconds thinking and then stop. If this action is unavailable, stop and say no local coding occurred.",
+      "Call this immediately for /goal, deep research, vague large implementation, or 'proceed quickly' prompts. This uses the local jk execution bridge; ChatGPT remains the reasoning surface. It returns within seconds with the next tool calls so ChatGPT does not spend ~30 seconds thinking and then stop. If this action is unavailable, stop and say no local coding occurred.",
     schema: "GoalIntakeInput",
   },
   {
@@ -81,7 +75,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "project_select",
     summary: "Select the active local project",
     description:
-      "Selects and leases the project. GPT Actions default to preset=full-write when preset is omitted, so source edits can be applied directly through chatgpt2codex instead of returning copy/paste scripts. Use preset=image-only only for image-only saves.",
+      "Selects and leases the project by canonical id, name, or alias. GPT Actions default to preset=full-write when preset is omitted, so source edits can be applied directly through jk instead of returning copy/paste scripts. GPT Actions default to confirmSwitch=true when omitted; pass false to preserve an existing project's lease and reject a switch. If duplicate names exist across machines, use the explicit project id or machine-qualified alias from workspace_list_projects. Use preset=image-only only for image-only saves.",
     schema: "ProjectSelectInput",
   },
   {
@@ -98,7 +92,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "workspace_list_projects",
     operationId: "workspace_list_projects",
     summary: "List local workspace projects",
-    description: "List projects registered under the local chatgpt2codex workspace.",
+    description: "List projects registered under the local jk workspace.",
     schema: "WorkspaceListProjectsInput",
   },
   {
@@ -106,7 +100,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "workspace_refresh_index",
     operationId: "workspace_refresh_index",
     summary: "Refresh the local project index",
-    description: "Rescan the local workspace root and refresh chatgpt2codex's project registry.",
+    description: "Rescan the local workspace root and refresh jk's project registry.",
     schema: "WorkspaceRefreshIndexInput",
   },
   {
@@ -139,7 +133,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "project_rules",
     operationId: "project_rules",
     summary: "Read project rules",
-    description: "Read local AGENTS/CLAUDE project rules through chatgpt2codex, optionally scoped to a nested path, with secret redaction.",
+    description: "Read local AGENTS/CLAUDE project rules through jk, optionally scoped to a nested path, with secret redaction.",
     schema: "ProjectRulesInput",
   },
   {
@@ -147,7 +141,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "code_search",
     operationId: "code_search",
     summary: "Search project code",
-    description: "Search project source code through the local chatgpt2codex runtime.",
+    description: "Search project source code through the local jk runtime.",
     schema: "CodeSearchInput",
   },
   {
@@ -179,7 +173,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "file_create",
     operationId: "file_create",
     summary: "Create a project file",
-    description: "Create or overwrite a project-confined file directly through chatgpt2codex. Requires project_select preset=full-write.",
+    description: "Create or overwrite a project-confined file directly through jk. Requires project_select preset=full-write.",
     schema: "FileCreateInput",
   },
   {
@@ -187,7 +181,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "command_list",
     operationId: "command_list",
     summary: "List project commands",
-    description: "List allowlisted project commands discovered by chatgpt2codex.",
+    description: "List allowlisted project commands discovered by jk.",
     schema: "ProjectOnlyInput",
   },
   {
@@ -195,7 +189,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "command_run",
     operationId: "command_run",
     summary: "Run allowlisted project command",
-    description: "Run an allowlisted project command through chatgpt2codex.",
+    description: "Run an allowlisted project command through jk.",
     schema: "CommandRunInput",
   },
   {
@@ -203,7 +197,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "local_shell_run",
     operationId: "local_shell_run",
     summary: "Run local project shell",
-    description: "Run a guarded local shell command inside the project through chatgpt2codex. Network/destructive intents remain approval-gated. For known multi-step risky work, intent.approvalBundle can predeclare exact follow-up commands for one bounded owner approval.",
+    description: "Run a guarded local shell command inside the project through jk. Network/destructive intents remain approval-gated. For known multi-step risky work, intent.approvalBundle can predeclare exact follow-up commands for one bounded owner approval.",
     schema: "LocalShellRunInput",
   },
   {
@@ -256,7 +250,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_screenshot",
     summary: "Capture an E2E screenshot",
     description:
-      "Capture a macOS or Windows screenshot into the selected project under .chatgpt2codex/e2e/screenshots. Remote Windows projects capture on their executor and return visual proof to the hub.",
+      "Capture a macOS or Windows screenshot into the selected project under .jk/e2e/screenshots. Remote Windows projects capture on their executor and return visual proof to the hub.",
     schema: "E2eScreenshotInput",
   },
   {
@@ -296,7 +290,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "checkpoint_list",
     operationId: "checkpoint_list",
     summary: "List project checkpoints",
-    description: "List recent mutation checkpoints captured by chatgpt2codex.",
+    description: "List recent mutation checkpoints captured by jk.",
     schema: "ProjectOnlyInput",
   },
   {
@@ -304,7 +298,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "checkpoint_show",
     operationId: "checkpoint_show",
     summary: "Show project checkpoint",
-    description: "Show the redacted diff stored in a chatgpt2codex checkpoint.",
+    description: "Show the redacted diff stored in a jk checkpoint.",
     schema: "CheckpointShowInput",
   },
   {
@@ -312,7 +306,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "checkpoint_restore",
     operationId: "checkpoint_restore",
     summary: "Restore project checkpoint",
-    description: "Reverse-apply a checkpoint diff through chatgpt2codex. Requires a write lease.",
+    description: "Reverse-apply a checkpoint diff through jk. Requires a write lease.",
     schema: "CheckpointShowInput",
   },
   {
@@ -320,7 +314,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "git_commit",
     operationId: "git_commit",
     summary: "Commit project changes",
-    description: "Stage and commit project changes through chatgpt2codex after inspecting status/diff.",
+    description: "Stage and commit project changes through jk after inspecting status/diff.",
     schema: "GitCommitInput",
   },
   {
@@ -328,7 +322,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "git_push",
     operationId: "git_push",
     summary: "Push project branch",
-    description: "Push the current project branch through chatgpt2codex when the user explicitly requested pushing.",
+    description: "Push the current project branch through jk when the user explicitly requested pushing.",
     schema: "GitPushInput",
   },
   {
@@ -346,7 +340,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "save_chatgpt_image_from_url",
     summary: "Import a ChatGPT image URL",
     description:
-      "Device-agnostic import for ChatGPT image URLs, including chatgpt.com/s/m_... share pages and backend estuary content URLs. Use for phone-generated images or any device where chatgpt2codex cannot inspect local Chrome.",
+      "Device-agnostic import for ChatGPT image URLs, including chatgpt.com/s/m_... share pages and backend estuary content URLs. Use for phone-generated images or any device where jk cannot inspect local Chrome.",
     schema: "ImportChatGptImageUrlInput",
   },
   {
@@ -354,7 +348,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "list_images",
     operationId: "list_images",
     summary: "List saved project images",
-    description: "Lists images already saved under .chatgpt2codex/images for a project.",
+    description: "Lists images already saved under .jk/images for a project.",
     schema: "ListImagesInput",
   },
 ];
@@ -408,6 +402,9 @@ function actionInputForRoute(route: ActionRoute, body: unknown): Record<string, 
   if (route.tool === "project_select" && input.preset === undefined) {
     input.preset = "full-write";
   }
+  if (route.tool === "project_select" && input.confirmSwitch === undefined) {
+    input.confirmSwitch = true;
+  }
   return input;
 }
 
@@ -422,6 +419,9 @@ function genericToolInput(body: unknown): { toolName: string; input: Record<stri
   const input = isRecord(raw.input) ? { ...raw.input } : {};
   if (toolName === "project_select" && input.preset === undefined) {
     input.preset = "full-write";
+  }
+  if (toolName === "project_select" && input.confirmSwitch === undefined) {
+    input.confirmSwitch = true;
   }
   return { toolName, input };
 }
@@ -464,11 +464,11 @@ async function callRegisteredTool(
   // Desktop-control tools are blocked on the generic action bridge (even for
   // the owner-bearer /actions/call-tool route, even if isControlEnabled() is
   // on) unless the owner has separately opted in to exposing them to ChatGPT
-  // via CHATGPT2CODEX_CONTROL_CHATGPT (isControlChatGptExposed) — the
+  // via JK_CONTROL_CHATGPT (isControlChatGptExposed) — the
   // public-product default keeps this block in place, matching the
   // tools/list hide in src/server/tools.ts installChatGptToolListHandler.
-  if (CONTROL_TOOL_NAMES.has(toolName) && !isControlChatGptExposed()) {
-    const message = `Tool ${toolName} is not available through the chatgpt2codex action bridge.`;
+  if (CONTROL_TOOL_NAMES.has(toolName) && !(await isControlChatGptExposedForContext(ctx))) {
+    const message = `Tool ${toolName} is not available through the jk action bridge.`;
     return {
       isError: true,
       structuredContent: { code: "PERMISSION_DENIED", error: message },
@@ -486,7 +486,7 @@ async function callRegisteredTool(
   // through. The local/MCP zod path (registerTool project_select) is
   // untouched, so a local approver can still grant/resume control normally.
   if (toolName === "project_select" && input.preset === "control") {
-    const message = "preset=control cannot be granted through the chatgpt2codex action bridge.";
+    const message = "preset=control cannot be granted through the jk action bridge.";
     await ctx.ledger.append({ type: "control.bridge.rejected", preset: "control" }).catch(() => undefined);
     return {
       isError: true,
@@ -540,8 +540,7 @@ function isScreenshotRecord(value: unknown): value is Record<string, unknown> {
   return (
     isRecord(value) &&
     typeof value.path === "string" &&
-    value.path.includes(`${["", ".chatgpt2codex", "e2e", "screenshots", ""].join("/")}`) &&
-    value.path.endsWith(".png")
+    isScreenshotPath(value.path)
   );
 }
 
@@ -596,7 +595,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
     "/actions/health": {
       get: {
         operationId: "action_health",
-        summary: "Check chatgpt2codex action bridge health",
+        summary: "Check jk action bridge health",
         security: [],
         responses: {
           "200": {
@@ -609,9 +608,9 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
     "/actions/call-tool": {
       post: {
         operationId: "call_tool",
-        summary: "Call any chatgpt2codex MCP tool",
+        summary: "Call any jk MCP tool",
         description:
-          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits: select project with preset=full-write, then call file_apply_patch or file_create through this route. The response toolCall object is the required proof that the local tool was actually callable.",
+          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named jk MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits: select project with preset=full-write, then call file_apply_patch or file_create through this route. The response toolCall object is the required proof that the local tool was actually callable.",
         security: [{ oauth2: ["chatgpt2codex"] }, { ownerBearer: [] }],
         requestBody: {
           required: true,
@@ -659,10 +658,10 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
   return {
     openapi: "3.1.0",
     info: {
-      title: "chatgpt2codex Custom GPT Actions",
+      title: "jk Custom GPT Actions",
       version: ACTION_BRIDGE_VERSION,
       description:
-        "OpenAPI bridge for Custom GPTs. ChatGPT drives local coding actions through chatgpt2codex; the bridge does not embed a separate LLM coding client and is not intended to bypass any OpenAI product rate limit, usage limit, or safety restriction. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, mass_ulw_execute, and e2e_test_and_show_screenshot for source editing, approved MASS ULW fan-out, and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools such as optional omo_run remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
+        "OpenAPI bridge for Custom GPTs. ChatGPT drives local coding actions through jk; the bridge does not embed a separate LLM coding client and is not intended to bypass any OpenAI product rate limit, usage limit, or safety restriction. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no jk local work happened; reselect/reconnect jk or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, mass_ulw_execute, and e2e_test_and_show_screenshot for source editing, approved MASS ULW fan-out, and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools such as optional omo_run remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes().map((route) => route.tool),
@@ -688,7 +687,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           type: "http",
           scheme: "bearer",
           bearerFormat: "chatgpt2codex-owner-token",
-          description: "Use the chatgpt2codex owner token shown at init/setup time. Never commit it.",
+          description: "Use the jk owner token shown at init/setup time. Never commit it.",
         },
       },
       schemas: {
@@ -701,12 +700,12 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             toolName: {
               type: "string",
               description:
-                "Registered chatgpt2codex MCP tool name, e.g. file_apply_patch, file_create, local_shell_run, repo_status, git_commit, git_push.",
+                "Registered MCP tool name. For ChatGPT-web MASS ULW use mass_ulw_step (start/next/context/submit/review/revise/integrate/finish/status) after task_workspace create and goal_loop fanout planning. Pass its returned identity plus action in input; follow context/nextCall until terminal=true. Submit ready lanes incrementally; ChatGPT supplies repairs and reviews, with no model API. task_workspace also supports list/status/resume/archive/verify/publish/discard. Other examples: file_apply_patch, file_create, local_shell_run, repo_status, git_commit, git_push.",
             },
             input: {
               type: "object",
               additionalProperties: true,
-              description: "Input object passed directly to the named chatgpt2codex MCP tool.",
+              description: "Input object passed directly to the named jk MCP tool.",
             },
           },
         },
@@ -729,6 +728,12 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             },
             mode: { type: "string", enum: ["implement", "research", "debug", "review", "plan"] },
             urgency: { type: "string", enum: ["normal", "fast"] },
+            coordinationMode: {
+              type: "string",
+              enum: ["standard", "dispatcher"],
+              description:
+                "Optional orchestration policy. dispatcher keeps the main ChatGPT reasoning surface thin and routes work through compact inspect/edit/verify result contracts; standard preserves the existing behavior.",
+            },
           },
         },
         GoalLoopInput: {
@@ -761,6 +766,12 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               enum: ["auto", "fast", "max"],
               description:
                 "Optional JK execution policy. auto is the default and may infer Fast or Max from task shape; fast minimizes coordination overhead; max prioritizes wall-clock speed, verification coverage, and reduced rework while preserving hard safety guards.",
+            },
+            coordinationMode: {
+              type: "string",
+              enum: ["standard", "dispatcher"],
+              description:
+                "Optional orchestration policy independent from executionProfile. dispatcher minimizes main-context growth by requiring narrow context and compact worker/batch summaries.",
             },
             safety: {
               type: "object",
@@ -805,6 +816,12 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               type: "string",
               enum: ["unknown", "pass", "fail", "blocked"],
               description: "Result of the closest verification from the previous batch.",
+            },
+            reviewVerdict: {
+              type: "string",
+              enum: ["missing", "approve", "reject"],
+              description:
+                "Fresh final-review verdict for this loop turn. Successful terminal completion requires approve after verification; reject keeps the loop open, and missing means final review has not run yet.",
             },
             failureCount: {
               type: "integer",
@@ -957,7 +974,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           required: ["projectId", "reason"],
           properties: {
-            projectId: { type: "string", description: "Project id or name, for example chatgpt2codex." },
+            projectId: { type: "string", description: "Project id, name, or alias, for example jk or windows-main:cleantube." },
             workSessionId: {
               type: "string",
               pattern: "^ws_[A-Za-z0-9_.-]+$",
@@ -994,7 +1011,10 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               enum: ["read-only", "tests-only", "full-write", "image-only"],
               description: "Defaults to full-write on the GPT Actions bridge when omitted.",
             },
-            confirmSwitch: { type: "boolean" },
+            confirmSwitch: {
+              type: "boolean",
+              description: "Defaults to true on the GPT Actions bridge when omitted. Set false to reject switching away from another currently leased project.",
+            },
           },
         },
         CodeSearchInput: {
@@ -1369,7 +1389,7 @@ export function registerActionRoutes(
   app.get("/actions/health", (_req, res) => {
     res.json({
       ok: true,
-      name: "chatgpt2codex-actions",
+      name: "jk-actions",
       actions: ACTION_ROUTES.length,
       openApiOperations: openApiActionRoutes().length + 2,
       openApiToolNames: openApiActionRoutes().map((route) => route.tool),

@@ -1,17 +1,25 @@
 import type { MassUlwPlan } from "./mass-ulw.js";
 import { MassUlwStore, type MassUlwDocument } from "./mass-ulw-store.js";
 import { PlanSchema } from "./mass-ulw-store-schema.js";
-import { cleanupMassUlwPrivateWorkspace, createMassUlwWorkspace, type MassUlwLaneCheckout, type MassUlwWorkspaceOptions } from "./mass-ulw-workspace.js";
+import { cleanupMassUlwPrivateWorkspace, createMassUlwWorkspace, type MassUlwWorkspaceOptions } from "./mass-ulw-workspace.js";
 import { MassUlwFinalizer } from "./mass-ulw-executor-finalizer.js";
 import { ancestorsOf, descendantsOf, stableTopologicalWaves, topologicalLaneIds } from "./mass-ulw-executor-graph.js";
 import { MassUlwExecutionState } from "./mass-ulw-executor-state.js";
 import { MassUlwLaneRunner } from "./mass-ulw-executor-lane.js";
 import { acquireExecutionLock } from "./mass-ulw-executor-lock.js";
-import { laneAttempts, parseMassUlwAttemptFingerprint, recoveryHistory } from "./mass-ulw-executor-recovery.js";
+import { recoveryHistory } from "./mass-ulw-executor-recovery.js";
 import { finalizeMassUlwPublicationRecovery, recoverMassUlwPublication } from "./mass-ulw-publish-recovery.js";
 import type { MassUlwExecutionInput, MassUlwExecutionResult, MassUlwExecutorOptions, MassUlwWorkspaceLike } from "./mass-ulw-executor-types.js";
+import type { MassUlwFailureDiagnostic } from "./mass-ulw-failure.js";
+import { MassUlwStageError } from "./mass-ulw-failure.js";
 const MAX_LANE_ATTEMPTS = 3;
-type LaneOutcome = { laneId: string; status: "completed" | "failed" };
+type LaneOutcome = { laneId: string; status: "completed" | "failed" | "halted" };
+function laneFailureDiagnostics(document: MassUlwDocument, laneIds: ReadonlySet<string>): MassUlwFailureDiagnostic[] {
+  return document.attempts
+    .filter((attempt) => attempt.kind === "lane" && attempt.status === "failed" && attempt.laneId && laneIds.has(attempt.laneId) && attempt.failure)
+    .map((attempt) => attempt.failure!)
+    .sort((left, right) => (left.laneId ?? "").localeCompare(right.laneId ?? "") || left.stage.localeCompare(right.stage));
+}
 export { encodeMassUlwAttemptFingerprint, parseMassUlwAttemptFingerprint } from "./mass-ulw-executor-recovery.js";
 export type { IntegratedVerificationRequest, LaneEngine, LaneExecutionRequest, LaneExecutionResult, LaneRestoreRequest, LaneVerificationRequest, MassUlwAttemptFingerprint, MassUlwExecutionInput, MassUlwExecutionResult, MassUlwExecutorOptions, MassUlwRecoveryApproach, MassUlwWorkspaceLike, VerificationEngine, VerificationResult } from "./mass-ulw-executor-types.js";
 export class MassUlwExecutor {
@@ -55,6 +63,7 @@ export class MassUlwExecutor {
 
   private validatePlan(plan: MassUlwPlan): void {
     PlanSchema.parse(plan);
+    if (plan.lanes.length > 4) throw new Error("MASS ULW execution admits at most four approved lanes");
     if (plan.hardBlocks.length > 0) throw new Error(`MASS ULW plan is blocked: ${plan.hardBlocks.join(", ")}`);
     const stableWaves = stableTopologicalWaves(plan.lanes);
     if (JSON.stringify(stableWaves) !== JSON.stringify(plan.waves)) {
@@ -77,13 +86,17 @@ export class MassUlwExecutor {
   }
 
   private completedResult(document: MassUlwDocument): MassUlwExecutionResult {
+    const receipt = document.publishJournal.findLast((entry) => entry.status === "published" &&
+      entry.fingerprint === document.fingerprints.publish &&
+      entry.receipt?.integrationCommit === document.fingerprints.integration)?.receipt;
     return {
       status: "completed",
       completedLaneIds: topologicalLaneIds(document.plan).filter((id) => document.lanes[id]?.status === "completed"),
       failedLaneIds: [],
       blockedLaneIds: [],
-      changedPaths: [],
-      laneCommits: [],
+      failureDiagnostics: [],
+      changedPaths: [...(receipt?.changedPaths ?? [])].sort((left, right) => left.localeCompare(right)),
+      laneCommits: [...(receipt?.laneCommits ?? [])].sort((left, right) => left.id.localeCompare(right.id)),
       integrationFingerprint: document.fingerprints.integration,
       finalVerificationInvocationCount: document.integrationVerification.status === "passed" ? 1 : 0,
     };
@@ -106,8 +119,9 @@ export class MassUlwExecutor {
         completedLaneIds: topologicalLaneIds(document.plan),
         failedLaneIds: [],
         blockedLaneIds: [],
+        failureDiagnostics: [],
         changedPaths: [...recovery.receipt.changedPaths],
-        laneCommits: [...recovery.receipt.laneCommits],
+        laneCommits: [...recovery.receipt.laneCommits].sort((left, right) => left.id.localeCompare(right.id)),
         integrationFingerprint: recovery.receipt.integrationCommit,
         finalVerificationInvocationCount: 1,
       };
@@ -119,14 +133,26 @@ export class MassUlwExecutor {
     ) {
       return this.completedResult(document);
     }
+    if (document.integrationVerification.status === "unknown-after-interruption") {
+      return {
+        status: "blocked", completedLaneIds: topologicalLaneIds(input.plan).filter((id) => document.lanes[id]?.status === "completed"),
+        failedLaneIds: [], blockedLaneIds: [], failureDiagnostics: [], changedPaths: [], laneCommits: [],
+        integrationFingerprint: document.integrationVerification.fingerprint, finalVerificationInvocationCount: 0,
+        recovery: { reason: "final-verification-outcome-unknown", attemptId: document.integrationVerification.attemptId,
+          automaticReplay: false, authorizationRequired: true, nextAction: "inspect-outcome-and-start-new-approved-run" },
+      };
+    }
 
+    await this.state.prepareStrategies(input);
+    document = await this.store.load(input.loopId);
     const workspace = await this.workspaceFactory({
       repositoryRoot: this.options.repositoryRoot,
       tempRoot: this.options.tempRoot,
       recoveryRoot: this.options.stateDir,
       recoveryId: input.loopId,
-      lanes: input.plan.lanes.map((lane) => ({ id: lane.id, writeScopes: lane.writeScopes })),
+      lanes: input.plan.lanes.map((lane) => ({ id: lane.id, writeScopes: lane.writeScopes, dependsOn: lane.dependsOn })),
     });
+    let publicationRecorded = false;
     try {
       const checkouts = new Map(workspace.lanes.map((checkout) => [checkout.id, checkout]));
       for (const lane of input.plan.lanes) {
@@ -135,58 +161,75 @@ export class MassUlwExecutor {
 
       await this.state.restoreCompletedLanes(input, document, workspace, checkouts);
       const failedLaneIds = new Set<string>();
+      const maxAttempts = this.options.laneEngine.failurePolicy === "repair-required" ? 1 : MAX_LANE_ATTEMPTS;
       for (const lane of input.plan.lanes) {
-        if (document.lanes[lane.id]?.status !== "completed" && recoveryHistory(document, lane.id).length >= MAX_LANE_ATTEMPTS) {
+        if (document.lanes[lane.id]?.status !== "completed" && recoveryHistory(document, lane.id).length >= maxAttempts) {
           failedLaneIds.add(lane.id);
         }
       }
       let blockedLaneIds = descendantsOf(input.plan, failedLaneIds);
       if (failedLaneIds.size > 0) await this.state.persistBlockedLanes(input.loopId, failedLaneIds, blockedLaneIds);
 
-      for (let waveIndex = 0; waveIndex < input.plan.waves.length; waveIndex += 1) {
-        document = await this.store.load(input.loopId);
-        const wave = input.plan.waves[waveIndex]!;
-        const newlyBlocked = new Set<string>();
-        const runnable: string[] = [];
-        for (const laneId of wave) {
-          const laneState = document.lanes[laneId]!;
-          if (laneState.status === "completed" || failedLaneIds.has(laneId) || blockedLaneIds.has(laneId)) continue;
-          const lane = laneState.lane;
-          const failedDependency = lane.dependsOn.some((dependency) => document.lanes[dependency]?.status === "failed");
-          if (failedDependency) newlyBlocked.add(laneId);
-          else if (lane.dependsOn.every((dependency) => document.lanes[dependency]?.status === "completed")) runnable.push(laneId);
-          else throw new Error(`MASS ULW lane became runnable before its dependencies: ${laneId}`);
+      const pending = new Set(topologicalLaneIds(input.plan).filter((id) =>
+        document.lanes[id]?.status !== "completed" && !failedLaneIds.has(id) && !blockedLaneIds.has(id)));
+      const active = new Map<string, Promise<LaneOutcome>>();
+      const concurrency = input.plan.state === "fanout" && input.plan.recommended ? Math.min(4, input.plan.maxLanes) : 1;
+      let globalFailure: { error: unknown } | undefined;
+      const assertAdmissionOpen = (): void => { if (globalFailure) throw globalFailure.error; };
+      const start = async (laneId: string): Promise<LaneOutcome> => {
+        try {
+          try {
+            await workspace.prepareLane?.(laneId, ancestorsOf(input.plan, laneId));
+          } catch (error) {
+            if (!(error instanceof MassUlwStageError) || error.diagnostic.laneId !== laneId || error.diagnostic.stage !== "checkout") throw error;
+            await this.state.failPreparation(input.loopId, laneId, error.diagnostic);
+            return { laneId, status: "failed" };
+          }
+          if (globalFailure) return { laneId, status: "halted" };
+          const checkout = checkouts.get(laneId);
+          if (!checkout) throw new Error(`Missing checkout: ${laneId}`);
+          return await this.laneRunner.run(input, checkout, laneId);
+        } catch (error) {
+          globalFailure ??= { error };
+          return { laneId, status: "halted" };
         }
-        if (newlyBlocked.size > 0) {
-          for (const laneId of newlyBlocked) blockedLaneIds.add(laneId);
-          blockedLaneIds = new Set([...blockedLaneIds, ...descendantsOf(input.plan, new Set([...failedLaneIds, ...blockedLaneIds]))]);
-          await this.state.persistBlockedLanes(input.loopId, failedLaneIds, blockedLaneIds);
-        }
-        if (runnable.length === 0) {
-          await this.state.finishWave(input.loopId, waveIndex);
-          continue;
-        }
+      };
 
-        await Promise.all(runnable.map((laneId) => workspace.prepareLane?.(laneId, ancestorsOf(input.plan, laneId))));
-        await this.state.startWave(input.loopId, waveIndex);
-        const outcomes: LaneOutcome[] = [];
-        const beneficialParallelWave = input.plan.state === "fanout" && input.plan.recommended && runnable.length > 1;
-        if (beneficialParallelWave) {
-          const settled = await Promise.allSettled(
-            runnable.map((laneId) => this.laneRunner.run(input, checkouts.get(laneId)!, laneId)),
-          );
-          const rejected = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
-          if (rejected) throw rejected.reason;
-          outcomes.push(...settled.map((result) => (result as PromiseFulfilledResult<LaneOutcome>).value));
-        } else {
-          for (const laneId of runnable) outcomes.push(await this.laneRunner.run(input, checkouts.get(laneId)!, laneId));
+      try {
+        while (pending.size > 0 || active.size > 0) {
+          assertAdmissionOpen();
+          document = await this.store.load(input.loopId);
+          for (const laneId of pending) {
+            if (globalFailure || active.size >= concurrency) break;
+            const lane = document.lanes[laneId]?.lane;
+            if (!lane || !lane.dependsOn.every((id) => document.lanes[id]?.status === "completed")) continue;
+            await this.state.startWave(input.loopId, input.plan.waves.findIndex((wave) => wave.includes(laneId)));
+            if (globalFailure) break;
+            pending.delete(laneId);
+            active.set(laneId, start(laneId));
+          }
+          assertAdmissionOpen();
+          if (active.size === 0) {
+            if (pending.size > 0) throw new Error("MASS ULW has pending lanes without completed prerequisites");
+            break;
+          }
+          const outcome = await Promise.race(active.values());
+          active.delete(outcome.laneId);
+          assertAdmissionOpen();
+          if (outcome.status === "failed") {
+            failedLaneIds.add(outcome.laneId);
+            blockedLaneIds = descendantsOf(input.plan, failedLaneIds);
+            for (const id of blockedLaneIds) pending.delete(id);
+            await this.state.persistBlockedLanes(input.loopId, failedLaneIds, blockedLaneIds);
+          }
+          for (let index = 0; index < input.plan.waves.length; index += 1) await this.state.finishWave(input.loopId, index);
         }
-        for (const outcome of outcomes) if (outcome.status === "failed") failedLaneIds.add(outcome.laneId);
-        if (outcomes.some((outcome) => outcome.status === "failed")) {
-          blockedLaneIds = descendantsOf(input.plan, failedLaneIds);
-          await this.state.persistBlockedLanes(input.loopId, failedLaneIds, blockedLaneIds);
-        }
-        await this.state.finishWave(input.loopId, waveIndex);
+      } catch (error) {
+        globalFailure ??= { error };
+        throw error;
+      } finally {
+        // Admission and cleanup share execution ownership, including preparations.
+        await Promise.all(active.values());
       }
 
       document = await this.store.load(input.loopId);
@@ -196,6 +239,10 @@ export class MassUlwExecutor {
           completedLaneIds: topologicalLaneIds(input.plan).filter((id) => document.lanes[id]?.status === "completed"),
           failedLaneIds: [...failedLaneIds].sort((left, right) => left.localeCompare(right)),
           blockedLaneIds: [...blockedLaneIds].sort((left, right) => left.localeCompare(right)),
+          failureDiagnostics: laneFailureDiagnostics(document, failedLaneIds),
+          ...(this.options.laneEngine.failurePolicy === "repair-required" ? {
+            recovery: { reason: "repair-required" as const, laneIds: [...failedLaneIds].sort(), automaticReplay: false as const },
+          } : {}),
           changedPaths: [],
           laneCommits: [],
           integrationFingerprint: null,
@@ -211,6 +258,7 @@ export class MassUlwExecutor {
           completedLaneIds: topologicalLaneIds(input.plan),
           failedLaneIds: [],
           blockedLaneIds: [],
+          failureDiagnostics: verification.failure ? [verification.failure] : [],
           changedPaths: integration.changedPaths,
           laneCommits: integration.laneCommits,
           integrationFingerprint: integration.commit,
@@ -218,18 +266,22 @@ export class MassUlwExecutor {
         };
       }
       const published = await this.finalizer.publish(input.loopId, workspace, integration);
+      publicationRecorded = true;
       return {
         status: "completed",
         completedLaneIds: topologicalLaneIds(input.plan),
         failedLaneIds: [],
         blockedLaneIds: [],
+        failureDiagnostics: [],
         changedPaths: [...published.changedPaths].sort((left, right) => left.localeCompare(right)),
         laneCommits: [...integration.laneCommits].sort((left, right) => left.id.localeCompare(right.id)),
         integrationFingerprint: integration.commit,
         finalVerificationInvocationCount: verification.invocationCount,
       };
     } finally {
-      await workspace.cleanup();
+      // Filesystem commit alone is not durable executor completion.
+      await workspace.cleanup({ preservePublicationReceipt: true });
+      if (publicationRecorded) await finalizeMassUlwPublicationRecovery(this.options.stateDir, input.loopId);
     }
   }
 
@@ -237,6 +289,6 @@ export class MassUlwExecutor {
 }
 
 export async function executeMassUlw(options: MassUlwExecutorOptions & MassUlwExecutionInput): Promise<MassUlwExecutionResult> {
-  const { loopId, plan, ...dependencies } = options;
-  return new MassUlwExecutor(dependencies).execute({ loopId, plan });
+  const { loopId, plan, repairStrategies, ...dependencies } = options;
+  return new MassUlwExecutor(dependencies).execute({ loopId, plan, repairStrategies });
 }

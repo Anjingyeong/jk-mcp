@@ -1,7 +1,18 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, stat, readdir } from "node:fs/promises";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { TaskWorkspaceStore } from "../workspace/task-workspaces.js";
+import { Store } from "../state/store.js";
+import { makeLease } from "../workspace/project-select.js";
+import { git } from "../orchestration/mass-ulw-workspace-repository.js";
+import { MassUlwWorkspace } from "../orchestration/mass-ulw-workspace.js";
+import { MassUlwWebWorkflow, type WebMassInput } from "../orchestration/mass-ulw-web.js";
+import { executeWebMassStep } from "../server/mass-ulw-web-tool.js";
+import { createMassUlwExecutionIdentity } from "../server/mass-ulw-identity.js";
+import { writeMassUlwIdentityIndex } from "../orchestration/mass-ulw-identity-index.js";
+import type { ToolContext } from "../types.js";
 import { MassUlwStore } from "../orchestration/mass-ulw-store.js";
 import { buildMassUlwPlan, type MassUlwCandidate } from "../orchestration/mass-ulw.js";
 import { readTaskExecutionView, type TaskExecutionSnapshot } from "./execution.js";
@@ -9,7 +20,11 @@ import { readTaskExecutionView, type TaskExecutionSnapshot } from "./execution.j
 const tempDirs: string[] = [];
 
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  vi.restoreAllMocks();
+  await Promise.all(tempDirs.splice(0).map(async (dir) => {
+    await rm(dir, { recursive: true, force: true });
+    await expect(stat(dir)).rejects.toMatchObject({ code: "ENOENT" });
+  }));
 });
 
 async function stateDir(): Promise<string> {
@@ -208,7 +223,9 @@ describe("readTaskExecutionView", () => {
 
     const view = await readTaskExecutionView(dir, snapshot());
 
-    expect(view.massUlw).toStrictEqual({
+    expect(view.massUlw).toMatchObject({
+      createdAt: 200,
+      updatedAt: 200,
       currentWave: 0,
       runningLanes: ["running"],
       failedLanes: ["failed"],
@@ -216,5 +233,11 @@ describe("readTaskExecutionView", () => {
       blockedDependencies: ["failed"],
       verification: "in-flight",
     });
+    expect(view.massUlw?.lanes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "running", task: "Implement running", status: "in-flight", dependsOn: [] }),
+      expect.objectContaining({ id: "failed", task: "Implement failed", status: "failed", dependsOn: [] }),
+      expect.objectContaining({ id: "blocked", task: "Implement blocked", status: "blocked", dependsOn: ["failed"] }),
+    ]));
+    expect(view.massUlw?.waves.length).toBeGreaterThan(0);
   });
 });

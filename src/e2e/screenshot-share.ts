@@ -30,9 +30,10 @@ function sharesDir(stateDir: string): string {
   return path.join(stateDir, "e2e-screenshot-shares");
 }
 
-function isScreenshotPath(filePath: string): boolean {
-  const normalized = filePath.split(path.sep).join("/");
-  return normalized.includes("/.chatgpt2codex/e2e/screenshots/") && normalized.endsWith(".png");
+export function isScreenshotPath(filePath: string): boolean {
+  const normalized = filePath.replaceAll("\\", "/");
+  return ["/.jk/e2e/screenshots/", "/.chatgpt2codex/e2e/screenshots/"]
+    .some((directory) => normalized.includes(directory)) && normalized.endsWith(".png");
 }
 
 export async function createE2eScreenshotShare(

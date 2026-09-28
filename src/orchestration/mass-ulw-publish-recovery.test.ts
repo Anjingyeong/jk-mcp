@@ -10,6 +10,7 @@ import { MassUlwExecutor } from "./mass-ulw-executor.js";
 import { cleanupExecutorRoots, lane, makeExecutorRepository } from "./mass-ulw-runner-fixtures.js";
 import { MassUlwStore } from "./mass-ulw-store.js";
 import { buildMassUlwPlan } from "./mass-ulw.js";
+import { imageDigest, readPathImage } from "./mass-ulw-workspace-repository.js";
 import {
   massUlwPublishFingerprint,
   publicationTransactionRoot,
@@ -174,6 +175,11 @@ describe("MASS ULW durable publication recovery", () => {
         applied: ["src/a/added.txt", "src/a/existing.txt"],
         preexisting: ["src/a/existing.txt"],
         backedUp: ["src/a/existing.txt"],
+        ownership: await Promise.all(["src/a/added.txt", "src/a/existing.txt"].map(async (relative) => ({
+          path: relative,
+          preimage: imageDigest(await readPathImage(backupRoot, relative)),
+          postimage: imageDigest(await readPathImage(repositoryRoot, relative)),
+        }))),
       }),
       "utf8",
     );

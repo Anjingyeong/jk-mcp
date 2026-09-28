@@ -8,6 +8,7 @@ import {
   fingerprintMassUlwRepository,
   git,
   gitBytes,
+  imageDigest,
   readPathImage,
 } from "./mass-ulw-workspace-repository.js";
 import type {
@@ -47,6 +48,7 @@ export async function publishMassUlwWorkspace(input: {
   const backupRoot = path.join(transactionRoot, "backup");
   await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });
   const journalPath = path.join(transactionRoot, "journal.json");
+  const ownership: NonNullable<JournalRecord["ownership"]> = [];
   const journal: JournalRecord = {
     version: 1,
     repositoryRoot: input.repositoryRoot,
@@ -55,6 +57,7 @@ export async function publishMassUlwWorkspace(input: {
     applied: [],
     preexisting: changes.filter((change) => preimages.get(change.path)!.exists).map((change) => change.path),
     backedUp: [],
+    ownership,
   };
   await writeJournal(journalPath, journal);
   try {
@@ -69,6 +72,20 @@ export async function publishMassUlwWorkspace(input: {
       if (!imagesEqual(expected, actual)) throw new Error(`Publish preimage changed: ${change.path}`);
       const destination = absoluteFromRelative(input.repositoryRoot, change.path);
       const backup = absoluteFromRelative(backupRoot, change.path);
+      let temporary: string | null = null;
+      let postimage: PathImage = { exists: false, kind: "missing", mode: 0, bytes: Buffer.alloc(0) };
+      if (change.newMode !== null) {
+        const bytes = await gitBytes(mergedRoot, ["show", `${input.integration.commit}:${change.path}`]);
+        await fs.mkdir(path.dirname(destination), { recursive: true });
+        const modeChanged = change.oldMode !== change.newMode;
+        const mode = modeChanged ? (change.newMode === "100755" ? 0o755 : 0o644) : (expected.mode & 0o777) || 0o644;
+        temporary = `${destination}.mass-ulw-${randomUUID()}`;
+        await fs.writeFile(temporary, bytes, { mode });
+        await fs.chmod(temporary, mode);
+        // Read the staged file so ownership reflects actual platform permissions.
+        postimage = await readPathImage(path.dirname(temporary), path.basename(temporary));
+      }
+      ownership.push({ path: change.path, preimage: imageDigest(expected), postimage: imageDigest(postimage) });
       journal.applied.push(change.path);
       await writeJournal(journalPath, journal);
       await fs.mkdir(path.dirname(backup), { recursive: true });
@@ -77,16 +94,7 @@ export async function publishMassUlwWorkspace(input: {
         journal.backedUp.push(change.path);
         await writeJournal(journalPath, journal);
       }
-      if (change.newMode !== null) {
-        const bytes = await gitBytes(mergedRoot, ["show", `${input.integration.commit}:${change.path}`]);
-        await fs.mkdir(path.dirname(destination), { recursive: true });
-        const modeChanged = change.oldMode !== change.newMode;
-        const mode = modeChanged ? (change.newMode === "100755" ? 0o755 : 0o644) : (expected.mode & 0o777) || 0o644;
-        const temporary = `${destination}.mass-ulw-${randomUUID()}`;
-        await fs.writeFile(temporary, bytes, { mode });
-        await fs.chmod(temporary, mode);
-        await fs.rename(temporary, destination);
-      }
+      if (temporary !== null) await fs.rename(temporary, destination);
       await input.hooks.afterPublishPath?.(change.path, ordinal);
     }
     const afterHead = (await git(input.repositoryRoot, ["rev-parse", "HEAD"])).trim();

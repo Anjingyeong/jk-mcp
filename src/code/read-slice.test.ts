@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readSlice } from "./read-slice.js";
 import { ErrorCode } from "../types.js";
 import { rangeHash, lineHashes } from "../util/hash.js";
@@ -13,10 +14,49 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await fs.rm(root, { recursive: true, force: true });
+  await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 describe("readSlice", () => {
+  it.each([
+    { name: "partial CRLF", bytes: Buffer.from("one\r\ntwo\r\nthree\r\n"), start: 2, end: 2,
+      content: "2\ttwo", range: "two", hashes: lineHashes("two"), eol: "crlf" },
+    { name: "empty file", bytes: Buffer.alloc(0), start: 1, end: 1,
+      content: "1\t", range: "", hashes: lineHashes(""), eol: "lf" },
+    { name: "out-of-range CRLF", bytes: Buffer.from("one\r\n"), start: 9, end: 10,
+      content: "", range: "", hashes: [], eol: "crlf" },
+    { name: "empty reversed range", bytes: Buffer.from("one\ntwo"), start: 2, end: 1,
+      content: "", range: "", hashes: lineHashes(""), eol: "lf" },
+    { name: "non-UTF8 bytes", bytes: Buffer.from([0x61, 0xff, 0x0d, 0x0a]), start: 1, end: 1,
+      content: "1\ta\ufffd", range: "a\ufffd", hashes: lineHashes("a\ufffd"), eol: "crlf" },
+  ])("native-evolution R3 hashes the exact read buffer after a controlled edit: $name", async (fixture) => {
+    const abs = path.join(await fs.realpath(root), "same-buffer.txt");
+    const replacement = Buffer.from("replacement\nbytes\n");
+    await fs.writeFile(abs, fixture.bytes);
+    const originalReadFile = fs.readFile.bind(fs);
+    let reads = 0;
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      const bytes = await originalReadFile(...args);
+      if (args[0] === abs) {
+        reads += 1;
+        if (reads === 1) await fs.writeFile(abs, replacement);
+      }
+      return bytes;
+    });
+
+    const result = await readSlice(root, "same-buffer.txt", fixture.start, fixture.end);
+
+    expect(result.content).toBe(fixture.content);
+    expect(await originalReadFile(abs)).toEqual(replacement);
+    expect(result).toHaveProperty("fullFileHash", createHash("sha256").update(fixture.bytes).digest("hex"));
+    expect(result.fileHash).toBe(rangeHash(fixture.range));
+    expect(result.lineHashes).toEqual(fixture.hashes);
+    expect(result.eol).toBe(fixture.eol);
+    expect(reads).toBe(1);
+  });
+
   it("returns line-numbered content with stable per-line and range hashes", async () => {
     await fs.writeFile(path.join(root, "a.txt"), "line1\nline2\nline3\n", "utf8");
 

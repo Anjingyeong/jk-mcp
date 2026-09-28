@@ -1,12 +1,19 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { DomainError, ErrorCode } from "../types.js";
 import { resolveInProject } from "../policy/paths.js";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const IMAGE_DIR = path.join(".chatgpt2codex", "images");
-const METADATA_DIR = path.join(".chatgpt2codex", "image-metadata");
+const IMAGE_DIR = path.join(".jk", "images");
+const IMAGE_DIRS = [IMAGE_DIR, path.join(".chatgpt2codex", "images")];
+const METADATA_DIR = path.join(".jk", "image-metadata");
+
+export function isProjectImagePath(filePath: string): boolean {
+  const normalized = path.posix.normalize(filePath.replaceAll("\\", "/"));
+  return [".jk/images/", ".chatgpt2codex/images/"].some((directory) => normalized.startsWith(directory));
+}
 
 export interface SavedImage {
   filePath: string;
@@ -118,33 +125,50 @@ export async function saveImage(root: string, projectId: string, imageData: stri
   if (metadata) {
     await writeImageMetadata(root, rel, { projectId, sha256, mime: detected.mime, bytes: bytes.length, metadata, savedAt: Date.now() });
   }
-  return { filePath: rel, resourceUri: `chatgpt2codex://${projectId}/images/${fileName}`, sha256, bytes: bytes.length, mime: detected.mime };
+  return { filePath: rel, resourceUri: `jk://${projectId}/images/${fileName}`, sha256, bytes: bytes.length, mime: detected.mime };
 }
 
 export async function listImages(root: string): Promise<Array<SavedImage & { modifiedAt: number }>> {
-  const absDir = await resolveInProject(root, IMAGE_DIR, { allowSymlink: false });
-  let names: string[] = [];
-  try { names = await readdir(absDir); } catch { return []; }
   const out: Array<SavedImage & { modifiedAt: number }> = [];
-  for (const name of names.filter((n) => /\.(png|jpg|jpeg|webp|gif)$/i.test(n)).sort().reverse()) {
-    const rel = path.join(IMAGE_DIR, name);
-    const abs = await resolveInProject(root, rel, { allowSymlink: false });
-    const data = await readFile(abs);
-    const st = await stat(abs);
-    const det = detect(data);
-    out.push({ filePath: rel, resourceUri: `file://${abs}`, sha256: createHash("sha256").update(data).digest("hex"), bytes: data.length, mime: det.mime, modifiedAt: st.mtimeMs });
+  for (const directory of IMAGE_DIRS) {
+    const absDir = await resolveInProject(root, directory, { allowSymlink: false });
+    let names: string[];
+    try { names = await readdir(absDir); } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+      throw error;
+    }
+    for (const name of names.filter((n) => /\.(png|jpg|jpeg|webp|gif)$/i.test(n)).sort().reverse()) {
+      const rel = path.join(directory, name);
+      const abs = await resolveInProject(root, rel, { allowSymlink: false });
+      const data = await readFile(abs);
+      const st = await stat(abs);
+      const det = detect(data);
+      out.push({ filePath: rel, resourceUri: pathToFileURL(abs).href, sha256: createHash("sha256").update(data).digest("hex"), bytes: data.length, mime: det.mime, modifiedAt: st.mtimeMs });
+    }
   }
   return out;
 }
 
-export async function retrieveImage(root: string, filePath: string): Promise<SavedImage & { data: string }> {
-  if (!filePath.startsWith(`${IMAGE_DIR}${path.sep}`) && !filePath.startsWith(`${IMAGE_DIR}/`)) {
-    throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "Images can only be retrieved from .chatgpt2codex/images", { filePath });
+export async function retrieveImage(root: string, filePath: string, projectId?: string): Promise<SavedImage & { data: string }> {
+  let relativePath = filePath;
+  const uri = /^(jk|chatgpt2codex):\/\/([^/]+)\/images\/([^/?#]+)$/.exec(filePath);
+  if (uri) {
+    if (!projectId || uri[2] !== projectId) {
+      throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "Image URI belongs to another project", { filePath });
+    }
+    relativePath = path.join(uri[1] === "jk" ? ".jk" : ".chatgpt2codex", "images", decodeURIComponent(uri[3] ?? ""));
+  } else if (filePath.startsWith("file://")) {
+    // Older listings used raw absolute paths after file://, including Windows separators.
+    const raw = filePath.slice("file://".length);
+    relativePath = path.relative(root, path.isAbsolute(raw) && !filePath.includes("%") ? raw : fileURLToPath(filePath));
   }
-  const abs = await resolveInProject(root, filePath, { allowSymlink: false });
+  if (!isProjectImagePath(relativePath)) {
+    throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "Images can only be retrieved from .jk/images or legacy .chatgpt2codex/images", { filePath });
+  }
+  const abs = await resolveInProject(root, relativePath, { allowSymlink: false });
   const data = await readFile(abs);
   if (data.length > MAX_IMAGE_BYTES) throw new DomainError(ErrorCode.FILE_TOO_LARGE, "Image exceeds return limit");
   const det = detect(data);
   const sha256 = createHash("sha256").update(data).digest("hex");
-  return { filePath, resourceUri: `file://${abs}`, sha256, bytes: data.length, mime: det.mime, data: `data:${det.mime};base64,${data.toString("base64")}` };
+  return { filePath: relativePath, resourceUri: pathToFileURL(abs).href, sha256, bytes: data.length, mime: det.mime, data: `data:${det.mime};base64,${data.toString("base64")}` };
 }

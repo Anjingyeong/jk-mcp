@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import path from "node:path";
 import { DomainError, ErrorCode } from "../types.js";
 
@@ -50,7 +51,7 @@ async function saveState(stateDir: string, state: CredentialState): Promise<void
   const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   const body = `${JSON.stringify({ ...state, version: VERSION, updatedAt: Date.now() }, null, 2)}\n`;
   await writeFile(temp, body, { encoding: "utf8", mode: 0o600 });
-  await rename(temp, target);
+  await renameWithRetry(temp, target);
 }
 
 function tokenHash(token: string): string {

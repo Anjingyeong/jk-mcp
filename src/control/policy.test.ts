@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { DomainError, ErrorCode } from "../types.js";
-import { assertAllowedTarget, controlAllowlist, isControlChatGptExposed, isControlEnabled, isSensitiveApp } from "./policy.js";
+import {
+  assertAllowedTarget,
+  controlAllowlist,
+  controlAllowlistForContext,
+  isControlChatGptExposed,
+  isControlChatGptExposedForContext,
+  isControlEnabled,
+  isSensitiveApp,
+} from "./policy.js";
 
 describe("control/policy", () => {
   it("isControlEnabled defaults to true (no env var set) and requires an explicit opt-out value to disable", () => {
@@ -81,4 +89,33 @@ describe("control/policy", () => {
       expect(isControlChatGptExposed({ CHATGPT2CODEX_CONTROL_CHATGPT: value })).toBe(false);
     },
   );
+
+  it("exposes control from a live local control lease when no env override is set", async () => {
+    const ctx = {
+      store: {
+        getSession: async () => ({
+          activeProjectId: "windows-main::proj",
+          lease: { projectId: "windows-main::proj", preset: "control", expiresAt: 2_000 },
+          controlAllowlist: ["Google Chrome", "Roblox Studio"],
+        }),
+      },
+    } as any;
+    expect(await isControlChatGptExposedForContext(ctx, {}, 1_000)).toBe(true);
+    expect(await controlAllowlistForContext(ctx, {})).toEqual(["Google Chrome", "Roblox Studio"]);
+    expect(await isControlChatGptExposedForContext(ctx, {}, 2_001)).toBe(false);
+  });
+
+  it("keeps explicit env control settings authoritative over session state", async () => {
+    const ctx = {
+      store: {
+        getSession: async () => ({
+          activeProjectId: "windows-main::proj",
+          lease: { projectId: "windows-main::proj", preset: "control", expiresAt: 2_000 },
+          controlAllowlist: ["Google Chrome"],
+        }),
+      },
+    } as any;
+    expect(await isControlChatGptExposedForContext(ctx, { JK_CONTROL_CHATGPT: "0" }, 1_000)).toBe(false);
+    expect(await controlAllowlistForContext(ctx, { JK_CONTROL_ALLOWLIST: "Microsoft Edge" })).toEqual(["Microsoft Edge"]);
+  });
 });

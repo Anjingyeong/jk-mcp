@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ErrorCode, type Lease, type ProjectRegistryEntry } from "../types.js";
-import { makeLease, renewLease, requireLease } from "./project-select.js";
+import { makeLease, renewLease, requireLease, slideLease } from "./project-select.js";
 
 const alpha: ProjectRegistryEntry = {
   projectId: "alpha-app",
@@ -23,6 +23,31 @@ describe("makeLease", () => {
     const a = makeLease(alpha, "read-only");
     const b = makeLease(alpha, "read-only");
     expect(a.leaseId).not.toBe(b.leaseId);
+  });
+});
+
+describe("lease TTL", () => {
+  it("honors a configured TTL when issuing and renewing", () => {
+    const lease = makeLease(alpha, "full-write", 90_000);
+    expect(lease.expiresAt - lease.issuedAt).toBe(90_000);
+    const renewed = renewLease(alpha, "full-write", lease, 120_000);
+    expect(renewed.leaseId).toBe(lease.leaseId);
+    expect(renewed.expiresAt - renewed.issuedAt).toBe(120_000);
+  });
+
+  it("slides only unexpired non-control leases with less than half the TTL left", () => {
+    const base: Lease = {
+      projectId: alpha.projectId,
+      leaseId: "lease_slide",
+      projectRoot: alpha.root,
+      preset: "full-write",
+      issuedAt: 0,
+      expiresAt: 60_000,
+    };
+    expect(slideLease(base, 60_000, 10_000)).toBeNull();
+    expect(slideLease(base, 60_000, 40_000)).toEqual({ ...base, expiresAt: 100_000 });
+    expect(slideLease(base, 60_000, 60_001)).toBeNull();
+    expect(slideLease({ ...base, preset: "control" }, 60_000, 40_000)).toBeNull();
   });
 });
 

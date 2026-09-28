@@ -1,34 +1,32 @@
 # Local overrides
 
-JK의 공개 코어와 개인/호스트별 운영 설정을 분리하기 위한 확장 지점입니다. 아래 파일은 모두 Git 저장소 밖의 JK state directory에 둡니다.
+JK의 공개 코어와 개인/호스트별 운영 설정을 분리하기 위한 확장 지점입니다. 시작 훅은 JK 실행기 루트 아래에, Quick Links는 런타임 상태 디렉터리 아래에 둡니다. 개인 설정과 인증 정보는 공개 저장소에 커밋하지 않습니다.
 
-## Launcher override
+## Linux startup hook
 
-기본 경로:
-
-```text
-~/.local/share/chatgpt2codex/local/launcher.sh
-```
-
-Linux launcher는 이 파일이 실행 가능하면 공개 launcher보다 먼저 호출합니다.
-
-호출 규약:
+Linux 실행기는 JK 설치 또는 소스 실행기 루트(`ROOT`)의 startup hook을 실행합니다. 작업 대상으로 선택한 프로젝트 루트와는 다릅니다. 기본 경로는 다음과 같습니다:
 
 ```text
-launcher.sh <public-launcher-path> <original-arguments...>
+$ROOT/.jk/startup-hook.sh
 ```
 
-호스트별 서비스 준비, 별도 runtime 선택, private deployment follower 같은 동작은 이 wrapper에서 구현할 수 있습니다. wrapper가 공개 launcher를 다시 실행할 때는 재귀 호출을 막기 위해 `JK_LOCAL_LAUNCHER_ACTIVE=1` 상태가 전달됩니다.
+기존 설치와의 호환성을 위해 hook이 없으면 레거시 경로를 fallback으로 확인합니다:
 
-다른 경로를 쓰려면 `JK_LOCAL_LAUNCHER` 환경 변수로 지정할 수 있습니다.
+```text
+$ROOT/.chatgpt2codex/startup-hook.sh
+```
+
+hook은 `bash`로 실행되며 launcher 경로 또는 원래 인수를 전달하지 않습니다. 훅은 백그라운드로 실행되고 출력은 같은 디렉터리의 `startup-hook.log`에 기록됩니다.
 
 ## Control Center Quick Links
 
-기본 경로:
+Quick Links는 현재 JK 런타임이 선택한 상태 디렉터리 아래에 둡니다:
 
 ```text
-~/.local/share/chatgpt2codex/control-center/quick-links.json
+<selected-state-dir>/control-center/quick-links.json
 ```
+
+상태 디렉터리는 비어 있지 않은 `JK_STATE_DIR`, 비어 있지 않은 레거시 `CHATGPT2CODEX_STATE_DIR`, 이미 존재하는 `~/.local/share/jk`, 이미 존재하는 `~/.local/share/chatgpt2codex` 순으로 선택합니다. 모두 없으면 새 `~/.local/share/jk`를 사용합니다. Quick Links 파일은 선택된 디렉터리에서만 읽으며, 그 파일이 없다고 다른 상태 디렉터리의 파일을 대신 읽거나 합치지 않습니다.
 
 예시:
 

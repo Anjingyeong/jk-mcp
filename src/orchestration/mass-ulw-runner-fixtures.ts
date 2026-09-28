@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -41,8 +41,20 @@ export function deferred(): { promise: Promise<void>; resolve(): void } {
   return { promise, resolve };
 }
 
+// These helpers can wait for a real child process or loopback socket while other
+// Vitest files are launching Git/Node/browser processes on Windows. Keep the
+// guard bounded, but leave enough room for that legitimate scheduler pressure.
+const EVENT_WAIT_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 10_000;
+
 export async function eventOrFinished(event: Promise<void>, execution: Promise<unknown>): Promise<boolean> {
-  return Promise.race([event.then(() => true), execution.then(() => false)]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([event.then(() => true), execution.then(() => false), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Expected execution event did not arrive")), EVENT_WAIT_TIMEOUT_MS);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function fakeWorkspace(plan: MassUlwPlan, events: string[], onCleanup: () => void): MassUlwWorkspaceLike {
@@ -114,5 +126,13 @@ export async function rmResilient(root: string, attempts = 5, remove: RemoveRoot
 
 export async function cleanupExecutorRoots(): Promise<void> {
   await Promise.all([...executorRoots].map((root) => rmResilient(root)));
+  for (const root of executorRoots) {
+    try { await stat(root); } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+      throw error;
+    }
+    throw new Error(`Owned fixture remains: ${root}`);
+  }
+  console.log("B_FIXTURE_CLEANUP", JSON.stringify({ complete: true, paths: [...executorRoots] }));
   executorRoots.clear();
 }

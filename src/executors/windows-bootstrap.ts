@@ -8,7 +8,7 @@ const cp = require("node:child_process");
 
 const HUB = String(process.env.JK_HUB_URL || "").replace(/\/mcp\/?$/i, "").replace(/\/$/, "");
 const EXECUTOR_ID = String(process.env.JK_EXECUTOR_ID || "windows-main");
-const WORKSPACE = path.resolve(String(process.env.JK_EXECUTOR_WORKSPACE || process.cwd()));
+const WORKSPACE = canonicalDirectory(path.resolve(String(process.env.JK_EXECUTOR_WORKSPACE || process.cwd())));
 const TOKEN_FILE = String(process.env.JK_EXECUTOR_TOKEN_FILE || "");
 if (!HUB || !TOKEN_FILE) throw new Error("JK worker configuration missing");
 const TOKEN = fs.readFileSync(TOKEN_FILE, "utf8").trim();
@@ -33,7 +33,44 @@ function claimSingleton(){
 claimSingleton();
 process.on("exit",()=>{ try{ if(Number(fs.readFileSync(LOCK_FILE,"utf8").trim())===process.pid) fs.unlinkSync(LOCK_FILE); }catch{} });
 
-const CAPABILITIES = ["project_status","project_rules","repo_status","repo_diff_summary","git_sync_start","code_search","file_read_slice","local_shell_run","executor_restart"];
+const CAPABILITIES = ["execution-target-v1","project_status","project_rules","repo_status","repo_diff_summary","git_sync_start","code_search","file_read_slice","local_shell_run","executor_restart"];
+const IDENTITY = {role:"worker",protocolVersion:1,executorId:EXECUTOR_ID,instanceId:INSTANCE_ID,workspaceRoot:WORKSPACE,os:process.platform,arch:process.arch,capabilities:CAPABILITIES};
+let hubIdentity=null, heartbeatError=null;
+function canonicalDirectory(root){ const canonical=fs.realpathSync(root); if(!fs.statSync(canonical).isDirectory()) throw new Error("Not a directory: "+root); return canonical; }
+function nonempty(value){ return typeof value==="string" && value.length>0; }
+function absolutePath(value){ return nonempty(value) && !value.includes("\0") && (path.posix.isAbsolute(value)||path.win32.isAbsolute(value)); }
+function object(value){ return value!==null && typeof value==="object" && !Array.isArray(value); }
+function validateIdentity(value){
+  if(!object(value) || !["hub","worker"].includes(value.role) || value.protocolVersion!==1
+    || ![value.executorId,value.instanceId,value.os,value.arch].every(nonempty) || !absolutePath(value.workspaceRoot)
+    || (value.appVersion!==undefined&&!nonempty(value.appVersion)) || !Array.isArray(value.capabilities)
+    || !value.capabilities.every(nonempty) || !value.capabilities.includes("execution-target-v1")) throw new Error("Invalid executor runtime identity");
+  return value;
+}
+function sameIdentity(a,b){ return ["role","protocolVersion","executorId","instanceId","workspaceRoot"].every(key=>a[key]===b[key]); }
+const TARGET_KEYS=["kind","protocolVersion","executorId","instanceId","workspaceRoot","projectId","sourceProjectId","projectRoot"];
+function validateTarget(value){
+  if(!object(value) || !["local","remote"].includes(value.kind) || value.protocolVersion!==1
+    || ![value.executorId,value.instanceId,value.projectId,value.sourceProjectId].every(nonempty)
+    || !absolutePath(value.workspaceRoot) || !absolutePath(value.projectRoot)
+    || Object.keys(value).some(key=>!TARGET_KEYS.includes(key))) throw new Error("Invalid project execution target");
+  return value;
+}
+function sameTarget(a,b){ return TARGET_KEYS.every(key=>a[key]===b[key]); }
+async function validateJob(job){
+  if(!object(job) || !nonempty(job.jobId) || !nonempty(job.executorId) || typeof job.tool!=="string"
+    || !object(job.payload) || typeof job.createdAt!=="number" || !Number.isFinite(job.createdAt)
+    || job.protocolVersion!==1) throw new Error("Invalid executor job");
+  if(job.executorId!==EXECUTOR_ID || !sameIdentity(validateIdentity(job.runtime),IDENTITY)
+    || !CAPABILITIES.includes(job.tool)) throw new Error("Job runtime identity or capability mismatch");
+  if(job.tool==="executor_restart" && job.executionTarget===undefined) return [];
+  const target=validateTarget(job.executionTarget), registry=await scanWorkspace(), project=resolveProject(registry,job.payload);
+  const actual={kind:"remote",protocolVersion:1,executorId:EXECUTOR_ID,instanceId:INSTANCE_ID,workspaceRoot:WORKSPACE,
+    projectId:target.projectId,sourceProjectId:project.projectId,projectRoot:canonicalDirectory(project.root)};
+  if(!sameTarget(target,actual)) throw new Error("Job project execution target changed");
+  if(job.payload.executionTarget!==undefined && !sameTarget(validateTarget(job.payload.executionTarget),actual)) throw new Error("Job payload execution target mismatch");
+  return registry;
+}
 const SKIP_DIRS = new Set([".git","node_modules",".gradle",".idea","build","dist","out","coverage","venv",".venv","__pycache__"]);
 const MARKERS = ["package.json","settings.gradle","settings.gradle.kts","build.gradle","build.gradle.kts","gradlew","pubspec.yaml","pom.xml","pyproject.toml"];
 const TEXT_EXTS = new Set([".ts",".tsx",".js",".jsx",".mjs",".cjs",".java",".kt",".kts",".xml",".json",".html",".css",".scss",".md",".txt",".yml",".yaml",".toml",".properties",".gradle",".py",".sh",".ps1",".bat",".cmd"]);
@@ -56,18 +93,27 @@ function gitStatus(root){
 }
 function projectSnapshot(dir,id){ const st=gitStatus(dir); const name=path.basename(dir); const packageName=packageProjectName(dir); const aliases=[id,name]; if(packageName) aliases.push(packageName,projectSlug(packageName)); return {projectId:id,name,root:dir,aliases:[...new Set(aliases)],branch:st.branch||undefined,dirty:st.dirtyFiles.length>0||st.staged.length>0,hasAgentsMd:fs.existsSync(path.join(dir,"AGENTS.md")),hasCodeBrain:false,packageHints:packageHints(dir),lastSeenAt:new Date().toISOString()}; }
 async function scanWorkspace(){
+  if(canonicalDirectory(WORKSPACE)!==WORKSPACE) throw new Error("Worker workspace root changed");
   const found=[]; const ids=new Map(); const queue=[{dir:WORKSPACE,depth:0}];
   while(queue.length){ const {dir,depth}=queue.shift(); let names=[]; try{ names=await fsp.readdir(dir,{withFileTypes:true}); }catch{ continue; }
     const marker = names.some(e=>e.name===".git") || MARKERS.some(m=>names.some(e=>e.name===m));
-    if(marker){ let base=projectSlug(path.basename(dir))||"project"; const n=(ids.get(base)||0)+1; ids.set(base,n); const id=n===1?base:base+"-"+n; found.push(projectSnapshot(dir,id)); if(depth>0) continue; }
+    if(marker){ let base=projectSlug(path.basename(dir))||"project"; const n=(ids.get(base)||0)+1; ids.set(base,n); const id=n===1?base:base+"-"+n; found.push(projectSnapshot(canonicalDirectory(dir),id)); if(depth>0) continue; }
     if(depth>=6) continue;
     for(const ent of names){ if(!ent.isDirectory()||SKIP_DIRS.has(ent.name)) continue; if(ent.name.startsWith(".")&&ent.name!==".config") continue; queue.push({dir:path.join(dir,ent.name),depth:depth+1}); }
   }
   return found;
 }
 async function requestJson(url, body, timeoutMs=25000){ const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),Math.max(1000,Number(timeoutMs)||25000)); try{ const r=await fetch(url,{method:"POST",headers:{authorization:"Bearer "+TOKEN,"content-type":"application/json"},body:JSON.stringify(body),signal:controller.signal}); const text=await r.text(); let data=null; try{data=text?JSON.parse(text):null}catch{data=text} if(!r.ok) throw new Error("JK hub "+r.status+": "+(data&&data.error||text)); return data; } finally { clearTimeout(timer); } }
-async function heartbeat(registry){ return requestJson(HUB+"/api/executors/heartbeat",{executorId:EXECUTOR_ID,label:"Windows PC",platform:process.platform+"/"+process.arch+" · "+os.hostname(),workspaceRoot:WORKSPACE,projects:registry,capabilities:CAPABILITIES,instanceId:INSTANCE_ID,startedAtMs:STARTED_AT_MS},5000); }
-function resolveProject(registry,payload){ const id=String(payload.sourceProjectId||payload.projectId||""); const p=registry.find(x=>x.projectId===id||x.aliases.includes(id)); if(!p) throw new Error("Worker project not found: "+id); return p; }
+async function heartbeat(registry){ try{ const response=await requestJson(HUB+"/api/executors/heartbeat",{...IDENTITY,label:"Windows PC",platform:process.platform+"/"+process.arch+" \u00b7 "+os.hostname(),projects:registry,startedAtMs:STARTED_AT_MS},5000);
+  if(!object(response) || response.ok!==true || validateIdentity(response.hub).role!=="hub"
+    || validateIdentity(response.executor).role!=="worker" || !sameIdentity(response.executor,IDENTITY)) throw new Error("Invalid executor handshake");
+  if(hubIdentity && !sameIdentity(hubIdentity,response.hub)){
+    console.error("[JK worker] Hub runtime identity changed; exiting for supervisor reconnect");
+    process.exit(1);
+  }
+  hubIdentity=response.hub; heartbeatError=null; return response;
+}catch(error){ heartbeatError=error; throw error; } }
+function resolveProject(registry,payload){ const id=String(payload.sourceProjectId??payload.projectId??""); const p=registry.find(x=>x.projectId===id); if(!p) throw new Error("Worker project not found: "+id); return p; }
 function ruleResult(root, rel){ const target=safePath(root,rel||"."); const stat=fs.existsSync(target)?fs.statSync(target):null; let dir=stat&&stat.isDirectory()?target:path.dirname(target); const dirs=[]; while(inside(root,dir)){ dirs.unshift(dir); if(path.resolve(dir)===path.resolve(root)) break; const parent=path.dirname(dir); if(parent===dir) break; dir=parent; } const rules=[]; for(const d of dirs){ for(const name of (d===root?[".codex/config.toml","AGENTS.md","CLAUDE.md"]:["AGENTS.md","CLAUDE.md"])){ const f=path.join(d,name); if(!fs.existsSync(f)) continue; let raw=""; try{raw=fs.readFileSync(f,"utf8")}catch{} rules.push({file:path.relative(root,f).replace(/\\/g,"/")||name,summary:raw.split(/\r?\n/).slice(0,20).join("\n").slice(0,2000)}); } } return {scopePath:path.relative(root,target).replace(/\\/g,"/")||".",hierarchical:Boolean(rel),rules}; }
 function repoStatus(root){ const st=gitStatus(root); const remoteRaw=git(root,["remote","-v"]); const remotes=[...new Set(remoteRaw.split(/\r?\n/).filter(Boolean).map(l=>l.split(/\s+/)[0]))]; const upstream=git(root,["rev-parse","--abbrev-ref","--symbolic-full-name","@{u}"]); let ahead=0,behind=0; if(upstream){ const c=git(root,["rev-list","--left-right","--count","HEAD...@{u}"]).split(/\s+/).map(Number); ahead=c[0]||0; behind=c[1]||0; } const syncState=!upstream?"no-upstream":ahead&&behind?"diverged":ahead?"ahead":behind?"behind":"synced"; return {...st,remotes,upstream:upstream||null,ahead,behind,syncState}; }
 function upstreamRemote(upstream){ const slash=String(upstream||"").indexOf("/"); return slash>0?upstream.slice(0,slash):"origin"; }
@@ -81,7 +127,25 @@ function readSlice(root, rel, start, end){ const abs=safePath(root,rel); const b
 async function shellRun(root,payload){ const cwd=safePath(root,payload.cwd||"."); const timeout=Math.max(1000,Math.min((Number(payload.timeoutSec)||120)*1000,900000)); return await new Promise(resolve=>{ cp.exec(String(payload.command||""),{cwd,windowsHide:true,timeout,maxBuffer:8*1024*1024,shell:true},(error,stdout,stderr)=>resolve({cwd:path.relative(root,cwd).replace(/\\/g,"/")||".",exitCode:error&&typeof error.code==="number"?error.code:(error?1:0),stdoutSummary:String(stdout||"").slice(-200000),stderrSummary:String(stderr||"").slice(-200000),durationMs:0,outputTruncated:String(stdout||"").length>200000||String(stderr||"").length>200000})); }); }
 function requestRestart(payload){ const requestFile=path.join(path.dirname(TOKEN_FILE),"executor-restart.request"); const now=Date.now(); fs.writeFileSync(requestFile,JSON.stringify({requestedAt:now,notBefore:now+3000,reason:String(payload&&payload.reason||"JK requested worker restart").slice(0,240)})+"\n","utf8"); return {scheduled:true,notBefore:now+3000,requestFile:path.basename(requestFile)}; }
 async function execute(registry,job){ const payload=job.payload||{}; if(job.tool==="executor_restart") return requestRestart(payload); const p=resolveProject(registry,payload); switch(job.tool){ case "project_status":{ const st=gitStatus(p.root); return {...st,packageHints:p.packageHints||[],ruleFiles:["AGENTS.md","CLAUDE.md",".codex/config.toml"].filter(f=>fs.existsSync(path.join(p.root,f))),knownCommands:[],hasCodeBrain:false}; } case "project_rules": return ruleResult(p.root,payload.path); case "repo_status": return repoStatus(p.root); case "repo_diff_summary": return repoDiff(p.root); case "git_sync_start": return gitSyncStart(p.root); case "code_search": return codeSearch(p.root,payload.query,payload.maxResults,nestedRoots(registry,p)); case "file_read_slice": return readSlice(p.root,payload.path,payload.start??(Number(payload.offset)>=0?Number(payload.offset)+1:undefined),payload.end); case "local_shell_run": return shellRun(p.root,payload); default: throw new Error("Unsupported bootstrap worker tool: "+job.tool); } }
-async function complete(job,result,error){ return requestJson(HUB+"/api/executors/"+encodeURIComponent(EXECUTOR_ID)+"/jobs/"+encodeURIComponent(job.jobId)+"/result",error?{error:String(error&&error.message||error)}:{result}); }
-async function main(){ let registry=[]; let lastScan=0,lastBeat=0; let beatBusy=false; console.log("[JK worker] starting",EXECUTOR_ID,WORKSPACE,HUB); const beatTimer=setInterval(async()=>{ if(beatBusy||registry.length===0) return; beatBusy=true; try{await heartbeat(registry);lastBeat=Date.now();}catch(e){console.error("[JK worker heartbeat]",e&&e.message||e);}finally{beatBusy=false;} },8000); beatTimer.unref(); for(;;){ const now=Date.now(); try{ if(now-lastScan>15000||registry.length===0){registry=await scanWorkspace();lastScan=now;} if(now-lastBeat>10000&&!beatBusy){beatBusy=true;try{await heartbeat(registry);lastBeat=Date.now();}finally{beatBusy=false;}} const polled=await requestJson(HUB+"/api/executors/"+encodeURIComponent(EXECUTOR_ID)+"/poll",{waitMs:20000}); if(polled&&polled.job){ try{ const result=await execute(registry,polled.job); await complete(polled.job,result,null); }catch(e){ await complete(polled.job,null,e); } } }catch(e){ console.error("[JK worker]",e&&e.message||e); await sleep(3000); } } }
+async function complete(job,result,error){ return requestJson(HUB+"/api/executors/"+encodeURIComponent(EXECUTOR_ID)+"/jobs/"+encodeURIComponent(job.jobId)+"/result",{result,error:error?String(error&&error.message||error):undefined,identity:IDENTITY}); }
+async function main(){
+  console.log("[JK worker] starting",EXECUTOR_ID,WORKSPACE,HUB);
+  let registry=await scanWorkspace(); await heartbeat(registry);
+  console.log("[JK worker] ready",JSON.stringify({worker:IDENTITY,hub:hubIdentity,projects:registry.length}));
+  let lastScan=Date.now(),lastBeat=Date.now(),beatBusy=false;
+  const beatTimer=setInterval(async()=>{ if(beatBusy||registry.length===0) return; beatBusy=true; try{await heartbeat(registry);lastBeat=Date.now();}catch(e){console.error("[JK worker heartbeat]",e&&e.message||e);}finally{beatBusy=false;} },8000); beatTimer.unref();
+  for(;;){ const now=Date.now(); try{
+    if(now-lastScan>15000||registry.length===0){registry=await scanWorkspace();lastScan=now;}
+    if(now-lastBeat>10000&&!beatBusy){beatBusy=true;try{await heartbeat(registry);lastBeat=Date.now();}finally{beatBusy=false;}}
+    if(heartbeatError) throw heartbeatError;
+    const polled=await requestJson(HUB+"/api/executors/"+encodeURIComponent(EXECUTOR_ID)+"/poll",{waitMs:20000,identity:IDENTITY});
+    if(polled&&polled.job){ try{
+      if(heartbeatError) throw heartbeatError;
+      registry=await validateJob(polled.job);
+      if(heartbeatError) throw heartbeatError;
+      const result=await execute(registry,polled.job); await complete(polled.job,result,null);
+    }catch(e){ await complete(polled.job,null,e); } }
+  }catch(e){ console.error("[JK worker]",e&&e.message||e); await sleep(3000); } }
+}
 main().catch(e=>{console.error(e);process.exitCode=1;});
 `;

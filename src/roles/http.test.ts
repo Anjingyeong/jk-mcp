@@ -3,10 +3,14 @@ import type { AddressInfo } from "node:net";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CONTROL_CENTER_HTML } from "../control-center/ui.js";
+import { buildActiveRoleContext } from "./roles.js";
 import type { ToolContext } from "../types.js";
 import { createHttpServer, defaultHttpServerConfig } from "../server/http.js";
 import { recordExecutorHeartbeat } from "../executors/broker.js";
+import { EXECUTOR_PROTOCOL_VERSION, TARGET_CAPABILITY } from "../executors/target-protocol.js";
 
 async function getFreePort(): Promise<number> {
   const server = createNodeServer();
@@ -91,13 +95,57 @@ afterEach(async () => {
 });
 
 describe("local JK role management API", () => {
+  it("sets default through the UI request", async () => {
+    // Given the shipped UI functions and an isolated real role HTTP server.
+    expect(app).not.toBeNull();
+    if (!app) throw new Error("Role HTTP test server was not started");
+    const { baseUrl } = app;
+    const functions = CONTROL_CENTER_HTML.match(
+      /^  async function (?:api|loadProjectContext|setDefault)\([\s\S]*?(?=^  (?:async )?function )/gm,
+    );
+    expect(functions).toHaveLength(3);
+    if (!functions) throw new Error("Role UI functions were not found");
+    const state = { selectedProjectId: "proj", roleContext: null };
+    const requests: Array<{ path: string; method: string; status: number }> = [];
+
+    // When the actual handler posts its request and reloads the project context.
+    await runInNewContext(`${functions.join("\n")}\nsetDefault(roleId);`, {
+      state,
+      roleId: "builder",
+      fetch: async (requestPath: string, options?: RequestInit) => {
+        const response = await fetch(new URL(requestPath, baseUrl), {
+          ...options,
+          signal: AbortSignal.timeout(5000),
+        });
+        requests.push({ path: requestPath, method: options?.method ?? "GET", status: response.status });
+        expect(response.status, requestPath).toBe(200);
+        return response;
+      },
+      render: () => undefined,
+      toast: () => undefined,
+    });
+
+    // Then both durable state and the refreshed UI context contain the choice.
+    expect(requests).toContainEqual({
+      path: "/api/jk/projects/proj/default-role", method: "POST", status: 200,
+    });
+    const storedContext = await buildActiveRoleContext(makeCtx(stateDir, projectRoot), "proj");
+    expect(storedContext.defaultRoleId).toBe("builder");
+    expect(state.roleContext).toMatchObject({ defaultRoleId: "builder", selectionSource: "project-default" });
+  });
+
   it("collapses a remote executor mirror that aliases the same logical project", async () => {
     await recordExecutorHeartbeat(stateDir, {
+      role: "worker",
+      protocolVersion: EXECUTOR_PROTOCOL_VERSION,
       executorId: "windows-main",
+      instanceId: "role-http-worker",
+      os: "win32",
+      arch: "x64",
       label: "Windows PC",
       platform: "win32/x64",
       workspaceRoot: "C:\\JK",
-      capabilities: ["code_search"],
+      capabilities: [TARGET_CAPABILITY, "code_search"],
       projects: [{
         projectId: "workspace-root",
         name: "workspace-root",

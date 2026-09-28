@@ -128,7 +128,7 @@ export async function resolveWindowPoint(appName: string, xRel: number, yRel: nu
   };
 }
 
-/** Click an absolute screen point. Prefers the native `chatgpt2codex-ax`
+/** Click an absolute screen point. Prefers the native `jk-ax`
  * helper's CGEvent-based synthesis (more reliable against Electron/Chromium
  * apps than AppleScript UI scripting) and falls back to the existing
  * osascript "click at" primitive when the helper is unavailable or fails. */
@@ -214,12 +214,12 @@ export async function typeText(appName: string, text: string): Promise<void> {
     tell application "System Events"
       tell process ${appleScriptString(appName)}
         set frontmost to true
-        keystroke (system attribute "CHATGPT2CODEX_CTL_TYPE_TEXT")
+        keystroke (system attribute "JK_CTL_TYPE_TEXT")
       end tell
     end tell
     `,
     ],
-    { CHATGPT2CODEX_CTL_TYPE_TEXT: text },
+    { JK_CTL_TYPE_TEXT: text },
   );
 }
 
@@ -258,8 +258,8 @@ export interface AxResolveTarget {
 }
 
 // ---------------------------------------------------------------------------
-// AX semantic targeting: native `chatgpt2codex-ax` helper (preferred, ships
-// inside the signed .app bundle at Contents/MacOS/chatgpt2codex-ax, built by
+// AX semantic targeting: native `jk-ax` helper (preferred, ships
+// inside the signed .app bundle at Contents/MacOS/jk-ax, built by
 // the former macOS desktop packaging helper)
 // with an osascript/System Events read-only fallback for source/dev runs
 // where the helper hasn't been built. Resolve is always side-effect free;
@@ -269,16 +269,17 @@ export interface AxResolveTarget {
 
 let cachedHelperPath: string | null | undefined;
 
-/** Locate the bundled `chatgpt2codex-ax` helper relative to this compiled
- * module (dist/control/mac-input.js -> Contents/Resources/chatgpt2codex/dist/control
- * -> up 4 -> Contents/MacOS/chatgpt2codex-ax). Returns null (cached) when not
+/** Locate the bundled `jk-ax` helper relative to this compiled
+ * module (dist/control/mac-input.js -> Contents/Resources/jk/dist/control
+ * -> up 4 -> Contents/MacOS/jk-ax). Returns null (cached) when not
  * running from inside the packaged app, e.g. source/dev/test runs. */
 function resolveHelperPath(): string | null {
   if (cachedHelperPath !== undefined) return cachedHelperPath;
   try {
     const here = path.dirname(fileURLToPath(import.meta.url));
-    const candidate = path.join(here, "..", "..", "..", "..", "MacOS", "chatgpt2codex-ax");
-    cachedHelperPath = existsSync(candidate) ? candidate : null;
+    const directory = path.join(here, "..", "..", "..", "..", "MacOS");
+    cachedHelperPath = ["jk-ax", "chatgpt2codex-ax"]
+      .map((name) => path.join(directory, name)).find((candidate) => existsSync(candidate)) ?? null;
   } catch {
     cachedHelperPath = null;
   }
@@ -299,7 +300,7 @@ function runHelper(helperPath: string, subcommand: string, payload: Record<strin
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`chatgpt2codex-ax ${subcommand} exited ${code}: ${stderr.trim()}`));
+        reject(new Error(`jk-ax ${subcommand} exited ${code}: ${stderr.trim()}`));
         return;
       }
       try {
@@ -379,7 +380,7 @@ async function resolveAxElementViaSystemEvents(appName: string, target: AxResolv
  * side effect (no activate, no click, no focus change). Used by
  * src/control/tools.ts to build the human-readable dry-run approval preview
  * before a control action is ever queued for approval. Prefers the native
- * `chatgpt2codex-ax` helper (works even against Electron/Chromium apps whose
+ * `jk-ax` helper (works even against Electron/Chromium apps whose
  * AX tree is otherwise empty) and falls back to a read-only System Events
  * query when the helper isn't present (source/dev runs). */
 export async function resolveAxElement(appName: string, target: AxResolveTarget): Promise<ResolvedTargetPreview> {
@@ -464,7 +465,7 @@ export async function setAxValue(appName: string, target: AxResolveTarget, text:
 
 // ---------------------------------------------------------------------------
 // Live permission preflight: surfaces the real Accessibility/Screen
-// Recording trust state so callers (executor.ts, `chatgpt2codex control
+// Recording trust state so callers (executor.ts, `jk control
 // preflight`) can report a clear reason instead of a control action silently
 // failing partway through. Only the native helper (running inside the
 // signed .app, which is what actually needs/holds the TCC grants) can answer
@@ -503,6 +504,6 @@ export async function preflightPermissions(): Promise<PermissionPreflightResult>
     accessibilityTrusted: false,
     screenRecordingAllowed: false,
     source: "unavailable",
-    reason: "native chatgpt2codex-ax helper not found (dev/source run); permission state cannot be determined outside the packaged app",
+    reason: "native jk-ax helper not found (dev/source run); permission state cannot be determined outside the packaged app",
   };
 }

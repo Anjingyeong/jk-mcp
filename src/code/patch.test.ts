@@ -32,7 +32,7 @@ describe("applyPatch", () => {
     // Confirm nothing was actually written into the project's parent
     // directory (the temp-file naming pattern the commit loop uses).
     const parentEntries = await fs.readdir(path.dirname(root));
-    expect(parentEntries.some((name) => name.startsWith(".chatgpt2codex.tmp."))).toBe(false);
+    expect(parentEntries.some((name) => name.startsWith(".jk.tmp."))).toBe(false);
   });
 
   it("applies an Add File operation, creating the new file", async () => {

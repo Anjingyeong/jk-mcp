@@ -23,6 +23,7 @@ const PROJECT_MARKER_FILES = [
   "go.mod",
   "Cargo.toml",
   "requirements.txt",
+  ".jk",
   ".chatgpt2codex",
 ];
 
@@ -111,7 +112,9 @@ function slugify(name: string): string {
  * folders) and build registry entries (PRD §8.1 workspace_list_projects,
  * §10 registry shape).
  */
-export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[]> {
+type WorkspaceScanOptions = { readonly includeGitMetadata?: boolean };
+
+export async function scanWorkspace(root: string, options: WorkspaceScanOptions = {}): Promise<ProjectRegistryEntry[]> {
   let dirents: import("node:fs").Dirent[];
   try {
     dirents = await fs.readdir(root, { withFileTypes: true });
@@ -132,8 +135,8 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
     if (!hasMarker) return;
 
     const [branch, dirty, packageHints, packageName, hasAgentsMd, hasCodeBrain] = await Promise.all([
-      isGit ? getBranch(dir) : Promise.resolve(undefined),
-      isGit ? getDirty(dir) : Promise.resolve(undefined),
+      isGit && options.includeGitMetadata !== false ? getBranch(dir) : Promise.resolve(undefined),
+      isGit && options.includeGitMetadata !== false ? getDirty(dir) : Promise.resolve(undefined),
       detectPackageHints(dir),
       getPackageProjectName(dir),
       pathExists(path.join(dir, "AGENTS.md")).then(
@@ -226,15 +229,16 @@ export function nestedProjectRoots(
 /**
  * Scan the configured workspace and, only for a source/development JK runtime,
  * also expose JK's own checkout as a separately leased project. This keeps
- * self-maintenance available when the launcher workspace is a selected app,
- * without allowing arbitrary paths outside the workspace.
+ * self-maintenance available when the launcher workspace is a selected app
+ * such as CleanTube, without allowing arbitrary paths outside the workspace.
  */
 export async function scanWorkspaceWithRuntimeSelf(
   root: string,
   runtimeRoot = process.env.JK_RUNTIME_ROOT,
   runtimeMode = process.env.JK_RUNTIME_MODE,
+  options: WorkspaceScanOptions = {},
 ): Promise<ProjectRegistryEntry[]> {
-  const entries = await scanWorkspace(root);
+  const entries = await scanWorkspace(root, options);
   if (runtimeMode !== "development" || !runtimeRoot) return entries;
 
   const resolvedRuntimeRoot = path.resolve(runtimeRoot);
@@ -242,7 +246,7 @@ export async function scanWorkspaceWithRuntimeSelf(
 
   let runtimeEntries: ProjectRegistryEntry[];
   try {
-    runtimeEntries = await scanWorkspace(resolvedRuntimeRoot);
+    runtimeEntries = await scanWorkspace(resolvedRuntimeRoot, options);
   } catch {
     return entries;
   }
@@ -301,7 +305,9 @@ export function findProject(
   if (q.projectId) {
     const found = entries.find((e) => e.projectId === q.projectId);
     if (found) return { ok: true, entry: found };
-    return { ok: false, reason: "not_found" };
+    if (!q.name || q.name.trim().length === 0) {
+      return { ok: false, reason: "not_found" };
+    }
   }
 
   if (!q.name || q.name.trim().length === 0) {

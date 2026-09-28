@@ -24,7 +24,24 @@ export interface TaskExecutionSnapshot {
 }
 
 export interface MassUlwExecutionStatus {
+  createdAt: number;
+  updatedAt: number;
   currentWave: number | null;
+  waves: Array<{
+    index: number;
+    laneIds: string[];
+    status: "planned" | "in-flight" | "completed" | "failed";
+    completedAt: number | null;
+  }>;
+  lanes: Array<{
+    id: string;
+    task: string;
+    status: "planned" | "in-flight" | "completed" | "failed" | "blocked";
+    dependsOn: string[];
+    attempts: number;
+    wave: number | null;
+    completedAt: number | null;
+  }>;
   runningLanes: string[];
   readonly failedLanes: readonly string[];
   readonly blockedLanes: readonly string[];
@@ -114,7 +131,28 @@ async function readMassUlwExecutionStatus(
   if (!parsed.success || parsed.data.loopId !== executionId) return null;
   const document = parsed.data;
   return {
+    createdAt: document.createdAt,
+    updatedAt: document.updatedAt,
     currentWave: document.currentWave,
+    waves: document.waves.map((wave) => ({
+      index: wave.index,
+      laneIds: [...wave.laneIds],
+      status: wave.status,
+      completedAt: wave.completedAt ?? null,
+    })),
+    lanes: document.plan.lanes.map((lane) => {
+      const state = document.lanes[lane.id];
+      const wave = document.waves.find((candidate) => candidate.laneIds.includes(lane.id));
+      return {
+        id: lane.id,
+        task: lane.task,
+        status: state?.status ?? "planned",
+        dependsOn: [...lane.dependsOn],
+        attempts: state?.attempts ?? 0,
+        wave: wave?.index ?? null,
+        completedAt: state?.completedAt ?? null,
+      };
+    }),
     runningLanes: document.plan.lanes
       .filter((lane) => document.lanes[lane.id]?.status === "in-flight")
       .map((lane) => lane.id),

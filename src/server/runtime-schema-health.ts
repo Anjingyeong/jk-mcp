@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
-export const REQUIRED_GOAL_LOOP_INPUT_FIELDS = ["safety", "executionProfile", "fanoutCandidates"] as const;
+export const REQUIRED_GOAL_LOOP_INPUT_FIELDS = ["safety", "executionProfile", "fanoutCandidates", "reviewVerdict"] as const;
 
 export interface RuntimeSchemaManifest {
   version: 1;
@@ -33,6 +34,47 @@ export interface RuntimeSchemaHealth extends RegisteredToolSchemaHealth {
   expectedSourceFingerprint: string | null;
   buildFingerprint: string | null;
   expectedBuildFingerprint: string | null;
+  startupBuildFingerprint: string | null;
+  startupExpectedBuildFingerprint: string | null;
+  startupManifestFingerprint: string | null;
+  currentManifestFingerprint: string | null;
+  startupCapturedAt: string;
+}
+
+const requiredModules = [
+  "server/tools", "server/actions", "server/runtime-schema-health", "control-center/http",
+  "policy/local-approvals", "policy/approvals", "policy/local-approval-bundles",
+  "policy/local-shell-jobs", "orchestration/mass-ulw-lock",
+] as const;
+const manifestFiles = z.array(z.string().regex(/^(?!.*(?:^|\/)\.{1,2}(?:\/|$))[a-zA-Z0-9_./-]+$/u))
+  .nonempty().refine((files) => files.every((file) => !file.startsWith("/") && !file.includes("//")) && new Set(files).size === files.length);
+const manifestSchema = z.object({
+  version: z.literal(1), generatedAt: z.string().datetime(),
+  sourceFiles: manifestFiles.refine((files) => requiredModules.every((file) => files.includes(`src/${file}.ts`))),
+  buildFiles: manifestFiles.refine((files) => requiredModules.every((file) => files.includes(`${file}.js`))),
+  sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+  buildFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+  requiredGoalLoopInputFields: z.array(z.string()).refine((fields) =>
+    REQUIRED_GOAL_LOOP_INPUT_FIELDS.every((field) => fields.includes(field)) && new Set(fields).size === fields.length),
+});
+
+async function readManifest(file: string) {
+  let fingerprint: string | null = null;
+  try {
+    const bytes = await readFile(file);
+    fingerprint = sha256(bytes);
+    const parsed = manifestSchema.parse(JSON.parse(bytes.toString("utf8")));
+    const manifest = Object.freeze({ ...parsed,
+      sourceFiles: Object.freeze([...parsed.sourceFiles]), buildFiles: Object.freeze([...parsed.buildFiles]),
+      requiredGoalLoopInputFields: Object.freeze([...parsed.requiredGoalLoopInputFields]),
+    });
+    return { manifest, fingerprint, missing: false, error: null };
+  } catch (error) {
+    return { manifest: null, fingerprint,
+      missing: error instanceof Error && "code" in error && error.code === "ENOENT",
+      error: `manifest evidence unavailable or invalid: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 let registeredSchemaHealth: RegisteredToolSchemaHealth = {
@@ -112,7 +154,7 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-async function fingerprintFiles(root: string, files: string[]): Promise<string | null> {
+async function fingerprintFiles(root: string, files: readonly string[]): Promise<string | null> {
   try {
     const entries: string[] = [];
     for (const relative of files) {
@@ -154,7 +196,7 @@ async function findSourceRoot(): Promise<string | null> {
   return null;
 }
 
-async function findManifest(): Promise<{ manifest: RuntimeSchemaManifest; path: string; distRoot: string } | null> {
+async function findManifest() {
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
     path.resolve(moduleDir, "..", "runtime-schema-manifest.json"),
@@ -167,31 +209,46 @@ async function findManifest(): Promise<{ manifest: RuntimeSchemaManifest; path: 
     path.join(process.cwd(), "dist", "runtime-schema-manifest.json"),
   ];
   for (const candidate of [...new Set(candidates)]) {
-    try {
-      const parsed = JSON.parse(await readFile(candidate, "utf8")) as RuntimeSchemaManifest;
-      if (parsed.version !== 1 || !Array.isArray(parsed.sourceFiles) || !Array.isArray(parsed.buildFiles)) continue;
-      const parent = path.dirname(candidate);
-      const distRoot = path.basename(parent).toLowerCase() === "dist" ? parent : path.join(parent, "dist");
-      return { manifest: parsed, path: candidate, distRoot };
-    } catch {
-      // Try the next manifest candidate.
-    }
+    const evidence = await readManifest(candidate);
+    if (evidence.missing) continue;
+    const parent = path.dirname(candidate);
+    const distRoot = path.basename(parent).toLowerCase() === "dist" ? parent : path.join(parent, "dist");
+    // A present but invalid higher-priority manifest must not be hidden by a fallback.
+    return { ...evidence, path: candidate, distRoot };
   }
   return null;
 }
 
+async function readFingerprints(info: Awaited<ReturnType<typeof findManifest>>, sourceRoot: string | null) {
+  const [sourceFingerprint, buildFingerprint] = await Promise.all([
+    info?.manifest && sourceRoot ? fingerprintFiles(sourceRoot, info.manifest.sourceFiles) : null,
+    info?.manifest ? fingerprintFiles(info.distRoot, info.manifest.buildFiles) : null,
+  ]);
+  return { sourceFingerprint, buildFingerprint };
+}
+
+// Attests bytes observed during module startup, not loaded functions or external
+// dependencies. Await before import completes, even when no health request occurs.
+const startup = await (async () => {
+  const capturedAt = new Date().toISOString();
+  const info = await findManifest();
+  const sourceRoot = await findSourceRoot();
+  return Object.freeze({ capturedAt, info: info ? Object.freeze(info) : null, sourceRoot,
+    ...await readFingerprints(info, sourceRoot) });
+})();
+
 export async function getRuntimeSchemaHealth(): Promise<RuntimeSchemaHealth> {
   const registered = getRegisteredToolSchemaHealth();
   const reasons: string[] = [];
-  const manifestInfo = await findManifest();
-  const sourceRoot = await findSourceRoot();
-
-  const currentSourceFingerprint = sourceRoot && manifestInfo
-    ? await fingerprintFiles(sourceRoot, manifestInfo.manifest.sourceFiles)
+  const manifestInfo = startup.info
+    ? { ...startup.info, ...await readManifest(startup.info.path) }
     : null;
-  const currentBuildFingerprint = manifestInfo
-    ? await fingerprintFiles(manifestInfo.distRoot, manifestInfo.manifest.buildFiles)
-    : null;
+  const sourceRoot = startup.sourceRoot;
+  const { sourceFingerprint: currentSourceFingerprint, buildFingerprint: currentBuildFingerprint } =
+    await readFingerprints(manifestInfo, sourceRoot);
+  const verifiable = Boolean(startup.info?.manifest && startup.buildFingerprint &&
+    (!sourceRoot || startup.sourceFingerprint) && manifestInfo?.manifest && currentBuildFingerprint &&
+    (!sourceRoot || currentSourceFingerprint));
 
   // A fresh HTTP runtime may not have constructed an MCP server yet, so the
   // in-memory tools/list cache can legitimately be empty during bootstrap.
@@ -200,25 +257,38 @@ export async function getRuntimeSchemaHealth(): Promise<RuntimeSchemaHealth> {
   if (registered.toolSchemaFingerprint && !registered.toolSchemaCompatible) {
     reasons.push(`registered goal_loop schema missing: ${registered.missingGoalLoopInputFields.join(", ")}`);
   }
-  if (manifestInfo && currentBuildFingerprint && currentBuildFingerprint !== manifestInfo.manifest.buildFingerprint) {
-    reasons.push("running build files do not match the build manifest fingerprint");
+  if (manifestInfo?.manifest && currentBuildFingerprint && currentBuildFingerprint !== manifestInfo.manifest.buildFingerprint) {
+    reasons.push("current build files do not match the build manifest fingerprint");
   }
-  if (manifestInfo && sourceRoot && currentSourceFingerprint && currentSourceFingerprint !== manifestInfo.manifest.sourceFingerprint) {
+  if (manifestInfo?.manifest && currentSourceFingerprint && currentSourceFingerprint !== manifestInfo.manifest.sourceFingerprint) {
     reasons.push("source schema files changed after this runtime build was produced");
   }
+  if (startup.info?.manifest && (
+    (startup.buildFingerprint && startup.buildFingerprint !== startup.info.manifest.buildFingerprint) ||
+    (startup.sourceFingerprint && startup.sourceFingerprint !== startup.info.manifest.sourceFingerprint)
+  )) reasons.push("startup files did not match the startup manifest");
+  if (startup.info && manifestInfo && (
+    startup.info.fingerprint !== manifestInfo.fingerprint || startup.buildFingerprint !== currentBuildFingerprint ||
+    startup.sourceFingerprint !== currentSourceFingerprint
+  )) reasons.push("runtime evidence changed since module startup; controlled reload required");
 
   const mismatch = reasons.length > 0;
-  const verifiable = Boolean(manifestInfo) || Boolean(registered.toolSchemaFingerprint);
+  if (!verifiable) reasons.push(startup.info?.error ?? manifestInfo?.error ?? "startup or current file evidence is incomplete");
   return {
     ...registered,
-    status: mismatch ? "mismatch" : verifiable ? "ok" : "unverified",
-    releaseBlocked: mismatch,
+    status: !verifiable ? "unverified" : mismatch ? "mismatch" : "ok",
+    releaseBlocked: !verifiable || mismatch,
     reasons,
     manifestPath: manifestInfo?.path ?? null,
     sourceRoot,
     sourceFingerprint: currentSourceFingerprint,
-    expectedSourceFingerprint: manifestInfo?.manifest.sourceFingerprint ?? null,
+    expectedSourceFingerprint: manifestInfo?.manifest?.sourceFingerprint ?? null,
     buildFingerprint: currentBuildFingerprint,
-    expectedBuildFingerprint: manifestInfo?.manifest.buildFingerprint ?? null,
+    expectedBuildFingerprint: manifestInfo?.manifest?.buildFingerprint ?? null,
+    startupBuildFingerprint: startup.buildFingerprint,
+    startupExpectedBuildFingerprint: startup.info?.manifest?.buildFingerprint ?? null,
+    startupManifestFingerprint: startup.info?.fingerprint ?? null,
+    currentManifestFingerprint: manifestInfo?.fingerprint ?? null,
+    startupCapturedAt: startup.capturedAt,
   };
 }

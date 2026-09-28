@@ -112,6 +112,9 @@ describe("computer_screenshot full-screen sensitive-app gate", () => {
   });
 
   it("allows a full-screen capture when the live frontmost app is not sensitive", async () => {
+    // An active control lease now implies ChatGPT exposure (session-derived),
+    // which refuses full-screen capture. Pin local-only mode explicitly.
+    process.env.CHATGPT2CODEX_CONTROL_CHATGPT = "0";
     vi.mocked(macInput.resolveFrontmostApp).mockResolvedValue("TextEdit");
     const ctx = makeCtx(stateDir, projectRoot);
     const tools = await registeredTools(ctx);

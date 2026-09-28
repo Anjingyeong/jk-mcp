@@ -12,6 +12,7 @@ import {
   type MassUlwWorkspaceLane,
 } from "./mass-ulw-workspace.js";
 import { rmResilient } from "./mass-ulw-runner-fixtures.js";
+import { validateLanes } from "./mass-ulw-workspace-changes.js";
 
 const execFileAsync = promisify(execFile);
 // Real git clone/integrate cycles take 10-20s each; under parallel CI load
@@ -34,6 +35,7 @@ async function makeRepository(): Promise<string> {
   await git(root, ["config", "user.email", "workspace@example.test"]);
   await fs.mkdir(path.join(root, "src", "a"), { recursive: true });
   await fs.mkdir(path.join(root, "src", "b"), { recursive: true });
+  await fs.writeFile(path.join(root, ".gitignore"), "node_modules/\n");
   await fs.writeFile(path.join(root, "base.txt"), "base\n");
   await fs.writeFile(path.join(root, "src", "a", "existing.txt"), "a0\n");
   await fs.writeFile(path.join(root, "src", "b", "existing.txt"), "b0\n");
@@ -74,6 +76,43 @@ afterEach(async () => {
 });
 
 describe("Mass ULW workspace isolation", () => {
+  it("native-evolution R4 preserves normalized dependencies and defaults legacy lanes to independent", () => {
+    const lanes = [
+      { id: " A ", writeScopes: ["src/a"], dependsOn: [" Z ", "Z"] },
+      { id: "Z", writeScopes: ["src/z"] },
+    ];
+    expect(validateLanes(lanes)).toEqual([
+      { id: "A", writeScopes: ["src/a"], dependsOn: ["Z"] },
+      { id: "Z", writeScopes: ["src/z"], dependsOn: [] },
+    ]);
+    expect(lanes[0]?.dependsOn).toEqual([" Z ", "Z"]);
+  });
+
+  it.each([
+    [{ id: "A", writeScopes: [], dependsOn: ["missing"] }],
+    [{ id: "A", writeScopes: [], dependsOn: ["A"] }],
+    [{ id: "A", writeScopes: [], dependsOn: ["Z"] }, { id: "Z", writeScopes: [], dependsOn: ["A"] }],
+  ])("native-evolution R4 rejects invalid dependency graphs %#", (...lanes) => {
+    expect(() => validateLanes(lanes)).toThrow();
+  });
+
+  it("reuses ignored installed dependencies in lane and merged checkouts", async () => {
+    const root = await makeRepository();
+    const dependencyRoot = path.join(root, "node_modules");
+    await fs.mkdir(path.join(dependencyRoot, ".bin"), { recursive: true });
+    await fs.writeFile(path.join(dependencyRoot, ".bin", "fixture-tool"), "fixture\n");
+    const workspace = await create(root, [{ id: "a", writeScopes: ["src/a"] }]);
+    const laneRoot = workspace.lanes[0]!.root;
+    const normalize = async (value: string) => path.normalize(await fs.realpath(value)).toLowerCase();
+    expect(await normalize(path.join(laneRoot, "node_modules"))).toBe(await normalize(dependencyRoot));
+    expect(await git(laneRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+
+    await workspace.integrate();
+    const mergedRoot = path.join(workspace.privateRoot, "merged");
+    expect(await normalize(path.join(mergedRoot, "node_modules"))).toBe(await normalize(dependencyRoot));
+    expect(await git(mergedRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+  });
+
   it("requires a repository with a local HEAD", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "mass-ulw-test-"));
     cleanupRoots.add(root);

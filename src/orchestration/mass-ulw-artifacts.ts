@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rm } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { git, gitBytes } from "./mass-ulw-workspace-repository.js";
@@ -34,7 +35,7 @@ async function atomicWrite(path: string, bytes: string | Buffer): Promise<void> 
     await handle.close();
   }
   try {
-    await rename(temporary, path);
+    await renameWithRetry(temporary, path);
   } catch (error) {
     await rm(temporary, { force: true });
     throw error;

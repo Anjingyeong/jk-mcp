@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { DomainError, ErrorCode } from "../types.js";
 import { resolveInProject } from "../policy/paths.js";
-import { lineHashes, rangeHash } from "../util/hash.js";
+import { lineHashes, rangeHash, sha256Hex } from "../util/hash.js";
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB (PRD §8.3 FILE_TOO_LARGE)
 
@@ -24,6 +24,8 @@ export async function readSlice(
   content: string;
   lineHashes: string[];
   fileHash: string;
+  /** SHA-256 of the exact raw bytes used to produce this slice. */
+  fullFileHash: string;
   eol: string;
 }> {
   const abs = await resolveInProject(root, rel, { allowSymlink: false });
@@ -40,6 +42,7 @@ export async function readSlice(
   }
 
   const buf = await fs.readFile(abs);
+  const fullFileHash = sha256Hex(buf);
   const raw = buf.toString("utf8");
   const eol = detectEol(raw);
   const normalized = raw.replace(/\r\n/g, "\n");
@@ -61,6 +64,7 @@ export async function readSlice(
       content: "",
       lineHashes: [],
       fileHash: rangeHash(""),
+      fullFileHash,
       eol,
     };
   }
@@ -79,6 +83,7 @@ export async function readSlice(
     content: numbered,
     lineHashes: lineHashes(rangeText),
     fileHash: rangeHash(rangeText),
+    fullFileHash,
     eol,
   };
 }

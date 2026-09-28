@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import { DomainError, ErrorCode } from "../types.js";
 import { sendJkPush } from "../notifications/ntfy.js";
 import {
   consumeLocalShellTaskBundle,
   localShellBundleFingerprint,
   localShellTaskBundleId,
+  localShellTaskBundleRecordId,
+  withLocalShellExactApprovalLock,
   writeLocalShellTaskBundle,
 } from "./local-approval-bundles.js";
 import { redact } from "./secrets.js";
@@ -36,6 +39,7 @@ export interface LocalShellApprovalRecord {
   expiresAt: number;
   status: LocalShellApprovalStatus;
   resolvedAt?: number;
+  resolvedDecision?: LocalShellApprovalDecision;
   scopeKey?: string;
   scopeLabel?: string;
   scopeTtlMs?: number;
@@ -45,6 +49,13 @@ export interface LocalShellApprovalRecord {
   bundleTtlMs?: number;
   bundleFingerprint?: string;
 }
+
+interface PendingApprovalCacheEntry {
+  revision: string;
+  records: LocalShellApprovalRecord[];
+}
+
+const pendingApprovalCache = new Map<string, PendingApprovalCacheEntry>();
 
 export interface LocalShellApprovalScope {
   key: string;
@@ -100,6 +111,47 @@ interface LocalShellSupervisedRecord {
 
 function approvalsDir(stateDir: string): string {
   return path.join(stateDir, "approvals", "shell");
+}
+
+function archivedApprovalsDir(stateDir: string): string {
+  return path.join(approvalsDir(stateDir), "archive");
+}
+
+async function approvalDirectoryRevision(stateDir: string): Promise<string> {
+  try {
+    const info = await fs.stat(approvalsDir(stateDir));
+    return String(info.mtimeMs);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
+function invalidatePendingApprovalCache(stateDir: string): void {
+  pendingApprovalCache.delete(stateDir);
+}
+
+async function archiveExpiredApprovalRecord(stateDir: string, record: LocalShellApprovalRecord): Promise<void> {
+  const archiveDir = archivedApprovalsDir(stateDir);
+  await fs.mkdir(archiveDir, { recursive: true, mode: DIR_MODE });
+  await fs.chmod(archiveDir, DIR_MODE).catch(() => undefined);
+  const target = path.join(archiveDir, `${record.id}.${record.createdAt}.${randomUUID()}.json`);
+  try {
+    await fs.rename(recordPath(stateDir, record.id), target);
+    invalidatePendingApprovalCache(stateDir);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+async function archiveExpiredApprovalRecordsInBackground(
+  stateDir: string,
+  records: LocalShellApprovalRecord[],
+): Promise<void> {
+  for (const record of records) {
+    await archiveExpiredApprovalRecord(stateDir, record).catch(() => undefined);
+  }
 }
 
 function scopesDir(stateDir: string): string {
@@ -203,13 +255,25 @@ function commandGrantKey(input: Pick<LocalShellApprovalInput, "command" | "needs
     .digest("hex");
 }
 
+const supervisedRecordSchema = z.object({
+  id: z.string().regex(APPROVAL_ID_RE), projectId: z.string(), cwd: z.string().nullable(),
+  taskKey: z.string(), taskLabel: z.string(), verificationOnly: z.boolean().optional(),
+  createdAt: z.number().finite().nonnegative(), expiresAt: z.number().finite(),
+}).refine((record) => record.expiresAt > record.createdAt && record.expiresAt - record.createdAt <= SUPERVISED_TTL_MS
+  && record.id === createHash("sha256").update(JSON.stringify({ projectId: record.projectId, cwd: record.cwd, taskKey: record.taskKey })).digest("hex"));
+
 async function readSupervisedRecord(stateDir: string, id: string): Promise<LocalShellSupervisedRecord | null> {
   if (!APPROVAL_ID_RE.test(id)) return null;
   try {
-    const parsed = JSON.parse(await fs.readFile(supervisedRecordPath(stateDir, id), "utf8")) as LocalShellSupervisedRecord;
-    return parsed && parsed.id === id ? parsed : null;
-  } catch {
-    return null;
+    const parsed = supervisedRecordSchema.parse(JSON.parse(await fs.readFile(supervisedRecordPath(stateDir, id), "utf8")));
+    if (parsed.id !== id) throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid supervised approval file identity");
+    return parsed;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    if (error instanceof SyntaxError || error instanceof z.ZodError) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid persisted supervised approval");
+    }
+    throw error;
   }
 }
 
@@ -270,13 +334,24 @@ export async function hasActiveTaskNetworkApproval(
     && record.taskKey === taskKey;
 }
 
+const scopeRecordSchema = z.object({
+  id: z.string().regex(APPROVAL_ID_RE), projectId: z.string(), cwd: z.string().nullable(),
+  scopeKey: z.string(), scopeLabel: z.string(), createdAt: z.number().finite().nonnegative(), expiresAt: z.number().finite(),
+}).refine((record) => record.expiresAt > record.createdAt && record.expiresAt - record.createdAt <= MAX_SCOPE_TTL_MS
+  && record.id === scopeId({ projectId: record.projectId, cwd: record.cwd ?? undefined, scope: { key: record.scopeKey, label: record.scopeLabel } }));
+
 async function readScopeRecord(stateDir: string, id: string): Promise<LocalShellApprovalScopeRecord | null> {
   if (!APPROVAL_ID_RE.test(id)) return null;
   try {
-    const parsed = JSON.parse(await fs.readFile(scopeRecordPath(stateDir, id), "utf8")) as LocalShellApprovalScopeRecord;
-    return parsed && parsed.id === id ? parsed : null;
-  } catch {
-    return null;
+    const parsed = scopeRecordSchema.parse(JSON.parse(await fs.readFile(scopeRecordPath(stateDir, id), "utf8")));
+    if (parsed.id !== id) throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid scoped approval file identity");
+    return parsed;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    if (error instanceof SyntaxError || error instanceof z.ZodError) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid persisted scoped approval");
+    }
+    throw error;
   }
 }
 
@@ -301,13 +376,46 @@ async function hasActiveScope(stateDir: string, input: LocalShellApprovalInput):
   return record.projectId === input.projectId && record.scopeKey === input.scope.key && record.cwd === (input.cwd ?? null);
 }
 
+const approvalRecordSchema = z.object({
+  id: z.string().regex(APPROVAL_ID_RE), projectId: z.string(), commandPreview: z.string(),
+  cwd: z.string().nullable(), reason: z.string().nullable(), taskIdentity: z.string().optional(),
+  workSessionId: z.string().nullable().optional(), needsNetwork: z.boolean(), destructive: z.boolean(),
+  createdAt: z.number().finite().nonnegative(), expiresAt: z.number().finite(),
+  status: z.enum(["pending", "approved", "denied"]), resolvedAt: z.number().finite().optional(),
+  resolvedDecision: z.enum(["approve", "supervise", "deny"]).optional(),
+  scopeKey: z.string().optional(), scopeLabel: z.string().optional(),
+  scopeTtlMs: z.number().finite().min(60_000).max(MAX_SCOPE_TTL_MS).optional(),
+  bundleLabel: z.string().optional(), bundlePreviews: z.array(z.string()).optional(),
+  bundleCommandKeys: z.array(z.string().regex(APPROVAL_ID_RE)).min(1).max(20)
+    .refine((keys) => new Set(keys).size === keys.length).optional(),
+  bundleTtlMs: z.number().finite().min(60_000).max(TASK_BUNDLE_TTL_MS).optional(),
+  bundleFingerprint: z.string().regex(APPROVAL_ID_RE).optional(),
+}).passthrough().refine((record) => {
+  if (record.expiresAt <= record.createdAt) return false;
+  if (record.resolvedAt !== undefined && (record.resolvedAt < record.createdAt || record.resolvedAt >= record.expiresAt)) return false;
+  if (record.resolvedDecision !== undefined && (record.resolvedAt === undefined
+    || record.status !== (record.resolvedDecision === "deny" ? "denied" : "approved"))) return false;
+  if (record.bundleFingerprint === undefined) return record.bundleCommandKeys === undefined;
+  const taskKey = supervisedTaskKey(record);
+  return Boolean(taskKey && record.bundleCommandKeys && record.bundleLabel !== undefined
+    && record.bundleFingerprint === localShellBundleFingerprint({
+      projectId: record.projectId, cwd: record.cwd, taskKey, workSessionId: record.workSessionId ?? null,
+      commandKeys: record.bundleCommandKeys,
+    }));
+});
+
 async function readRecord(stateDir: string, id: string): Promise<LocalShellApprovalRecord | null> {
   if (!APPROVAL_ID_RE.test(id)) return null;
   try {
-    const parsed = JSON.parse(await fs.readFile(recordPath(stateDir, id), "utf8")) as LocalShellApprovalRecord;
-    return parsed && parsed.id === id ? parsed : null;
-  } catch {
-    return null;
+    const parsed = approvalRecordSchema.parse(JSON.parse(await fs.readFile(recordPath(stateDir, id), "utf8")));
+    if (parsed.id !== id) throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid approval file identity");
+    return parsed;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    if (error instanceof SyntaxError || error instanceof z.ZodError) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid persisted approval record");
+    }
+    throw error;
   }
 }
 
@@ -318,6 +426,7 @@ async function writeRecord(stateDir: string, record: LocalShellApprovalRecord): 
   await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, { mode: FILE_MODE });
   await fs.chmod(temp, FILE_MODE).catch(() => undefined);
   await fs.rename(temp, target);
+  invalidatePendingApprovalCache(stateDir);
 }
 
 function expired(record: LocalShellApprovalRecord, now = Date.now()): boolean {
@@ -328,10 +437,15 @@ export async function requestLocalShellApproval(
   stateDir: string,
   input: LocalShellApprovalInput,
 ): Promise<LocalShellApprovalRecord> {
+  return withLocalShellExactApprovalLock(stateDir, localShellApprovalId(input), () => requestLocked(stateDir, input));
+}
+
+async function requestLocked(stateDir: string, input: LocalShellApprovalInput): Promise<LocalShellApprovalRecord> {
   const id = localShellApprovalId(input);
   const current = await readRecord(stateDir, id);
+  if (current && !expired(current)) return current;
   const taskKey = supervisedTaskKey(input);
-  const workSessionId = input.workSessionId?.trim().slice(0, 160) || null;
+  const workSessionId = input.workSessionId?.trim() || null;
   const bundleEntries = taskKey && input.bundle?.entries?.length
     ? input.bundle.entries.slice(0, 20)
     : [];
@@ -353,31 +467,7 @@ export async function requestLocalShellApproval(
     ? Math.min(Math.max(input.bundle?.ttlMs ?? TASK_BUNDLE_TTL_MS, 60_000), TASK_BUNDLE_TTL_MS)
     : undefined;
 
-  if (current && !expired(current)) {
-    const currentKeys = current.bundleCommandKeys ?? [];
-    const canUpgradePendingBundle =
-      current.status === "pending" &&
-      Boolean(taskKey) &&
-      bundleEntries.length > 0 &&
-      supervisedTaskKey(current) === taskKey &&
-      (current.workSessionId ?? null) === workSessionId &&
-      bundleCommandKeys.includes(commandGrantKey(input)) &&
-      currentKeys.every((key) => bundleCommandKeys.includes(key));
-    if (canUpgradePendingBundle) {
-      const upgraded: LocalShellApprovalRecord = {
-        ...current,
-        bundleLabel: redact(input.bundle?.label ?? current.bundleLabel ?? "Task bundle").slice(0, 160),
-        bundleCommandKeys,
-        bundleFingerprint,
-        bundlePreviews,
-        bundleTtlMs,
-      };
-      await writeRecord(stateDir, upgraded);
-      return upgraded;
-    }
-    return current;
-  }
-  if (current) await fs.unlink(recordPath(stateDir, id)).catch(() => undefined);
+  if (current) await archiveExpiredApprovalRecord(stateDir, current);
 
   if (taskKey) {
     const commandKey = commandGrantKey(input);
@@ -400,7 +490,7 @@ export async function requestLocalShellApproval(
     commandPreview: redact(input.command).slice(0, 800),
     cwd: input.cwd ?? null,
     reason: input.reason ? redact(input.reason).slice(0, 400) : null,
-    ...(input.taskIdentity?.trim() ? { taskIdentity: input.taskIdentity.trim().slice(0, 240) } : {}),
+    ...(input.taskIdentity?.trim() ? { taskIdentity: input.taskIdentity.trim() } : {}),
     ...(workSessionId ? { workSessionId } : {}),
     needsNetwork: input.needsNetwork,
     destructive: input.destructive,
@@ -448,37 +538,51 @@ export async function consumeLocalShellApprovalGrant(
   stateDir: string,
   input: LocalShellApprovalInput,
 ): Promise<LocalShellApprovalGrant | null> {
+  return withLocalShellExactApprovalLock(stateDir, localShellApprovalId(input), () => consumeLocked(stateDir, input));
+}
+
+async function consumeLocked(stateDir: string, input: LocalShellApprovalInput): Promise<LocalShellApprovalGrant | null> {
   const id = localShellApprovalId(input);
   const record = await readRecord(stateDir, id);
+  if (record && (record.projectId !== input.projectId || record.cwd !== (input.cwd ?? null)
+    || (record.taskIdentity?.trim() || null) !== (input.taskIdentity?.trim() || null)
+    || (record.workSessionId ?? null) !== (input.workSessionId?.trim() || null)
+    || record.needsNetwork !== input.needsNetwork || record.destructive !== input.destructive)) return null;
   if (record?.status === "approved" && !expired(record)) {
     const source = recordPath(stateDir, id);
     const consumed = path.join(approvalsDir(stateDir), `.${id}.${randomUUID()}.consumed`);
-    try {
-      await fs.rename(source, consumed);
-      await fs.unlink(consumed).catch(() => undefined);
-      const taskKey = supervisedTaskKey(input);
-      if (record.bundleFingerprint && taskKey) {
-        await consumeLocalShellTaskBundle(stateDir, {
+    await fs.rename(source, consumed);
+    invalidatePendingApprovalCache(stateDir);
+    if (record.bundleFingerprint) {
+      try {
+        const taskKey = supervisedTaskKey(input);
+        if (!taskKey) return null;
+        const grant = await consumeLocalShellTaskBundle(stateDir, {
           projectId: input.projectId,
           cwd: input.cwd ?? null,
           taskKey,
           workSessionId: input.workSessionId?.trim() || null,
           commandKey: commandGrantKey(input),
+          expected: { approvalId: record.id, bundleFingerprint: record.bundleFingerprint, approvalCreatedAt: record.createdAt },
         });
+        return grant ? { source: "exact", ...grant } : null;
+      } finally {
+        // The marker records the decision, not a second token. Retain it for
+        // publication retries; even an exhausted bundle must not be republished.
+        await fs.rename(consumed, source);
+        invalidatePendingApprovalCache(stateDir);
       }
-      return {
-        source: "exact",
-        approvalId: record.id,
-        bundleFingerprint: record.bundleFingerprint,
-        workSessionId: record.workSessionId ?? null,
-        createdAt: record.createdAt,
-        expiresAt: record.expiresAt,
-      };
-    } catch {
-      return null;
     }
+    await fs.unlink(consumed);
+    invalidatePendingApprovalCache(stateDir);
+    return {
+      source: "exact", approvalId: record.id, workSessionId: record.workSessionId ?? null,
+      createdAt: record.createdAt, expiresAt: record.expiresAt,
+    };
   }
-  if (record && expired(record)) await fs.unlink(recordPath(stateDir, id)).catch(() => undefined);
+  if (record && expired(record)) {
+    await archiveExpiredApprovalRecord(stateDir, record);
+  }
   const taskKey = supervisedTaskKey(input);
   if (taskKey) {
     const bundleGrant = await consumeLocalShellTaskBundle(stateDir, {
@@ -504,20 +608,38 @@ export async function consumeLocalShellApproval(
 
 export async function listPendingLocalShellApprovals(stateDir: string): Promise<LocalShellApprovalRecord[]> {
   const dir = await ensureDir(stateDir);
-  const files = await fs.readdir(dir).catch(() => [] as string[]);
+  const revision = await approvalDirectoryRevision(stateDir);
+  const cached = pendingApprovalCache.get(stateDir);
+  const now = Date.now();
+  if (cached?.revision === revision) {
+    const active = cached.records.filter((record) => record.status === "pending" && !expired(record, now));
+    if (active.length !== cached.records.length) {
+      pendingApprovalCache.set(stateDir, { revision, records: active });
+    }
+    return [...active].sort((a, b) => b.createdAt - a.createdAt);
+  }
+  const files = await fs.readdir(dir);
   const records: LocalShellApprovalRecord[] = [];
+  const expiredRecords: LocalShellApprovalRecord[] = [];
   for (const file of files) {
     if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
     const id = file.slice(0, -5);
     const record = await readRecord(stateDir, id);
     if (!record) continue;
-    if (expired(record)) {
-      await fs.unlink(recordPath(stateDir, id)).catch(() => undefined);
+    if (expired(record, now)) {
+      expiredRecords.push(record);
       continue;
     }
     if (record.status === "pending") records.push(record);
   }
-  return records.sort((a, b) => b.createdAt - a.createdAt);
+  const settledRevision = await approvalDirectoryRevision(stateDir);
+  if (settledRevision === revision) {
+    pendingApprovalCache.set(stateDir, { revision: settledRevision, records });
+  } else {
+    invalidatePendingApprovalCache(stateDir);
+  }
+  if (expiredRecords.length) void archiveExpiredApprovalRecordsInBackground(stateDir, expiredRecords);
+  return [...records].sort((a, b) => b.createdAt - a.createdAt);
 }
 
 export async function resolveLocalShellApproval(
@@ -528,18 +650,29 @@ export async function resolveLocalShellApproval(
   if (!APPROVAL_ID_RE.test(id)) {
     throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Invalid approval id");
   }
+  return withLocalShellExactApprovalLock(stateDir, id, () => resolveLocked(stateDir, id, decision));
+}
+
+async function resolveLocked(
+  stateDir: string, id: string, requestedDecision: LocalShellApprovalDecision,
+): Promise<LocalShellApprovalRecord> {
   const record = await readRecord(stateDir, id);
   if (!record || expired(record)) {
-    if (record) await fs.unlink(recordPath(stateDir, id)).catch(() => undefined);
+    if (record) await archiveExpiredApprovalRecord(stateDir, record);
     throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Approval request is missing or expired");
   }
-  if (record.status !== "pending") return record;
-  const next: LocalShellApprovalRecord = {
+  // Legacy resolved markers cannot safely reconstruct authority that may have
+  // been overwritten or spent by an older binary.
+  if (record.status !== "pending" && record.resolvedDecision === undefined) return record;
+  const decision = record.resolvedDecision ?? requestedDecision;
+  const resolvedAt = record.resolvedAt ?? Date.now();
+  const next: LocalShellApprovalRecord = record.status === "pending" ? {
     ...record,
     status: decision === "deny" ? "denied" : "approved",
-    resolvedAt: Date.now(),
-  };
-  await writeRecord(stateDir, next);
+    resolvedAt,
+    resolvedDecision: decision,
+  } : record;
+  if (record.status === "pending") await writeRecord(stateDir, next);
   if (
     decision !== "deny" &&
     record.bundleLabel &&
@@ -548,14 +681,15 @@ export async function resolveLocalShellApproval(
   ) {
     const taskKey = supervisedTaskKey(record);
     if (taskKey && record.bundleFingerprint) {
-      const createdAt = Date.now();
+      const createdAt = resolvedAt;
       const workSessionId = record.workSessionId ?? null;
+      const identityId = localShellTaskBundleId({ projectId: record.projectId, cwd: record.cwd, taskKey, workSessionId });
       await writeLocalShellTaskBundle(stateDir, {
-        id: localShellTaskBundleId({
-          projectId: record.projectId,
-          cwd: record.cwd,
-          taskKey,
-          workSessionId,
+        version: 2,
+        identityId,
+        approvalCreatedAt: record.createdAt,
+        id: localShellTaskBundleRecordId({
+          identityId, approvalId: record.id, bundleFingerprint: record.bundleFingerprint, approvalCreatedAt: record.createdAt,
         }),
         approvalId: record.id,
         bundleFingerprint: record.bundleFingerprint,
@@ -582,7 +716,7 @@ export async function resolveLocalShellApproval(
       label: record.scopeLabel,
       ttlMs: record.scopeTtlMs,
     };
-    const createdAt = Date.now();
+    const createdAt = resolvedAt;
     const id = scopeId({ projectId: record.projectId, cwd: record.cwd ?? undefined, scope });
     await writeScopeRecord(stateDir, {
       id,
@@ -596,7 +730,10 @@ export async function resolveLocalShellApproval(
   }
   if (
     ((decision === "approve" && Boolean(record.taskIdentity)) ||
-      (decision === "supervise" && Boolean(record.reason || record.taskIdentity) && !record.destructive)) &&
+      (decision === "supervise" && Boolean(record.reason || record.taskIdentity) && (
+        !record.destructive ||
+        Boolean(record.bundleFingerprint && record.bundleCommandKeys?.length && record.taskIdentity && record.workSessionId)
+      ))) &&
     record.needsNetwork
   ) {
     const verificationOnly = decision === "approve";
@@ -608,7 +745,7 @@ export async function resolveLocalShellApproval(
       taskIdentity: record.taskIdentity,
     });
     if (taskKey && supervisedRecordId) {
-      const createdAt = Date.now();
+      const createdAt = resolvedAt;
       await writeSupervisedRecord(stateDir, {
         id: supervisedRecordId,
         projectId: record.projectId,

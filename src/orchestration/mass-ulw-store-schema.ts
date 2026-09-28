@@ -1,8 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { join, resolve } from "node:path";
 import { z } from "zod";
 import { canonicalMassUlwPlanFingerprint, isPortableMassUlwLaneId } from "./mass-ulw-model.js";
+import { MassUlwFailureDiagnosticSchema } from "./mass-ulw-failure.js";
 import { CommittedPublicationReceiptSchema } from "./mass-ulw-publish-recovery.js";
 import type { MassUlwLane, MassUlwPlan } from "./mass-ulw.js";
 
@@ -64,12 +62,26 @@ const AttemptSchema = z.object({
   startedAt: z.number().int().nonnegative(),
   completedAt: z.number().int().nonnegative().optional(),
   fingerprint: z.string().min(1).optional(),
+  failure: MassUlwFailureDiagnosticSchema.optional(),
 }).strict();
+
+export const MassUlwRepairStrategiesSchema = z.record(LaneIdSchema, z.object({
+  generation: z.number().int().positive(),
+  approach: z.string().trim().min(1).max(2000),
+  evidence: z.string().trim().min(1).max(4000),
+}).strict());
+export type MassUlwRepairStrategies = z.infer<typeof MassUlwRepairStrategiesSchema>;
 
 const LaneStateSchema = z.object({
   lane: LaneSchema,
   status: z.enum(["planned", "in-flight", "completed", "failed", "blocked"]),
   attempts: z.number().int().nonnegative(),
+  strategyGenerations: z.array(z.object({
+    generation: z.number().int().nonnegative(),
+    approachFingerprint: z.string().min(1),
+    approach: z.string().min(1).max(2000),
+    evidence: z.string().min(1).max(4000),
+  }).strict()).optional(),
   completedAt: z.number().int().nonnegative().optional(),
 }).strict();
 
@@ -127,6 +139,7 @@ export const MassUlwDocumentSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
   plan: PlanSchema,
+  scheduler: z.literal("dependency-ready").optional(),
   waves: z.array(WaveStateSchema),
   lanes: z.record(z.string(), LaneStateSchema),
   attempts: z.array(AttemptSchema),

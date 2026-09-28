@@ -32,7 +32,7 @@ const FILE_MODE = 0o600;
 const DEFAULT_TTL_MINUTES = 10;
 const MAX_TTL_MINUTES = 60;
 
-export type AutoActionKind = "click" | "type" | "key";
+export type AutoActionKind = "click" | "type" | "key" | "scroll";
 
 /** On-disk shape. Contains no secrets and no input text/payloads — just app
  * names, timestamps, and a use counter. */

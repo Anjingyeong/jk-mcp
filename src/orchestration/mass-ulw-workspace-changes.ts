@@ -3,18 +3,22 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { isSecretPath } from "../policy/secrets.js";
 import { normalizeFanoutScope } from "./mass-ulw.js";
+import { workspaceDependencyPlan } from "./mass-ulw-workspace-dependencies.js";
 import { git, safeRelative, splitZ } from "./mass-ulw-workspace-repository.js";
 import type { JournalRecord, MassUlwWorkspaceLane, PathImage, TreeChange } from "./mass-ulw-workspace-types.js";
 
 export function validateLanes(lanes: MassUlwWorkspaceLane[]): MassUlwWorkspaceLane[] {
   const ids = new Set<string>();
-  return lanes.map((lane) => {
+  const definitions = lanes.map((lane) => {
     const id = lane.id.trim();
     if (!id || !/^[A-Za-z0-9._-]+$/u.test(id) || ids.has(id)) throw new Error(`Invalid or duplicate Mass ULW lane id: ${lane.id}`);
     ids.add(id);
     const writeScopes = [...new Set(lane.writeScopes.map(normalizeFanoutScope))].sort();
-    return { id, writeScopes };
+    const dependsOn = [...new Set((lane.dependsOn ?? []).map((dependency) => dependency.trim()))].sort();
+    return { id, writeScopes, dependsOn };
   });
+  workspaceDependencyPlan(definitions);
+  return definitions;
 }
 
 async function treeMode(root: string, commit: string, relative: string): Promise<string | null> {

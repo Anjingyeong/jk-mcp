@@ -2,6 +2,7 @@ import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
 import { afterEach, describe, expect, it } from "vitest";
 
 describe("Linux launcher", () => {
@@ -10,7 +11,11 @@ describe("Linux launcher", () => {
   const linuxIt = process.platform === "linux" ? it : it.skip;
 
   afterEach(async () => {
-    launcher?.kill("SIGTERM");
+    if (launcher && launcher.exitCode === null && launcher.signalCode === null) {
+      const closed = once(launcher, "close", { signal: AbortSignal.timeout(10_000) });
+      launcher.kill("SIGTERM");
+      await closed;
+    }
     if (root) await rm(root, { recursive: true, force: true });
   });
 
@@ -23,8 +28,8 @@ describe("Linux launcher", () => {
     await mkdir(binDir, { recursive: true });
     await mkdir(workspace, { recursive: true });
     await copyFile(
-      new URL("../../linux/start-chatgpt2codex.sh", import.meta.url),
-      join(root, "start-chatgpt2codex.sh"),
+      new URL("../../linux/start-jk.sh", import.meta.url),
+      join(root, "start-jk.sh"),
     );
     await writeFile(join(root, "dist", "cli.js"), "", "utf8");
     await writeFile(
@@ -43,7 +48,7 @@ describe("Linux launcher", () => {
     launcher = spawn(
       "bash",
       [
-        join(root, "start-chatgpt2codex.sh"),
+        join(root, "start-jk.sh"),
         "--no-tunnel",
         "--public-hostname",
         "mcp.example.test",
@@ -78,7 +83,7 @@ describe("Linux launcher", () => {
       }, 5_000);
       const onData = (): void => {
         if (
-          stdout.includes("chatgpt2codex is ready") &&
+          stdout.includes("jk is ready") &&
           stdout.includes("https://mcp.example.test/mcp") &&
           stdout.includes("PUBLIC_HOSTNAME is metadata only")
         ) {

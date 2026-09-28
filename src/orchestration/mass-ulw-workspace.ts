@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { auditChanges, treeChanges, validateLanes } from "./mass-ulw-workspace-changes.js";
 import { createSnapshotCommit, fingerprintMassUlwRepository, git, gitBytes, requireRepositoryRoot, restoreOriginalCheckout } from "./mass-ulw-workspace-repository.js";
-import { prepareMassUlwLaneDependencies } from "./mass-ulw-workspace-dependencies.js";
+import { prepareMassUlwLaneDependencies, workspaceDependencyPlan } from "./mass-ulw-workspace-dependencies.js";
+import { ancestorsOf, topologicalLaneIds } from "./mass-ulw-executor-graph.js";
 import { publicationTransactionRoot, recoverMassUlwPublication } from "./mass-ulw-publish-recovery.js";
 import { publishMassUlwWorkspace } from "./mass-ulw-workspace-publish.js";
 import type { MassUlwIntegrationResult, MassUlwLaneCheckout, MassUlwPublishResult, MassUlwRepositoryFingerprint, MassUlwWorkspaceHooks, MassUlwWorkspaceLane, MassUlwWorkspaceOptions } from "./mass-ulw-workspace-types.js";
@@ -29,6 +30,23 @@ export async function cleanupMassUlwPrivateWorkspace(
   recoveryId: string,
 ): Promise<void> {
   await fs.rm(massUlwPrivateWorkspaceRoot(tempRoot, recoveryRoot, recoveryId), { recursive: true, force: true });
+}
+
+async function linkIgnoredRepositoryDependencies(repositoryRoot: string, checkoutRoot: string): Promise<void> {
+  const source = path.join(repositoryRoot, "node_modules");
+  const target = path.join(checkoutRoot, "node_modules");
+  const sourceStat = await fs.stat(source).catch(() => null);
+  if (!sourceStat?.isDirectory()) return;
+  const ignored = await git(checkoutRoot, ["check-ignore", "-q", "node_modules/.mass-ulw-probe"]).then(() => true, () => false);
+  if (!ignored) return;
+  const existing = await fs.lstat(target).catch(() => null);
+  if (existing) return;
+  const gitDirValue = (await git(checkoutRoot, ["rev-parse", "--git-dir"])).trim();
+  const gitDir = path.isAbsolute(gitDirValue) ? gitDirValue : path.resolve(checkoutRoot, gitDirValue);
+  const excludePath = path.join(gitDir, "info", "exclude");
+  await fs.mkdir(path.dirname(excludePath), { recursive: true });
+  await fs.appendFile(excludePath, "\n/node_modules\n");
+  await fs.symlink(source, target, process.platform === "win32" ? "junction" : "dir");
 }
 
 export class MassUlwWorkspace {
@@ -117,6 +135,7 @@ export class MassUlwWorkspace {
         await git(laneRoot, ["checkout", "--quiet", "--detach", baselineCommit]);
         await git(laneRoot, ["config", "user.name", "Mass ULW"]);
         await git(laneRoot, ["config", "user.email", "mass-ulw@localhost"]);
+        await linkIgnoredRepositoryDependencies(root, laneRoot);
         checkouts.push({
           id: lane.id,
           root: laneRoot,
@@ -161,10 +180,14 @@ export class MassUlwWorkspace {
     await git(this.privateRoot, ["clone", "--quiet", "--no-hardlinks", "--branch", "mass-ulw-baseline", this.integrationRoot, mergedRoot]);
     await git(mergedRoot, ["config", "user.name", "Mass ULW"]);
     await git(mergedRoot, ["config", "user.email", "mass-ulw@localhost"]);
+    await linkIgnoredRepositoryDependencies(this.repositoryRoot, mergedRoot);
 
     const occupied = new Map<string, string>();
     const laneCommits: MassUlwIntegrationResult["laneCommits"] = [];
-    for (const lane of [...this.laneDefinitions].sort((a, b) => a.id.localeCompare(b.id))) {
+    const plan = workspaceDependencyPlan(this.laneDefinitions);
+    for (const laneId of topologicalLaneIds(plan)) {
+      const lane = this.laneDefinitions.find((item) => item.id === laneId)!;
+      const ancestors = new Set(ancestorsOf(plan, laneId));
       const checkout = this.lanes.find((item) => item.id === lane.id)!;
       const status = await git(checkout.root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
       if (status) throw new Error(`Lane ${lane.id} has uncommitted changes`);
@@ -173,7 +196,8 @@ export class MassUlwWorkspace {
       auditChanges(checkout.root, lane, changes);
       for (const change of changes) {
         const owner = occupied.get(change.path.toLowerCase());
-        if (owner) throw new Error(`Lanes ${owner} and ${lane.id} both changed path: ${change.path}`);
+        // Each accepted writer extends the same dependency chain, so its earlier writers are ancestors too.
+        if (owner && !ancestors.has(owner)) throw new Error(`Lanes ${owner} and ${lane.id} both changed path: ${change.path}`);
         occupied.set(change.path.toLowerCase(), lane.id);
       }
       if (changes.length > 0) {
@@ -217,11 +241,11 @@ export class MassUlwWorkspace {
     });
   }
 
-  async cleanup(): Promise<void> {
+  async cleanup(options?: { preservePublicationReceipt?: boolean }): Promise<void> {
     if (this.cleaned) return;
     this.cleaned = true;
     await fs.rm(this.privateRoot, { recursive: true, force: true });
-    if (this.durableTransactionRoot && this.publicationTerminal) {
+    if (this.durableTransactionRoot && this.publicationTerminal && !options?.preservePublicationReceipt) {
       await fs.rm(this.durableTransactionRoot, { recursive: true, force: true });
     }
   }

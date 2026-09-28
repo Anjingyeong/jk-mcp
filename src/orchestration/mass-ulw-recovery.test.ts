@@ -3,10 +3,61 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MassUlwExecutor, encodeMassUlwAttemptFingerprint, parseMassUlwAttemptFingerprint, type LaneEngine, type LaneExecutionRequest } from "./mass-ulw-executor.js";
 import { MassUlwStore } from "./mass-ulw-store.js";
+import { MassUlwStageError } from "./mass-ulw-failure.js";
 import { buildMassUlwPlan } from "./mass-ulw.js";
 import { cleanupExecutorRoots, fakeWorkspace, lane, passVerification, temporaryExecutorRoot } from "./mass-ulw-runner-fixtures.js";
 afterEach(cleanupExecutorRoots);
 describe("Mass ULW recovery", () => {
+  it("native-evolution R12 preparation failure in a repaired generation remains exhausted on reconnect", async () => {
+    const stateDir = await temporaryExecutorRoot("native-evolution-B-repair-preparation-");
+    const plan = buildMassUlwPlan({ executionProfile: "max", candidates: [lane("A"), lane("B")] });
+    let patch = "p0"; let preparations = 0;
+    const events: string[] = [];
+    const executor = new MassUlwExecutor({ stateDir, repositoryRoot: stateDir,
+      laneEngine: { failurePolicy: "repair-required", approachFingerprint: () => patch,
+        async restore() {}, async execute(request) { return { outputFingerprint: request.lane.id, approachFingerprint: patch }; },
+      }, verificationEngine: { ...passVerification(events), async verifyLane(request) { return { passed: request.lane.id === "B", fingerprint: patch }; } },
+      workspaceFactory: async () => ({ ...fakeWorkspace(plan, events, () => undefined), async prepareLane(id) {
+        if (id === "A") { preparations += 1; if (patch === "p1") throw new MassUlwStageError({ laneId: id, stage: "checkout", retryable: false, message: "changed strategy checkout conflict" }); }
+      } }),
+    });
+    await executor.execute({ loopId: "repair-prepare", plan });
+    patch = "p1";
+    const input = { loopId: "repair-prepare", plan, repairStrategies: { A: { generation: 1, approach: "new patch", evidence: "first failure" } } };
+    expect((await executor.execute(input)).status).toBe("blocked");
+    expect((await executor.execute(input)).status).toBe("blocked");
+    expect(preparations).toBe(2);
+  });
+  it("native-evolution R12 generations retain failed histories and never refill an unchanged native approach", async () => {
+    const stateDir = await temporaryExecutorRoot("native-evolution-B-generations-");
+    const plan = buildMassUlwPlan({ executionProfile: "max", candidates: [lane("A"), lane("B")] });
+    let patch = "p0";
+    const events: string[] = [];
+    const store = new MassUlwStore(stateDir);
+    const executor = new MassUlwExecutor({ stateDir, repositoryRoot: stateDir, store,
+      laneEngine: { failurePolicy: "repair-required", approachFingerprint: (id) => id === "A" ? patch : "peer",
+        async restore(request) { events.push(`restore:${request.lane.id}`); },
+        async execute(request) { events.push(`execute:${request.lane.id}`); return { outputFingerprint: patch, approachFingerprint: request.lane.id === "A" ? patch : "peer" }; },
+      }, verificationEngine: { ...passVerification(events), async verifyLane(request) { return { passed: request.lane.id === "B" || patch === "p2", fingerprint: patch }; } },
+      workspaceFactory: async () => fakeWorkspace(plan, events, () => undefined),
+    });
+    expect((await executor.execute({ loopId: "generations", plan })).status).toBe("blocked");
+    patch = "p1";
+    const input = { loopId: "generations", plan, repairStrategies: { A: { generation: 1, approach: "second approach", evidence: "first verifier failure" } } };
+    expect((await executor.execute(input)).status).toBe("blocked");
+    expect((await executor.execute(input)).status).toBe("blocked");
+    expect(events.filter((event) => event === "execute:A")).toHaveLength(2);
+    await expect(executor.execute({ ...input, repairStrategies: { A: { generation: 2, approach: "third approach", evidence: "second verifier failure" } } })).rejects.toThrow();
+    patch = "p2";
+    const repaired = await executor.execute({ ...input, repairStrategies: { A: { generation: 2, approach: "third approach", evidence: "second verifier failure" } } });
+    expect(repaired.status).toBe("completed");
+    const after = await store.load("generations");
+    expect(after.attempts.filter((attempt) => attempt.laneId === "A").map((attempt) => ({
+      status: attempt.status, generation: parseMassUlwAttemptFingerprint(attempt.fingerprint)?.strategyGeneration,
+    }))).toEqual([{ status: "failed", generation: 0 }, { status: "failed", generation: 1 }, { status: "completed", generation: 2 }]);
+    expect(events.filter((event) => event === "execute:B")).toHaveLength(1);
+    expect(after.lanes.A?.attempts).toBe(3);
+  });
   it("resumes durable waves and changes approach after repeated failure", async () => {
     const stateDir = await temporaryExecutorRoot("mass-ulw-recovery-state-");
     const plan = buildMassUlwPlan({

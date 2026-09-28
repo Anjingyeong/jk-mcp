@@ -14,7 +14,7 @@ function Ensure-Command([string]$Command, [string]$WingetId) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         throw "Missing $Command and winget is not available. Install $Command, then rerun this script."
     }
-    Write-Host "[chatgpt2codex] installing $Command via winget..."
+    Write-Host "[JK] installing $Command via winget..."
     winget install --id $WingetId --silent --accept-package-agreements --accept-source-agreements
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
@@ -31,26 +31,26 @@ $parent = Split-Path -Parent $InstallDir
 New-Item -ItemType Directory -Force -Path $parent | Out-Null
 
 if (Test-Path (Join-Path $InstallDir ".git")) {
-    Write-Host "[chatgpt2codex] updating existing checkout..."
+    Write-Host "[JK] updating existing checkout..."
     git -C $InstallDir pull --ff-only
 } elseif (Test-Path $InstallDir) {
     throw "InstallDir already exists and is not a git checkout: $InstallDir"
 } else {
-    Write-Host "[chatgpt2codex] cloning $RepoUrl..."
+    Write-Host "[JK] cloning $RepoUrl..."
     git clone $RepoUrl $InstallDir
 }
 
 Set-Location $InstallDir
 npm install
 npm run build
-if (Test-Path (Join-Path $InstallDir "windows\Build-ChatGPTToCodexExe.ps1")) {
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir "windows\Build-ChatGPTToCodexExe.ps1")
+if (Test-Path (Join-Path $InstallDir "windows\Build-JKExe.ps1")) {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir "windows\Build-JKExe.ps1")
 }
 
 $shortcutDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 $shortcutPath = Join-Path $shortcutDir "JK.lnk"
 $exeTarget = Join-Path $InstallDir "JK.exe"
-$target = if (Test-Path $exeTarget) { $exeTarget } else { Join-Path $InstallDir "windows\Start-ChatGPTToCodexTray.cmd" }
+$target = if (Test-Path $exeTarget) { $exeTarget } else { Join-Path $InstallDir "windows\Start-JKTray.cmd" }
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $target
@@ -58,9 +58,9 @@ $shortcut.WorkingDirectory = $InstallDir
 $shortcut.Description = "JK tray controller"
 $shortcut.Save()
 
-Write-Host "[chatgpt2codex] ready."
-Write-Host "[chatgpt2codex] Start Menu shortcut: $shortcutPath"
-Write-Host "[chatgpt2codex] Tray launcher: $target"
+Write-Host "[JK] ready."
+Write-Host "[JK] Start Menu shortcut: $shortcutPath"
+Write-Host "[JK] Tray launcher: $target"
 
 if ($Launch) {
     Start-Process $target

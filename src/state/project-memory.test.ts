@@ -88,4 +88,29 @@ describe("ProjectMemoryStore", () => {
     expect(matches[0]).toMatchObject({ id: first.id, solution: "gate play behind the ready event" });
     expect(matches[0]?.score).toBeGreaterThan(0);
   });
+
+  it("counts repeated project feedback and selects only recurring, relevant items", async () => {
+    await store.recordFeedback("p", { text: "UI too bright", tags: ["ui", "color"] });
+    const second = await store.recordFeedback("p", { text: "UI is still too bright", key: "ui too bright" });
+    expect(second).toMatchObject({ key: "ui too bright", count: 2, tags: ["ui", "color"], text: "UI is still too bright" });
+    await store.recordFeedback("p", { text: "Map feels empty", key: "map empty" });
+    await store.recordFeedback("p", { text: "Map feels empty", key: "map empty" });
+    await store.recordFeedback("p", { text: "Once only: font too small" });
+    await store.recordFeedback("other", { text: "UI too bright" });
+
+    const ui = await store.selectRelevantFeedback("p", "Polish inventory UI colors");
+    expect(ui.map((item) => item.key)).toEqual(["ui too bright"]);
+    // Recurring but unrelated items need a stronger recurrence to appear without a relevance signal.
+    expect(await store.selectRelevantFeedback("p", "unrelated backend refactor")).toEqual([]);
+    await store.recordFeedback("p", { text: "Map feels empty", key: "map empty" });
+    expect((await store.selectRelevantFeedback("p", "unrelated backend refactor")).map((item) => item.key)).toEqual(["map empty"]);
+    expect((await store.listFeedback("other"))[0]?.count).toBe(1);
+  });
+
+  it("reads project memory written before feedback existed", async () => {
+    await writeFile(join(stateDir, "project-memory.json"), JSON.stringify({ version: 1, updatedAt: 1, projects: { p: { contextPacks: [], results: [], knownFixes: [] } } }), "utf8");
+    expect(await store.listFeedback("p")).toEqual([]);
+    await store.recordFeedback("p", { text: "no PASS before Play QA" });
+    expect(await store.listFeedback("p")).toHaveLength(1);
+  });
 });

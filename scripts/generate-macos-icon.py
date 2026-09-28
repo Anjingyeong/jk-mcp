@@ -140,7 +140,7 @@ def draw_status_icon(path: Path, source: Image.Image) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--asset", default="assets/chatgpt2codex-icon.png")
+    parser.add_argument("--asset", default="assets/jk-icon.png")
     parser.add_argument("--out", default="build/macos/generated-icons")
     args = parser.parse_args()
 
@@ -158,7 +158,7 @@ def main() -> None:
             return
         raise SystemExit(
             "Pillow is required to generate macOS icon assets. Install pillow or keep "
-            "assets/chatgpt2codex-icon.png, build/macos/generated-icons/AppIcon.icns, "
+            "assets/jk-icon.png, build/macos/generated-icons/AppIcon.icns, "
             "and build/macos/generated-icons/StatusIconTemplate.png in place."
         )
 

@@ -1,0 +1,123 @@
+name: Release
+
+# Public (jk-mcp) release: builds the Windows installer and macOS package and
+# attaches them to a DRAFT GitHub Release. Review the draft, then click
+# "Publish release" — that human action triggers npm-publish.yml.
+# (Releases created with GITHUB_TOKEN cannot trigger other workflows, so the
+# draft step is also what keeps npm publishing behind a manual gate.)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v1.2.3). Defaults to the pushed tag.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # build-windows-app.ps1 bundles node/cloudflared/rg from PATH; the hosted
+      # runner has no cloudflared or rg. Pin versions and verify SHA-256.
+      - name: Provide pinned cloudflared and ripgrep
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $tools = Join-Path $env:RUNNER_TEMP 'jk-tools'
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          $cf = Join-Path $tools 'cloudflared.exe'
+          Invoke-WebRequest 'https://github.com/cloudflare/cloudflared/releases/download/2026.8.2/cloudflared-windows-amd64.exe' -OutFile $cf
+          if ((Get-FileHash $cf -Algorithm SHA256).Hash -ne 'c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5') { throw 'cloudflared SHA-256 mismatch' }
+          $rgZip = Join-Path $env:RUNNER_TEMP 'ripgrep.zip'
+          Invoke-WebRequest 'https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip' -OutFile $rgZip
+          if ((Get-FileHash $rgZip -Algorithm SHA256).Hash -ne '124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a') { throw 'ripgrep SHA-256 mismatch' }
+          Expand-Archive $rgZip (Join-Path $env:RUNNER_TEMP 'ripgrep') -Force
+          Copy-Item (Get-ChildItem (Join-Path $env:RUNNER_TEMP 'ripgrep') -Recurse -Filter rg.exe | Select-Object -First 1).FullName (Join-Path $tools 'rg.exe')
+          & $cf --version
+          & (Join-Path $tools 'rg.exe') --version
+          $tools >> $env:GITHUB_PATH
+
+      - name: Resolve release tag
+        id: release_tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "${{ github.ref_name }}" }
+          if ([string]::IsNullOrWhiteSpace($tag)) { throw "No tag resolved." }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows installer (unsigned)
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          $outputExe = "build/windows/JK-$version-windows-setup.exe"
+          Write-Host "Building $outputExe"
+          pwsh -File scripts/build-windows-installer.ps1 -OutputExe $outputExe
+
+      - name: Upload installer to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: true
+          files: build/windows/*.exe
+          fail_on_unmatched_files: true
+
+  build-macos-installer:
+    needs: build-windows-installer
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install macOS icon build dependency
+        shell: bash
+        run: |
+          python3 -m venv .venv-macos-release
+          .venv-macos-release/bin/python -m pip install --disable-pip-version-check pillow
+          echo "$PWD/.venv-macos-release/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve release tag
+        id: release_tag
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [[ -z "$tag" ]]; then tag="${{ github.ref_name }}"; fi
+          if [[ -z "$tag" ]]; then echo "No tag resolved." >&2; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS package
+        shell: bash
+        run: bash scripts/build-macos-app.sh
+
+      - name: Upload macOS package to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: true
+          files: build/macos/jk-*.pkg
+          fail_on_unmatched_files: true

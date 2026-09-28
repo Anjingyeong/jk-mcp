@@ -1,9 +1,16 @@
 import { mkdtemp, rm, stat, readFile } from "node:fs/promises";
+import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Store } from "./store.js";
 import type { ProjectRegistryEntry } from "../types.js";
+
+// Expose a spyable facade over the real Node exports; every operation still
+// calls the real filesystem unless the test injects its exact fault boundary.
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:fs/promises")>(),
+}));
 
 describe("Store", () => {
   let dir: string;
@@ -15,7 +22,9 @@ describe("Store", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
+    await expect(stat(dir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("returns an empty project list before anything is saved", async () => {
@@ -83,6 +92,48 @@ describe("Store", () => {
     expect(files.every((f) => !f.endsWith(".tmp"))).toBe(true);
   });
 
+  it("native-evolution R1 preserves a colliding temporary file it never acquired", async () => {
+    await store.saveProjects([]);
+    const previous = await readFile(join(dir, "projects.json"));
+    const sentinel = Buffer.from("owned collision sentinel");
+    const realOpen = fs.open;
+    let selectedTmp = "";
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      selectedTmp = String(args[0]);
+      const competingOwner = await realOpen(...args);
+      try { await competingOwner.writeFile(sentinel); }
+      finally { await competingOwner.close(); }
+      return realOpen(...args);
+    });
+
+    await expect(store.saveProjects([{ projectId: "new", name: "new", root: "/new", aliases: [] }])).rejects.toMatchObject({ code: "EEXIST" });
+
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    await expect(readFile(selectedTmp)).resolves.toEqual(sentinel);
+    expect(await readFile(join(dir, "projects.json"))).toEqual(previous);
+  });
+
+  it.each(["writeFile", "sync"] as const)("native-evolution R1 removes its own temporary file after %s fails", async (stage) => {
+    await store.saveProjects([]);
+    const previous = await readFile(join(dir, "projects.json"));
+    const failure = Object.assign(new Error("owned atomic write fault"), { code: "EIO" });
+    const realOpen = fs.open;
+    let closed = false;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...args);
+      const close = handle.close.bind(handle);
+      vi.spyOn(handle, "close").mockImplementation(async () => { await close(); closed = true; });
+      vi.spyOn(handle, stage).mockRejectedValue(failure);
+      return handle;
+    });
+
+    await expect(store.saveProjects([])).rejects.toBe(failure);
+
+    expect(closed).toBe(true);
+    expect(await fs.readdir(dir)).toEqual(["projects.json"]);
+    expect(await readFile(join(dir, "projects.json"))).toEqual(previous);
+  });
+
   it("rejects a corrupt projects.json instead of silently coercing it", async () => {
     const { writeFile, mkdir } = await import("node:fs/promises");
     await mkdir(dir, { recursive: true });
@@ -116,6 +167,22 @@ describe("Store", () => {
     expect(session.activeProjectId).toBe("alpha-app");
     expect(session.mode).toBe("edit");
     expect(session.lease?.leaseId).toBe("lease-1");
+  });
+
+  it("round-trips a control lease used by desktop control", async () => {
+    await store.setSession({
+      activeProjectId: "alpha-app",
+      mode: "edit",
+      lease: {
+        projectId: "alpha-app",
+        leaseId: "lease-control",
+        projectRoot: "/workspace/alpha-app",
+        preset: "control",
+        issuedAt: 1000,
+        expiresAt: 2000,
+      },
+    });
+    expect((await store.getSession()).lease?.preset).toBe("control");
   });
 
   it("migrates a legacy single workContext write into session schema v4", async () => {
@@ -281,17 +348,41 @@ describe("Store", () => {
       workContexts: {},
     });
 
-    await Promise.all([
-      store.updateSession(async (current) => {
-        await new Promise((resolve) => setTimeout(resolve, 40));
-        return { ...current, activeProjectId: "alpha-app" };
-      }),
-      secondStore.updateSession(async (current) => ({ ...current, mode: "edit" })),
-    ]);
+    let enter = () => undefined as void;
+    let release = () => undefined as void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const first = store.updateSession(async (current) => { enter(); await released; return { ...current, activeProjectId: "alpha-app" }; });
+    await entered;
+    const second = secondStore.updateSession(async (current) => ({ ...current, mode: "edit" }));
+    release();
+    await Promise.all([first, second]);
 
     const session = await store.getSession();
     expect(session.activeProjectId).toBe("alpha-app");
     expect(session.mode).toBe("edit");
+  });
+
+  it("native-evolution R1 serializes owned loop checkpoints and removes lock and temporary files", async () => {
+    const secondStore = new Store(dir);
+    const order: number[] = [];
+    let enter = () => undefined as void;
+    let release = () => undefined as void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const first = store.lockedGoalLoop("loop_owned", async () => {
+      order.push(1); enter(); await released; await store.writeGoalLoop("loop_owned", { revision: 1 });
+    });
+    await entered;
+    const second = secondStore.lockedGoalLoop("loop_owned", async () => {
+      expect(JSON.parse(await readFile(join(dir, "goals", "loop_owned.loop.json"), "utf8"))).toEqual({ revision: 1 });
+      order.push(2); await secondStore.writeGoalLoop("loop_owned", { revision: 2 });
+    });
+    release(); await Promise.all([first, second]);
+    expect(order).toEqual([1, 2]);
+    const { readdir } = await import("node:fs/promises");
+    expect(await readdir(join(dir, "goals"))).toEqual(["loop_owned.loop.json"]);
+    await expect(store.lockedGoalLoop("../foreign", async () => undefined)).rejects.toThrow();
   });
 
   it("keeps the session update queue usable after a mutator fails", async () => {

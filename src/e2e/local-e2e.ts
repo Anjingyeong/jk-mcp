@@ -121,9 +121,35 @@ function e2eId(seed: string): string {
 }
 
 async function e2eDir(projectRoot: string): Promise<string> {
-  const dir = path.join(projectRoot, ".chatgpt2codex", "e2e");
+  const dir = path.join(projectRoot, ".jk", "e2e");
   await fs.mkdir(dir, { recursive: true });
   return dir;
+}
+
+const BROWSER_PROFILE_PATTERN = /^browser-profile-(\d{13})-[0-9a-f]+$/;
+const ORPHAN_PROFILE_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Remove Chromium profile dirs left behind by crashed/killed captures (the
+ * normal `finally` cleanup never ran, or lost the EBUSY race). The creation
+ * timestamp is embedded in the dir name; only dirs older than any plausible
+ * in-flight capture are touched. Best-effort, never throws.
+ */
+export async function sweepOrphanBrowserProfiles(dir: string, now = Date.now(), maxAgeMs = ORPHAN_PROFILE_AGE_MS): Promise<number> {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return 0;
+  }
+  const stale = names.filter((name) => {
+    const match = BROWSER_PROFILE_PATTERN.exec(name);
+    return match !== null && now - Number(match[1]) > maxAgeMs;
+  });
+  const results = await Promise.all(
+    stale.map((name) => fs.rm(path.join(dir, name), { recursive: true, force: true }).then(() => true, () => false)),
+  );
+  return results.filter(Boolean).length;
 }
 
 function execFileAsync(file: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -163,7 +189,7 @@ async function captureRegionScreenshot(
   if (stat.size === 0) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      "macOS Screen Recording permission is required for E2E screenshots. Open jk > Screenshot Permission, enable jk in System Settings > Privacy & Security > Screen Recording, then retry.",
       { permission: "screen-recording" },
     );
   }
@@ -707,7 +733,9 @@ async function captureWindowsUrlScreenshotSetInternal(
   const dir = path.join(await e2eDir(root), "screenshots");
   await fs.mkdir(dir, { recursive: true });
   const browserExecutable = await findWindowsBrowserExecutable();
-  const profileDir = path.join(await e2eDir(root), `browser-profile-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const profileRoot = await e2eDir(root);
+  void sweepOrphanBrowserProfiles(profileRoot);
+  const profileDir = path.join(profileRoot, `browser-profile-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   await fs.mkdir(profileDir, { recursive: true });
   let browserProcess: ReturnType<typeof spawn> | undefined;
   let cdp: CdpWebSocketClient | undefined;
@@ -905,7 +933,7 @@ export async function captureE2eScreenshot(
   } catch (error) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      "macOS Screen Recording permission is required for E2E screenshots. Open jk > Screenshot Permission, enable jk in System Settings > Privacy & Security > Screen Recording, then retry.",
       { permission: "screen-recording", cause: summarizeE2eError(error) },
     );
   }
@@ -913,7 +941,7 @@ export async function captureE2eScreenshot(
   if (stat.size === 0) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      "macOS Screen Recording permission is required for E2E screenshots. Open jk > Screenshot Permission, enable jk in System Settings > Privacy & Security > Screen Recording, then retry.",
       { permission: "screen-recording" },
     );
   }
@@ -1078,7 +1106,7 @@ export async function captureE2eAppScreenshot(
   } catch (error) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      `macOS Accessibility permission is required to capture the ${input.appName} app window. Enable ChatGPT To Codex in System Settings > Privacy & Security > Accessibility, then retry.`,
+      `macOS Accessibility permission is required to capture the ${input.appName} app window. Enable jk in System Settings > Privacy & Security > Accessibility, then retry.`,
       { permission: "accessibility", appName: input.appName, cause: summarizeE2eError(error) },
     );
   }

@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { writeJournal } from "./mass-ulw-workspace-changes.js";
-import { absoluteFromRelative, readPathImage } from "./mass-ulw-workspace-repository.js";
+import { assertNoSymlinkParents, writeJournal } from "./mass-ulw-workspace-changes.js";
+import { absoluteFromRelative, imageDigest, readPathImage } from "./mass-ulw-workspace-repository.js";
 import type {
   JournalRecord,
   MassUlwCommittedPublicationReceipt,
@@ -38,6 +38,11 @@ const JournalSchema = z.object({
   applied: z.array(z.string().min(1)),
   preexisting: z.array(z.string().min(1)),
   backedUp: z.array(z.string().min(1)),
+  ownership: z.array(z.object({
+    path: z.string().min(1),
+    preimage: z.string().regex(/^[a-f0-9]{64}$/u),
+    postimage: z.string().regex(/^[a-f0-9]{64}$/u),
+  }).strict()).optional(),
   receipt: CommittedPublicationReceiptSchema.optional(),
 }).strict();
 
@@ -47,11 +52,13 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-async function exists(target: string): Promise<boolean> {
-  return stat(target).then(() => true, (error: unknown) => {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    throw error;
-  });
+export class MassUlwRollbackConflictError extends Error {
+  readonly code = "MASS_ULW_ROLLBACK_CONFLICT";
+
+  constructor(readonly relativePath: string, options?: ErrorOptions) {
+    super(`MASS ULW rollback recovery conflict: ${relativePath}; preserve the destination, backup and journal for manual recovery`, options);
+    this.name = "MassUlwRollbackConflictError";
+  }
 }
 
 export function massUlwPublishFingerprint(integrationCommit: string, changedPaths: readonly string[]): string {
@@ -69,20 +76,49 @@ export function publicationTransactionRoot(recoveryRoot: string, recoveryId: str
 export async function rollbackMassUlwPublication(transactionRoot: string, journal: JournalRecord): Promise<void> {
   const journalPath = path.join(transactionRoot, "journal.json");
   const backupRoot = path.join(transactionRoot, "backup");
+  const preexisting = new Set(journal.preexisting);
+  const ownership = new Map(journal.ownership?.map((image) => [image.path, image]));
+  const actions: Array<{ destination: string; backup: string | null }> = [];
+  // Preflight the entire transaction before changing even its journal phase.
+  // An applied intent can precede either rename, or a previous rollback restore.
+  for (const relative of [...journal.applied].reverse()) {
+    try {
+      await assertNoSymlinkParents(journal.repositoryRoot, relative);
+      await assertNoSymlinkParents(backupRoot, relative);
+      const actual = await readPathImage(journal.repositoryRoot, relative);
+      const saved = await readPathImage(backupRoot, relative);
+      const expected = ownership.get(relative);
+      const destination = absoluteFromRelative(journal.repositoryRoot, relative);
+      const backup = absoluteFromRelative(backupRoot, relative);
+      if (journal.ownership && !expected) throw new MassUlwRollbackConflictError(relative);
+      if (saved.exists) {
+        if (!preexisting.has(relative)
+          || (expected && imageDigest(saved) !== expected.preimage)
+          || (actual.exists && imageDigest(actual) !== (expected?.postimage ?? imageDigest(saved)))) {
+          throw new MassUlwRollbackConflictError(relative);
+        }
+        actions.push({ destination, backup });
+      } else if (preexisting.has(relative)) {
+        if (!actual.exists || (expected && imageDigest(actual) !== expected.preimage)) {
+          throw new MassUlwRollbackConflictError(relative);
+        }
+      } else if (actual.exists) {
+        // Old journals cannot prove ownership of newly added destination bytes.
+        if (!expected || imageDigest(actual) !== expected.postimage) throw new MassUlwRollbackConflictError(relative);
+        actions.push({ destination, backup: null });
+      }
+    } catch (error) {
+      if (error instanceof MassUlwRollbackConflictError) throw error;
+      throw new MassUlwRollbackConflictError(relative, { cause: error });
+    }
+  }
   journal.phase = "rolling-back";
   await writeJournal(journalPath, journal);
-  const preexisting = new Set(journal.preexisting);
-  for (const relative of [...journal.applied].reverse()) {
-    const destination = absoluteFromRelative(journal.repositoryRoot, relative);
-    const backup = absoluteFromRelative(backupRoot, relative);
-    if (preexisting.has(relative) && await exists(backup)) {
-      await rm(destination, { recursive: true, force: true });
-      await mkdir(path.dirname(destination), { recursive: true });
-      await rename(backup, destination);
-    } else if (preexisting.has(relative)) {
-      if (!(await exists(destination))) throw new Error(`MASS ULW publish preimage and backup are both missing: ${relative}`);
-    } else {
-      await rm(destination, { recursive: true, force: true });
+  for (const action of actions) {
+    await rm(action.destination, { force: true });
+    if (action.backup !== null) {
+      await mkdir(path.dirname(action.destination), { recursive: true });
+      await rename(action.backup, action.destination);
     }
   }
   journal.phase = "rolled-back";

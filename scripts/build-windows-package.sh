@@ -5,8 +5,8 @@ export COPYFILE_DISABLE=1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(node -p 'require("./package.json").version')"
 BUILD_DIR="$ROOT/build/windows"
-PACKAGE_DIR="$BUILD_DIR/chatgpt2codex-${VERSION}-windows"
-ZIP_PATH="$BUILD_DIR/chatgpt2codex-${VERSION}-windows.zip"
+PACKAGE_DIR="$BUILD_DIR/jk-${VERSION}-windows"
+ZIP_PATH="$BUILD_DIR/jk-${VERSION}-windows.zip"
 
 cd "$ROOT"
 npm run build
@@ -20,11 +20,11 @@ cp -R "$ROOT/windows" "$PACKAGE_DIR/windows"
 cp "$ROOT/README.md" "$PACKAGE_DIR/README.md"
 cp "$ROOT/package.json" "$PACKAGE_DIR/package.json"
 cp "$ROOT/package-lock.json" "$PACKAGE_DIR/package-lock.json"
-cp "$ROOT/start-chatgpt.ps1" "$PACKAGE_DIR/start-chatgpt.ps1"
+cp "$ROOT/start-jk.ps1" "$PACKAGE_DIR/start-jk.ps1"
 if [[ -f "$ROOT/JK.exe" ]]; then
   cp "$ROOT/JK.exe" "$PACKAGE_DIR/JK.exe"
 else
-  echo "warning: JK.exe is missing; run windows\\Build-ChatGPTToCodexExe.ps1 on Windows before public release packaging." >&2
+  echo "warning: JK.exe is missing; run windows\\Build-JKExe.ps1 on Windows before public release packaging." >&2
 fi
 find "$PACKAGE_DIR/dist" -name '*.map' -delete
 

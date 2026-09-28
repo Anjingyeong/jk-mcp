@@ -4,10 +4,17 @@ import { requireProjectLease } from "../workspace/lease-guard.js";
 import { resolveActiveProject } from "../workspace/active.js";
 import { captureE2eAppScreenshot, captureE2eScreenshot } from "../e2e/local-e2e.js";
 import { redact } from "../policy/secrets.js";
-import { assertAllowedTarget, controlAllowlist, isAppAllowed, isControlChatGptExposed } from "./policy.js";
+import {
+  assertAllowedTarget,
+  controlAllowlistForContext,
+  isAppAllowed,
+  isControlChatGptExposed,
+  isControlChatGptExposedForContext,
+} from "./policy.js";
 import { assertScreenshotTargetAllowed, maskSensitiveRegions } from "./screenshot-mask.js";
 import { executeApprovedAction } from "./executor.js";
 import * as macInput from "./mac-input.js";
+import { captureRemoteComputerScreenshot, resolveRemoteControlProject } from "./remote.js";
 import {
   approveAction,
   enqueue,
@@ -114,11 +121,12 @@ export interface ComputerScreenshotInput {
 export async function handleComputerScreenshot(ctx: ToolContext, input: ComputerScreenshotInput): Promise<CallToolResultLike> {
   return withControlErrorMapping(ctx, "computer_screenshot", input, async () => {
     const { projectId, root } = await requireControlLease(ctx);
+    const remote = await resolveRemoteControlProject(ctx, projectId);
     // Full-screen capture (no appName) shows whatever is frontmost, so the
     // sensitive-app gate must check the *live* frontmost app in that case —
     // an app-targeted capture is already covered by the appName check below.
     const frontmostApp =
-      input.appName === undefined && process.platform === "darwin"
+      input.appName === undefined && !remote && process.platform === "darwin"
         ? await macInput.resolveFrontmostApp().catch(() => undefined)
         : undefined;
     assertScreenshotTargetAllowed(input.appName, frontmostApp);
@@ -129,14 +137,14 @@ export async function handleComputerScreenshot(ctx: ToolContext, input: Computer
     // opted in. Without this, any non-denylisted, non-allowlisted app
     // (Mail, Messages, a private editor, ...) could be captured even
     // though it could never be clicked/typed into.
-    const allowlist = controlAllowlist();
+    const allowlist = await controlAllowlistForContext(ctx);
     if (input.appName !== undefined) {
       if (!isAppAllowed(input.appName, allowlist)) {
         throw new DomainError(ErrorCode.SENSITIVE_TARGET_BLOCKED, `App is not on the control allowlist: ${input.appName}`, {
           appName: input.appName,
         });
       }
-    } else if (isControlChatGptExposed()) {
+    } else if ((await isControlChatGptExposedForContext(ctx)) || remote) {
       // A full-screen capture (`screencapture -x`) captures every visible
       // window on the display, not just the frontmost one — checking only
       // the live frontmost app's denylist/allowlist status (as an earlier
@@ -156,6 +164,29 @@ export async function handleComputerScreenshot(ctx: ToolContext, input: Computer
         "Full-screen capture is not available when exposed to ChatGPT (it can show background sensitive windows the allowlist can't see); pass an allowlisted appName to capture a specific window",
         { appName: frontmostApp },
       );
+    }
+
+    if (remote) {
+      if (!input.appName) throw new DomainError(ErrorCode.SENSITIVE_TARGET_BLOCKED, "Remote Windows control screenshots require an explicit allowlisted appName");
+      const result = await captureRemoteComputerScreenshot(ctx, remote, {
+        appName: input.appName,
+        label: input.label,
+        waitMs: input.waitMs,
+      });
+      await ctx.ledger.append({
+        type: "control.screenshot.captured",
+        projectId,
+        appName: input.appName,
+        masked: false,
+        remote: true,
+      });
+      return {
+        structuredContent: { path: result.path, bytes: result.bytes, appName: input.appName, remote: true },
+        content: [
+          { type: "text", text: `Captured remote control screenshot for ${input.appName}` },
+          { type: "image", data: result.imageBase64, mimeType: "image/png" },
+        ],
+      } satisfies CallToolResultLike;
     }
 
     const result = input.appName
@@ -187,6 +218,7 @@ export interface ComputerRequestActionInput {
   target: ControlActionTarget;
   text?: string;
   keyCode?: number;
+  scrollDelta?: number;
   reason: string;
 }
 
@@ -220,14 +252,19 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
   const redactedInput = { ...input, text: input.text ? "[redacted]" : undefined };
   return withControlErrorMapping(ctx, "computer_request_action", redactedInput, async () => {
     const { projectId } = await requireControlLease(ctx);
+    const remote = await resolveRemoteControlProject(ctx, projectId);
 
     if (await isKilled(ctx.stateDir)) {
       throw new DomainError(ErrorCode.CONTROL_KILLED, "Control session is killed; grant a new control lease to resume");
     }
 
-    const frontmostApp = process.platform === "darwin" ? await macInput.resolveFrontmostApp().catch(() => undefined) : undefined;
+    const frontmostApp = !remote && process.platform === "darwin" ? await macInput.resolveFrontmostApp().catch(() => undefined) : undefined;
     try {
-      assertAllowedTarget({ appName: input.appName, frontmostAppName: frontmostApp, allowlist: controlAllowlist() });
+      assertAllowedTarget({
+        appName: input.appName,
+        frontmostAppName: frontmostApp,
+        allowlist: await controlAllowlistForContext(ctx),
+      });
     } catch (err) {
       await ctx.ledger.append({
         type: "control.action.blocked",
@@ -237,6 +274,19 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
         reason: err instanceof DomainError ? err.code : "blocked",
       });
       throw err;
+    }
+
+    if (input.kind === "type" && input.text === undefined) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "type requires text");
+    }
+    if (input.kind === "key" && input.keyCode === undefined) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "key requires keyCode");
+    }
+    if (input.kind === "scroll" && (!Number.isInteger(input.scrollDelta) || input.scrollDelta === 0 || Math.abs(input.scrollDelta ?? 0) > 20)) {
+      throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "scroll requires non-zero scrollDelta between -20 and 20");
+    }
+    if (remote && (input.kind === "click" || input.kind === "type" || input.kind === "scroll") && !input.target.windowPoint) {
+      throw new DomainError(ErrorCode.NOT_IMPLEMENTED, `${input.kind} requires target.windowPoint on Windows V1`);
     }
 
     // Dry-run preview: resolve the AX target read-only (no activate/click) so
@@ -254,11 +304,13 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
     }
 
     const record = await enqueue(ctx.stateDir, {
+      projectId,
       appName: input.appName,
       kind: input.kind,
       target: input.target,
       text: input.text,
       keyCode: input.keyCode,
+      scrollDelta: input.scrollDelta,
       reason: input.reason,
       resolved,
     });
@@ -274,7 +326,8 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
       resolved: record.resolved,
     });
 
-    if (isControlChatGptExposed() && !(await isChatGptExposedRateLimited(ctx.stateDir))) {
+    const chatGptConfirmMode = isControlChatGptExposed();
+    if (chatGptConfirmMode && !(await isChatGptExposedRateLimited(ctx.stateDir))) {
       // Reaching this call at all means the owner's ChatGPT client already
       // showed its Confirm/Deny prompt (driven by this tool's non-read-only
       // annotations) and the owner confirmed on their phone — that is the
@@ -299,7 +352,7 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
       } satisfies CallToolResultLike;
     }
 
-    if (isControlChatGptExposed()) {
+    if (chatGptConfirmMode) {
       await ctx.ledger.append({
         type: "control.action.rate_limited",
         projectId,

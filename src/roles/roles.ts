@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import path from "node:path";
 import { z } from "zod";
 import { DomainError, ErrorCode, type LeasePreset, type ToolContext } from "../types.js";
@@ -214,7 +215,7 @@ async function writeRoleState(stateDir: string, state: RoleState): Promise<RoleS
   const target = roleStatePath(stateDir);
   const tmp = path.join(stateDir, `.${ROLES_FILE}.${process.pid}.${randomUUID()}.tmp`);
   await writeFile(tmp, JSON.stringify(validated, null, 2), { encoding: "utf8", mode: FILE_MODE });
-  await rename(tmp, target);
+  await renameWithRetry(tmp, target);
   return validated;
 }
 
@@ -544,6 +545,14 @@ const ROLE_TOOL_BY_MCP_TOOL: Readonly<Record<string, RoleTool>> = {
   file_read_slice: "file_read",
   checkpoint_list: "file_read",
   checkpoint_show: "file_read",
+  // Impulse Scout only reads project context and writes JK-private state.
+  impulse_event_record: "file_read",
+  impulse_scout_run: "file_read",
+  impulse_wake_queue: "file_read",
+  impulse_director_decide: "file_read",
+  impulse_director_policy: "file_read",
+  impulse_semantic_review: "file_read",
+  project_feedback_record: "file_read",
   list_images: "file_read",
   retrieve_image: "file_read",
   command_list: "tests",

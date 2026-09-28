@@ -7,7 +7,7 @@ if [[ ! -f "$ROOT/package.json" && -f "$(dirname "${BASH_SOURCE[0]}")/package.js
 fi
 
 REPAIR=0
-if [[ "${1:-}" == "--repair" || "${CHATGPT2CODEX_DOCTOR_REPAIR:-0}" == "1" ]]; then
+if [[ "${1:-}" == "--repair" || "${JK_DOCTOR_REPAIR:-${CHATGPT2CODEX_DOCTOR_REPAIR:-0}}" == "1" ]]; then
   REPAIR=1
 fi
 
@@ -43,11 +43,11 @@ node_major() {
 }
 
 need_cloudflared=0
-if [[ "${CHATGPT2CODEX_EXPOSE_WEB:-0}" == "1" || -n "${PUBLIC_HOSTNAME:-}" || -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
+if [[ "${JK_EXPOSE_WEB:-${CHATGPT2CODEX_EXPOSE_WEB:-0}}" == "1" || -n "${PUBLIC_HOSTNAME:-}" || -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
   need_cloudflared=1
 fi
 
-printf 'ChatGPT To Codex macOS Doctor\n'
+printf 'JK macOS Doctor\n'
 printf 'Runtime: %s\n\n' "$ROOT"
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -82,13 +82,13 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 if [[ ! -f "$ROOT/dist/cli.js" ]]; then
-  block "dist/cli.js is missing. Reinstall ChatGPT To Codex or rebuild the source checkout."
+  block "dist/cli.js is missing. Reinstall JK or rebuild the source checkout."
 else
   ok "runtime CLI found"
 fi
 
-if [[ ! -x "$ROOT/start-chatgpt.sh" ]]; then
-  block "start-chatgpt.sh is missing or not executable. Reinstall ChatGPT To Codex."
+if [[ ! -x "$ROOT/start-jk.sh" ]]; then
+  block "start-jk.sh is missing or not executable. Reinstall JK."
 else
   ok "launcher script executable"
 fi

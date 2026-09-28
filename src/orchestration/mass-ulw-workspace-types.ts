@@ -1,6 +1,8 @@
 export type MassUlwWorkspaceLane = {
   id: string;
   writeScopes: string[];
+  /** Prerequisite lane IDs. Omitted dependencies mean an independent lane. */
+  dependsOn?: string[];
 };
 
 export type MassUlwWorkspaceHooks = {
@@ -88,5 +90,7 @@ export type JournalRecord = {
   applied: string[];
   preexisting: string[];
   backedUp: string[];
+  /** Digests include kind, permissions and bytes; persisted before either rename. */
+  ownership?: Array<{ readonly path: string; readonly preimage: string; readonly postimage: string }>;
   receipt?: MassUlwCommittedPublicationReceipt;
 };

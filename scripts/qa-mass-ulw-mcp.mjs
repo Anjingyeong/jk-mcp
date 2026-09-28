@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import net from "node:net";
 import path from "node:path";
@@ -18,9 +19,11 @@ const home = path.join(base, "home");
 const codexHome = path.join(base, "codex");
 const processTemp = path.join(base, "process-temp");
 const evidenceDir = path.join(processTemp, "mass-ulw-qa-events");
-const surfaceEvidenceDir = path.join(repoRoot, "evidence", "mass-ulw");
+const surfaceEvidenceDir = process.env.JK_QA_EVIDENCE_DIR
+  ? path.resolve(process.env.JK_QA_EVIDENCE_DIR)
+  : path.join(repoRoot, "evidence", "mass-ulw", `stdio-${randomUUID()}`);
 const surfaceEvidencePath = path.join(surfaceEvidenceDir, "surface-mcp.json");
-const stateDir = path.join(home, ".local", "share", "chatgpt2codex");
+const stateDir = path.join(home, ".local", "share", "jk");
 const loopId = "qa-mass-ulw-stdio";
 const workSessionId = "ws_mass_ulw_stdio";
 const expectedWaves = [["A"], ["B", "C"], ["D"]];
@@ -80,19 +83,21 @@ try {
     });
     socket.once("close", () => barrierConnections.delete(socket));
   });
+  const listening = once(barrierServer, "listening");
   barrierServer.listen(0, "127.0.0.1");
-  await once(barrierServer, "listening");
+  await listening;
   const barrierAddress = barrierServer.address();
   if (!barrierAddress || typeof barrierAddress === "string") throw new Error("failed to start the QA lane barrier");
   await writeFile(path.join(evidenceDir, "barrier-port"), String(barrierAddress.port), "utf8");
 
-  const inherited = Object.fromEntries(Object.entries(process.env).filter((entry) => entry[1] !== undefined));
+  const inherited = Object.fromEntries(Object.entries(process.env)
+    .filter(([key, value]) => value !== undefined && !/^(JK_|CHATGPT2CODEX_)/.test(key)));
   transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(repoRoot, "dist", "cli.js"), "serve", "--workspace", projectRoot,
       "--active-project-root", projectRoot, "--active-project-preset", "full-write"],
     cwd: repoRoot,
-    env: { ...inherited, CODEX_HOME: codexHome, HOME: home, USERPROFILE: home,
+    env: { ...inherited, JK_STATE_DIR: stateDir, CODEX_HOME: codexHome, HOME: home, USERPROFILE: home,
       TEMP: processTemp, TMP: processTemp },
     stderr: "pipe",
   });
@@ -257,7 +262,12 @@ try {
       cleanupErrors.push(`server kill: ${String(error)}`);
     }
   }
-  await Promise.race([serverExit, boundedTimeout(5_000)]);
+  let exitDeadline;
+  try {
+    await Promise.race([serverExit, new Promise((resolve) => { exitDeadline = setTimeout(resolve, 5_000); })]);
+  } finally {
+    clearTimeout(exitDeadline);
+  }
   const serverStopped = serverPid === null || !isPidAlive(serverPid);
   await rm(base, { recursive: true, force: true }).catch((error) => cleanupErrors.push(`temp remove: ${String(error)}`));
   const tempRemoved = (await stat(base).catch(() => null)) === null;
@@ -268,7 +278,7 @@ try {
 
 await mkdir(surfaceEvidenceDir, { recursive: true });
 await writeFile(surfaceEvidencePath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-console.log(JSON.stringify(report));
+console.log(JSON.stringify({ ...report, evidencePath: surfaceEvidencePath }));
 if (!report.pass) process.exitCode = 1;
 
 async function git(cwd, args) {
@@ -327,10 +337,6 @@ function isPidAlive(pid) {
   } catch {
     return false;
   }
-}
-
-function boundedTimeout(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function verifierFixture() {

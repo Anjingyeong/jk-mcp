@@ -1,14 +1,27 @@
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256([string]$Path) {
+    $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($getFileHash) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '') }
+        finally { $stream.Dispose() }
+    } finally { $sha256.Dispose() }
+}
+
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$Launcher = Join-Path $Root "start-chatgpt.ps1"
+$Launcher = Join-Path $Root "start-jk.ps1"
 
 $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Launcher, [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) {
     $messages = ($errors | ForEach-Object { $_.Message }) -join "`n"
-    throw "start-chatgpt.ps1 has PowerShell parse errors:`n$messages"
+    throw "start-jk.ps1 has PowerShell parse errors:`n$messages"
 }
 
 $functions = $ast.FindAll({
@@ -68,7 +81,7 @@ if ($connectedStatus -notcontains "JK is ready") {
     throw "Connected startup status did not claim JK is ready."
 }
 
-$windowsLauncher = Join-Path $Root "windows\ChatGPTToCodexLauncher.cs"
+$windowsLauncher = Join-Path $Root "windows\JKLauncher.cs"
 $windowsLauncherText = Get-Content -Raw -LiteralPath $windowsLauncher
 foreach ($statusMarker in @("JK runtime is running", "MCP endpoint available", "Waiting for ChatGPT connection", "JK is ready")) {
     if ($windowsLauncherText -notmatch [regex]::Escape($statusMarker)) {
@@ -79,15 +92,15 @@ if ($windowsLauncherText -match 'statusLabel\.Text\s*=\s*LFormat\("stableConnect
     throw "Windows UI still marks a stable connector URL as ready before OAuth connection is proven."
 }
 foreach ($approvalMarker in @(
-    'PublicControlCenterUrl().TrimEnd(''/'') + "/approvals"',
+    'return IsExecutorOnlyMode() ? PublicApprovalsPageUrl() : LocalApprovalsPageUrl();',
     'OpenUrl(ApprovalsPageUrl())'
 )) {
     if ($windowsLauncherText -notmatch [regex]::Escape($approvalMarker)) {
-        throw "Windows approvals navigation is missing cloud-first routing marker: $approvalMarker"
+        throw "Windows approvals navigation is missing local-first routing marker: $approvalMarker"
     }
 }
 
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("chatgpt2codex-launcher-test-" + [guid]::NewGuid().ToString("N"))
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("jk-launcher-test-" + [guid]::NewGuid().ToString("N"))
 try {
     New-Item -ItemType Directory -Force -Path (Join-Path $tempRoot "src"), (Join-Path $tempRoot "dist") | Out-Null
     Set-Content -LiteralPath (Join-Path $tempRoot "package.json") -Value "{}"
@@ -120,12 +133,12 @@ try {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$packagedLauncher = Join-Path $Root "build\windows\JK\start-chatgpt.ps1"
+$packagedLauncher = Join-Path $Root "build\windows\JK\start-jk.ps1"
 if (Test-Path -LiteralPath $packagedLauncher) {
-    $sourceHash = (Get-FileHash -LiteralPath $Launcher -Algorithm SHA256).Hash
-    $packagedHash = (Get-FileHash -LiteralPath $packagedLauncher -Algorithm SHA256).Hash
+    $sourceHash = Get-Sha256 $Launcher
+    $packagedHash = Get-Sha256 $packagedLauncher
     if ($sourceHash -ne $packagedHash) {
-        throw "Existing Windows development package launcher is stale. Re-sync start-chatgpt.ps1."
+        throw "Existing Windows development package launcher is stale. Re-sync start-jk.ps1."
     }
 }
 

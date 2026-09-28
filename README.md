@@ -4,239 +4,96 @@
 
 # JK
 
-**Local coding hands for ChatGPT, with project-scoped safety and verifiable execution.**
+**Local coding hands for ChatGPT, with persistent work, guarded execution, and verifiable results.**
 
 [English](README.md) | [한국어](README.ko.md)
 
-JK is an independent, unofficial modified fork of [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex). It connects ChatGPT to a local MCP / Actions runtime so ChatGPT can inspect a selected project, edit files, run tests, operate Git, launch E2E checks, and return execution evidence without uploading an entire repository to a separate coding-agent service.
+JK is a free local MCP coding app designed and built by **Anjingyeong**. Install it, pick a project folder, and connect it to ChatGPT. The current conversation can then inspect code, edit files, run tests, operate Git, run E2E checks, and return execution evidence.
 
-This fork focuses on making the local coding loop more durable and practical on Windows: persistent work sessions, fast resume, hash-checked patches, JK-native orchestration, optional OMO delegation, Windows browser E2E, and explicit development/portable runtime modes.
+JK is not another AI model. ChatGPT does the reasoning; JK is the local execution layer that remembers the work and enforces safety.
 
-> **Unofficial project:** JK is not affiliated with, endorsed by, sponsored by, or partnered with OpenAI. ChatGPT, GPT, Codex, and other OpenAI marks belong to OpenAI.
->
-> **Licensing notice:** the upstream repository currently does not expose a root software `LICENSE` and its package metadata states `Copyright 2026 ezBuilder. All rights reserved.` The JK maintainer has obtained direct permission from the upstream author to redistribute this modified fork. That permission does **not** relicense the upstream code as MIT, Apache, or another open-source license. See [Attribution & Compliance](docs/ATTRIBUTION_AND_COMPLIANCE.md).
+> JK is an independent project and is not affiliated with or endorsed by OpenAI. OpenAI, ChatGPT, GPT, and Codex are marks or products of OpenAI.
 
-## First install: only 3 steps
+## Download
 
-First-time users do not need to understand MCP, OAuth, domains, or Cloudflare configuration. **Install Node.js 22+ first**, then follow this flow.
+Download the app from the [Releases page](https://github.com/Anjingyeong/jk-mcp/releases). No Node.js or terminal is required. Node.js, cloudflared, and ripgrep are bundled.
 
-### 1. Run one PowerShell command
+| OS | File |
+|---|---|
+| Windows | `JK-...-setup.exe` |
+| macOS | `jk-....pkg` |
 
-```powershell
+The installers are not code-signed yet. If Windows SmartScreen appears, choose **More info → Run anyway** only when the file came from the official Releases page.
+
+### Prefer the terminal?
+
+With Node.js 22+ installed, one command sets everything up and prints the connector URL, Control Center link, and health check (Ctrl+click to open):
+
+```bash
 npx -y jk-mcp setup
 ```
 
-### 2. Answer the setup wizard
+Run the same command next time; it reuses your folder and connection code. `jk start` also works after `npm install -g jk-mcp`.
 
-JK checks the helper tools it needs. On Windows, if Git, ripgrep, or the Cloudflare tunnel helper is missing, JK first asks for permission before installing the official package IDs through `winget`. It never installs those system packages before you confirm. Then choose or paste the folder ChatGPT is allowed to work in.
+## Quick start
 
-JK also creates the **private connection code** needed for the first connection. Internally this is the Owner Token, but a first-time user does not need to know that terminology.
+1. Install and open **JK**. The tray icon appears near the clock (menu bar on macOS).
+2. Open **Settings...** and choose the project folder ChatGPT may work in.
+3. Click **Auto-generate Token**, then **Copy Owner Token**. Treat it like a password.
+4. Enable **ChatGPT web connector** and click **Start MCP**.
+5. Click **Copy Connector URL**. It ends in `/mcp`.
+6. In ChatGPT, open **Apps & Connectors / Connectors**, create a new connector, and paste the URL.
+7. When ChatGPT shows the JK login window, paste the **Owner Token**.
+8. Try: `@jk Read this project's README and summarize its current state.`
 
-### 3. Paste the final address into ChatGPT
+### Connector URL: temporary vs. your own domain
 
-When setup finishes, JK prominently prints one address such as `https://....trycloudflare.com/mcp`. In ChatGPT, open **Apps / Connectors**, add a Custom MCP connector, and paste that address. If ChatGPT asks for the private connection code, enter the code shown by JK.
+| | No domain (default) | Your own domain (optional) |
+|---|---|---|
+| URL | `https://<random>.trycloudflare.com/mcp` | `https://mcp.example.com/mcp` |
+| Setup | Nothing. JK creates a Cloudflare Quick Tunnel automatically. | Run a Cloudflare Named Tunnel or HTTPS reverse proxy to `http://127.0.0.1:7979`, then enter the hostname in **Owned fixed domain**. |
+| After JK restarts | **The URL changes.** Update the connector URL in ChatGPT and log in again. | The URL stays the same. |
+| Best for | Trying JK, short sessions | Daily use |
 
-Keep the PowerShell window open while using JK. A personal domain, OCI/VPS, and an unsigned `JK.exe` are not required for the default path. The temporary Quick Tunnel address can change when JK restarts.
+A domain is nice to have, not required. See the [installation guide](docs/INSTALL.md) for the full setup.
 
-Next time, run **the same `npx -y jk-mcp setup` command again**. JK automatically reuses the previously allowed folder and private connection code. Advanced users who prefer a global command can run `npm install -g jk-mcp` and then use `jk start --quick-tunnel`; stable domains, Named Tunnels, `--public-url`, and `--no-start` remain available too.
-
-## 30-Second Usage
-
-JK is designed around **natural-language goals and completion criteria**, not memorizing internal tool names.
+## What you can ask
 
 ```text
 @jk Inspect this project and explain how it works. Do not edit anything.
 @jk Find the cause of this bug, fix it, and run the relevant tests.
 @jk Continue the previous task and finish it.
-@jk Run E2E and show desktop/mobile screenshots.
-@jk Review the current diff and commit it if everything looks correct.
-@jk If verification passes, commit and push to jk-mcp.
+@jk Implement this in a separate task workspace, verify it, then apply it.
+@jk Run E2E and show the passing evidence.
+@jk Review the current diff and commit it if verification passes.
 ```
 
-For larger tasks, state **project + goal + constraints + verification/finish condition**. Internal state such as `goal_loop`, `workSessionId`, leases, and file hashes normally does not need to be managed by the user.
+## Features
 
-See the [JK Usage Guide](docs/USAGE.md) for practical patterns, resume behavior, hierarchical `AGENTS.md` rules, E2E, Git, and when to use OMO.
+- **Persistent work sessions**: keeps the current goal, touched files, pending work, decisions, checkpoints, and verification results, so follow-up requests resume the real task instead of starting over.
+- **Guarded edits**: existing-file edits can use SHA-256 preconditions. A change is rejected if the file changed after it was read.
+- **JK-native orchestration**: `goal_intake` and `goal_loop` coordinate longer coding loops through Explorer, Oracle, Implementer, Reviewer, Verifier, and Recovery roles. Failed verification re-plans instead of repeating the same approach.
+- **MASS ULW**: dependency-aware implementation, verification, repair, and review lanes inside one ChatGPT conversation. See [MASS ULW workflow](docs/MASS_ULW_WEB.ko.md).
+- **Task workspaces**: implement and verify in a private workspace, then publish accepted changes back with conflict checks. See [Task Workspaces](docs/TASK_WORKSPACES.ko.md).
+- **Local execution bridge**: project selection, code search, narrow reads, guarded patches, allowlisted commands and shell jobs, Git status/diff/commit/explicit push, dev servers, E2E and screenshots, image intake, external MCP routing, runtime health checks.
+- **Control Center**: a local dashboard for work status, approvals, runs, executor identity, and runtime operations.
+- **Optional OMO delegation**: hand selected passes to a local OMO / Oh My OpenAgent install while JK keeps state, safety, and verification authoritative.
 
-## How It Works
+## Safety model
 
-JK is not a second AI model. The current ChatGPT session remains the reasoning layer; JK supplies project-scoped local tools, durable state, safety gates, and execution evidence.
+JK is intended for trusted development environments.
 
-```text
-User
-  -> ChatGPT web session (reasoning / planning)
-  -> MCP or GPT Actions
-  -> JK HTTP runtime
-  -> shared tool registry
-  -> project lease + safety guards
-  -> code / state / shell / Git / E2E
-  -> selected local project
-```
-
-`goal_intake` and `goal_loop` coordinate the coding loop inside the current ChatGPT session. OMO is an optional delegation path for users who want a separate local agent runtime; normal JK-native coding does not depend on OMO or a second model-provider credential.
-
-## What JK Adds
-
-### 1. Persistent work sessions
-
-JK can keep project-scoped and work-session-scoped state so a follow-up request can continue the previous task instead of rediscovering the repository from scratch.
-
-It can retain information such as:
-
-- active artifact and recently touched files
-- current goal and task
-- completed and pending work
-- implementation decisions
-- latest checkpoint and verification result
-- remembered line ranges for fast source hydration
-
-A `workSessionId` isolates multiple workflows inside the same repository.
-
-### 2. Safe resume with CAS-style patching
-
-Resume is validated against the current files on disk.
-
-```text
-resume
-  -> validate the active artifact
-  -> read the current source slice
-  -> return the current full-file SHA-256
-  -> use that hash as a patch precondition
-  -> reject the patch if the file changed in between
-```
-
-This reduces accidental overwrites when the repository changes between turns.
-
-### 3. JK-native orchestration
-
-JK now keeps orchestration inside the current ChatGPT web session by default. It does not need a second model provider, API key, or separate agent runtime for normal coding loops.
-
-`goal_intake` and `goal_loop` route each turn through reasoning roles such as:
-
-- Explorer: inspect/search/read before claims or edits
-- Oracle: challenge assumptions and choose the smallest sound strategy
-- Implementer: apply one coherent scoped change
-- Reviewer: check regressions, security, maintainability, and goal fit
-- Verifier: require targeted test/typecheck/build/E2E evidence
-- Recovery: stop repeating the same failed approach and form a new evidence-backed hypothesis
-
-Verification failures escalate structurally: inspect the first failure, switch approach on the second, and enter recovery after three or more failed attempts.
-
-### 4. Optional OMO delegation
-
-JK can delegate a coding or analysis pass to a locally installed OMO / Oh My OpenAgent CLI.
-
-The runner:
-
-- discovers compatible Codex-cache and global OMO Native installations without invoking a shell
-- probes both the legacy `omo run --help` contract and the OMO Native print contract
-- selects the newest compatible legacy version, or the shell-free global native Node entry
-- falls back to an older compatible version if a newer CLI breaks the contract
-- passes prompts as argv rather than shell text
-- defaults to the `general` agent for legacy runs when no agent is specified
-- preserves OMO session IDs for resumable agent runs
-
-JK supports both CLI contracts:
-
-```text
-Legacy: omo run --json --directory DIR --agent AGENT [--model MODEL] [--session-id ID] [--verbose] MESSAGE
-Native: omo --mode json --print [--model MODEL] [--session-id ID] [--verbose] MESSAGE
-```
-
-The `omo_run` tool exposes optional `ultrawork: true`. JK adds only the native `ulw` trigger and lets OMO inject its own hidden directive; JK never copies the directive text. Omitted or false ultrawork preserves the original message bytes. On OMO Native, JK also passes `--omo-senpi-ultrawork-disabled` so incidental text such as `mass-ulw` cannot activate the hook. OMO Native print mode has no agent selector, so JK rejects an explicit `agent` instead of silently ignoring it.
-
-OMO still uses whichever model provider/authentication is configured for OMO itself. A provider outage can therefore fail an OMO run even when JK and the local OMO CLI are healthy.
-
-### 5. Local MCP / Actions execution bridge
-
-Once connected, ChatGPT can use JK to:
-
-- discover and select local projects
-- read repository rules
-- search source code
-- read narrow file slices
-- create files and apply guarded patches
-- run allowlisted project commands
-- run guarded local shell commands
-- inspect Git status and diffs
-- commit and push when explicitly requested
-- start development servers
-- run E2E checks
-- capture browser / app screenshots where supported
-- save generated image assets into a project
-
-The execution model is intentionally simple:
-
-```text
-User
-  -> ChatGPT
-  -> MCP / Actions
-  -> JK local runtime
-  -> files / shell / Git / E2E / OMO
-```
-
-ChatGPT remains the main reasoning surface. JK is the local execution harness.
-
-### 6. Windows-first development workflow
-
-This fork contains significant Windows work, including:
-
-- JK-branded Windows launcher and installer paths
-- project folder selection
-- Owner Token approval flow
-- ChatGPT web connector support
-- stale process cleanup
-- Edge / Chrome based local-web E2E capture
-- desktop and mobile viewport screenshot proof
-- browser console / failed-network capture in the E2E path
-- development-runtime auto-sync back to the source checkout
-
-For an exact implementation history, see [docs/HARNESS_DEVLOG.md](docs/HARNESS_DEVLOG.md).
-
-## Local Performance Snapshot
-
-The following numbers were measured on the maintainer's Windows development machine on **2026-08-13**, with the JK runtime already running locally. They are implementation measurements, not a cross-machine SLA.
-
-| Operation | Result |
-| --- | ---: |
-| `goal_intake` direct handler | 1.35 ms avg |
-| `goal_loop` first-turn handler | 1.43 ms avg |
-| 50-turn `goal_loop` continuation | 2.11 ms early avg -> 2.74 ms late avg |
-| `file_read_slice` (100 lines + hashes) | 2.32 ms avg / 3.39 ms p95 |
-| persisted session read + validation | 0.634 ms avg / 1.045 ms p95 |
-| `code_search` via ripgrep | 48.62 ms avg / 60.15 ms p95 |
-| local `gitRepositoryStatus` | 182.18 ms avg / 191.03 ms p95 |
-| localhost `/healthz` | 14.20 ms avg |
-| localhost Actions OpenAPI | 15.13 ms avg |
-
-The live Node runtime was approximately **124 MB working set** with 13 threads during the same inspection. The practical latency bottleneck is usually not JK-native orchestration itself; repeated ChatGPT-tool round trips, child-process startup, Git, typecheck/test/build, and browser E2E dominate real task time.
-
-## Safety Model
-
-JK is intended for trusted local development, not arbitrary public automation.
-
-- Project access is scoped to the selected workspace/project.
-- Local-only state, MCP configuration, logs, `.env` files, and generated runtime state are ignored from Git.
+- Access is scoped to the selected project folder.
+- Sensitive shell, network, Git publication, and destructive operations require approval.
 - Secret-looking values are redacted from tool output.
-- Existing-file edits can use hash preconditions.
-- Network, destructive, commit, push, and other sensitive actions require explicit user intent or approval gates.
-- Remote ChatGPT access uses an Owner Token approval model.
-- The connector defaults to local/loopback behavior unless web connector/tunnel mode is enabled.
+- Project leases and task ownership prevent conflicting concurrent edits.
+- The MCP endpoint rejects requests without Owner Token authorization.
 
-Treat the Owner Token like a password. Do not publish it in issues, screenshots, logs, or documentation.
+Never share your Owner Token, tunnel credentials, or domain credentials in screenshots, logs, issues, or chats. If one leaks, rotate it in **Settings**.
 
-## Build From Source
+## For developers: build from source
 
-### Requirements
-
-- Node.js 22 or newer
-- npm
-- PowerShell on Windows
-- Optional: an externally managed HTTPS reverse proxy or tunnel when your ChatGPT client cannot reach localhost directly
-- Optional: a compatible OMO installation for `omo_run`
-
-The public repository is the MCP harness/core. Persistent cloud hosting, provider-specific provisioning, private domains, and automatic deployment are intentionally kept out of the public distribution. Host-specific behavior can be added through the local override boundary documented in `docs/LOCAL_OVERRIDES.md`.
-
-### Install and verify
+Requirements: Node.js 22+, npm, and PowerShell on Windows.
 
 ```bash
 npm ci
@@ -245,102 +102,55 @@ npm test
 npm run build
 ```
 
-### Run on Windows
+Run from source:
 
 ```powershell
-npm run chatgpt:windows
+npm run chatgpt:windows   # Windows
 ```
-
-### Run on macOS / Linux source environments
 
 ```bash
-npm run chatgpt
+npm run chatgpt           # macOS
+npm run chatgpt:linux     # Linux
 ```
 
-or:
+Packaging and E2E:
 
-```bash
-npm run chatgpt:linux
+```powershell
+npm run windows:package
+npm run windows:e2e
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) and [windows/README.md](windows/README.md) for the inherited installation/runtime documentation.
-
-## Useful Verification Commands
-
-```bash
-npm run typecheck
-npm test
-npm run build
-```
-
-Targeted OMO runner tests:
-
-```bash
-npx vitest run src/exec/omo-runner.test.ts
-```
-
-MCP / Actions catalog tests:
-
-```bash
-npx vitest run src/server/tools-catalog.test.ts src/server/http-actions.test.ts
-```
-
-## Repository Layout
+<details>
+<summary>Repository layout</summary>
 
 ```text
 src/
-  auth/       OAuth / Owner Token support
-  code/       search, read and patch operations
-  control/    optional desktop-control safety path
-  e2e/        local E2E automation and screenshot proof
-  exec/       command, shell and OMO runners
-  server/     MCP tools and Actions bridge
-  state/      persistent project/work-session state
-  workspace/  project registry and lease handling
+  auth/           authentication / owner-token support
+  code/           search, read, patch operations
+  control/        desktop/control safety paths
+  control-center/ local operations UI
+  e2e/            local browser E2E and evidence
+  exec/           command, shell, OMO runners
+  executors/      remote/local execution routing
+  orchestration/  MASS ULW and longer-running task logic
+  policy/         approvals, paths, secrets, shell-job policy
+  roles/          JK orchestration roles
+  server/         MCP tools and Actions bridge
+  state/          persistent project/work-session state
+  workspace/      project registry and lease handling
 
-windows/      Windows launcher / tray / installer code
-macos/        macOS status-bar application
-linux/        Linux launch/install path
-scripts/      build, packaging and verification scripts
-docs/         install, engineering log and compliance notes
-assets/       public UI / README assets
+windows/          Windows launcher / tray / installer
+macos/            macOS launcher/status-bar path
+linux/            Linux launch/install path
+scripts/          build, packaging, verification, release helpers
+docs/             usage, architecture notes, engineering docs
+assets/           JK public assets
 ```
 
-## Recommended First Prompts
+</details>
 
-Basic repository check:
+## Author
 
-```text
-@jk Select my project, inspect its status and rules, run the safest relevant check,
-and summarize the result with exact evidence.
-```
+JK is designed, built, and maintained by **Anjingyeong**.
 
-OMO delegation:
-
-```text
-@jk Use OMO to analyze this project and return the highest-priority issues.
-@jk Use OMO ultrawork to implement and verify this change.
-```
-
-Visual verification:
-
-```text
-@jk Run E2E, capture the passing screenshots, and show me the proof.
-```
-
-## Attribution and Licensing
-
-The original project and base runtime were created by **ezBuilder**:
-
-- Upstream: [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)
-- Original package metadata: `Copyright 2026 ezBuilder. All rights reserved.`
-
-This fork is maintained as **Anjingyeong/jk-mcp** and contains substantial follow-on harness engineering, including persistent work sessions, fast resume, CAS patch handoff, Windows E2E work, JK branding, explicit development/portable runtime separation, and optional OMO integration.
-
-As of the latest review, the upstream GitHub repository does not expose a root software license. Public source visibility or GitHub forkability should not be interpreted as an independent redistribution/relicensing grant. This repository does not publish a new license over the combined upstream-derived work.
-
-For details, read [docs/ATTRIBUTION_AND_COMPLIANCE.md](docs/ATTRIBUTION_AND_COMPLIANCE.md).
-
-## Status
-
-JK is an active engineering fork. Source-level workflows are the primary focus. Modified binary redistribution should be treated separately from source development because of the upstream licensing uncertainty described above.
+The earliest codebase incorporated work from another project, used with the original author's permission. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) and [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md).

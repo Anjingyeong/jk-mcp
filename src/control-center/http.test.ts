@@ -1,4 +1,5 @@
 import { createServer as createNodeServer, type Server } from "node:http";
+import { EventEmitter, once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -6,9 +7,17 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../types.js";
 import { createHttpServer, defaultHttpServerConfig } from "../server/http.js";
-import { requestLocalShellApproval } from "../policy/local-approvals.js";
-import { queueLocalShellJob, readLocalShellJob } from "../policy/local-shell-jobs.js";
+import { consumeLocalShellApprovalGrant, requestLocalShellApproval, resolveLocalShellApproval } from "../policy/local-approvals.js";
+import { queueLocalShellJob, readLocalShellJob, updateLocalShellJob } from "../policy/local-shell-jobs.js";
 import { storeOwnerToken } from "../auth/owner-token.js";
+import { TaskWorkspaceStore } from "../workspace/task-workspaces.js";
+import { git } from "../orchestration/mass-ulw-workspace-repository.js";
+import { deriveLocalExecutionTarget } from "../executors/target-protocol.js";
+import { createRuntimeIdentity } from "../executors/target-protocol.js";
+import { issueExecutorToken } from "../executors/auth.js";
+import { CONTROL_CENTER_HTML } from "./ui.js";
+
+const jobEvents = new EventEmitter();
 
 const OWNER_TOKEN = "unit-test-remote-owner-token-1234567890";
 
@@ -65,7 +74,7 @@ function makeCtx(stateDir: string, projectRoot: string): ToolContext {
     workspaceRoot: path.dirname(projectRoot),
     stateDir,
     registry,
-    ledger: { append: async () => undefined },
+    ledger: { append: async (event) => { jobEvents.emit(String(event.type), event); } },
     store: {
       loadProjects: async () => registry,
       saveProjects: async () => undefined,
@@ -132,6 +141,62 @@ afterEach(async () => {
 });
 
 describe("JK Control Center", () => {
+  it("serves a worker-authenticated, project-scoped run view for the native JK app", async () => {
+    const executorId = "windows-main";
+    const workerToken = await issueExecutorToken(stateDir, executorId);
+    const worker = {
+      ...await createRuntimeIdentity("worker", path.dirname(projectRoot), executorId, ["execution-target-v1"]),
+      platform: "win32/x64",
+      projects: [{ projectId: "proj", name: "example-service", root: projectRoot, aliases: ["example-service"] }],
+    };
+    const heartbeat = await fetch(`${app!.baseUrl}/api/executors/heartbeat`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${workerToken}`, "content-type": "application/json" },
+      body: JSON.stringify(worker),
+    });
+    expect(heartbeat.status).toBe(200);
+
+    const route = `${app!.baseUrl}/api/executors/${executorId}/run-view`;
+    expect((await fetch(route, { headers: { authorization: "Bearer wrong-token" } })).status).toBe(401);
+    const response = await fetch(route, { headers: { authorization: `Bearer ${workerToken}` } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body).toMatchObject({ ok: true, approvalCount: 0 });
+    expect(body.execution).toMatchObject({ projectId: "proj", goal: "Finish dashboard", task: "QA" });
+    expect(body.logs[0]).toMatchObject({ type: "tool.call", projectId: "proj", detail: "code_search" });
+  });
+
+  it("does not project a completed historical goal as the native app's live DAG", async () => {
+    await app!.stop();
+    const ctx = makeCtx(stateDir, projectRoot);
+    const session = await ctx.store.getSession();
+    const taskState = (session.workContexts as any).proj.taskState;
+    taskState.lifecycle = "succeeded";
+    await ctx.store.setSession(session);
+    app = await startApp(ctx);
+
+    const execution = await (await fetch(`${app.baseUrl}/api/jk/control/execution`)).json() as any;
+    expect(execution.execution).toMatchObject({ projectId: null, goal: null, task: null, massUlw: null });
+
+    const executorId = "windows-main";
+    const workerToken = await issueExecutorToken(stateDir, executorId);
+    const worker = {
+      ...await createRuntimeIdentity("worker", path.dirname(projectRoot), executorId, ["execution-target-v1"]),
+      platform: "win32/x64",
+      projects: [{ projectId: "proj", name: "example-service", root: projectRoot, aliases: ["example-service"] }],
+    };
+    const heartbeat = await fetch(`${app.baseUrl}/api/executors/heartbeat`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${workerToken}`, "content-type": "application/json" },
+      body: JSON.stringify(worker),
+    });
+    expect(heartbeat.status).toBe(200);
+    const runView = await (await fetch(`${app.baseUrl}/api/executors/${executorId}/run-view`, {
+      headers: { authorization: `Bearer ${workerToken}` },
+    })).json() as any;
+    expect(runView.execution).toMatchObject({ projectId: null, goal: null, task: null, massUlw: null });
+  });
+
   it("keeps core HTTP health available when the optional management surface is headless", async () => {
     await app!.stop();
     app = await startApp(makeCtx(stateDir, projectRoot), false);
@@ -139,6 +204,27 @@ describe("JK Control Center", () => {
     expect((await fetch(`${app.baseUrl}/healthz`)).status).toBe(200);
     expect((await fetch(`${app.baseUrl}/`)).status).toBe(404);
     expect((await fetch(`${app.baseUrl}/api/jk/roles`)).status).toBe(404);
+  });
+
+  it("surfaces sanitized goal_loop coordination telemetry in Control Center status", async () => {
+    const telemetryDir = path.join(stateDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+    const rows = [
+      { schemaVersion: 1, at: new Date().toISOString(), coordinationMode: "standard", durationMs: 100, responseBytes: 10000, turn: 1, failureCount: 0, retryCount: 0, lifecycle: "yielded" },
+      { schemaVersion: 1, at: new Date().toISOString(), coordinationMode: "dispatcher", durationMs: 120, responseBytes: 7500, turn: 2, failureCount: 1, retryCount: 0, lifecycle: "reasoning-needed" },
+    ];
+    await writeFile(path.join(telemetryDir, "goal-loop.jsonl"), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+
+    const response = await fetch(`${app!.baseUrl}/api/jk/control/status`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.goalLoopTelemetry).toMatchObject({
+      samples: 2,
+      standard: { samples: 1, avgResponseBytes: 10000, avgDurationMs: 100, failureRate: 0 },
+      dispatcher: { samples: 1, avgResponseBytes: 7500, avgDurationMs: 120, failureRate: 1 },
+      dispatcherVsStandard: { responseBytesDeltaPct: -25, durationDeltaPct: 20 },
+    });
+    expect(JSON.stringify(body.goalLoopTelemetry)).not.toContain(projectRoot);
   });
 
   it("serves the local dashboard and blocks forwarded non-loopback access", async () => {
@@ -149,18 +235,19 @@ describe("JK Control Center", () => {
     expect(html).toContain("JK Control Center");
     expect(html).toContain("JK 시작 가이드");
     expect(html).toContain("실행 단계");
-    expect(html).toContain("AUTO ORCHESTRATION");
+    expect(html).toBe(CONTROL_CENTER_HTML);
     expect(html).toContain("Activity");
     expect(html).toContain("Settings");
     expect(html).toContain("Secure remote admin");
     expect(html).toContain("Authenticated remote");
     expect(html).not.toContain("Local admin only");
     expect(html).toContain("workflow-rail-root");
-    expect(html).toContain('aria-label="MASS ULW execution status"');
-    expect(html).toContain('aria-label="Current MASS ULW wave"');
-    expect(html).toContain('aria-label="Running MASS ULW lanes"');
-    expect(html).toContain('aria-label="Blocked MASS ULW dependencies"');
-    expect(html).toContain('aria-label="MASS ULW verification"');
+    expect(html).toContain('aria-label="MASS ULW 작업 그래프"');
+    expect(html).toContain('aria-label="Lane status summary"');
+    expect(html).toContain('aria-label="MASS ULW dependency graph viewport"');
+    expect(html).toContain('class="run-dag-edge"');
+    expect(html).toContain('data-lane-status=');
+    expect(html).toContain('data-run-started-at=');
     expect(html).toContain("refreshSignals");
     expect(html).not.toContain("Live Office");
     expect(html).not.toContain("data:image/webp;base64,UklGR");
@@ -372,13 +459,38 @@ describe("JK Control Center", () => {
     expect(status.deployment).toMatchObject(deployment);
   });
 
-  it("does not expose the maintainer-only deployment sync endpoint", async () => {
-    const response = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
+  it.skipIf(process.platform === "win32")("queues one fixed JK deployment sync approval and reuses it on repeated dashboard clicks", async () => {
+    process.env.JK_DEPLOYMENT_PROJECT_ROOT = projectRoot;
+    await mkdir(path.join(projectRoot, "src", "server"), { recursive: true });
+    await mkdir(path.join(projectRoot, "scripts"), { recursive: true });
+    await writeFile(path.join(projectRoot, "src", "server", "tools.ts"), "// marker\n");
+    await writeFile(path.join(projectRoot, "scripts", "sync-jk-oci.sh"), "#!/usr/bin/env bash\n");
+    await writeFile(path.join(projectRoot, "scripts", "reload-jk-runtime.sh"), "#!/usr/bin/env bash\n");
+
+    const firstResponse = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: "{}",
+      body: JSON.stringify({ command: "systemctl restart anything" }),
     });
-    expect(response.status).toBe(404);
+    expect(firstResponse.status).toBe(202);
+    const first = await firstResponse.json() as any;
+    expect(first).toMatchObject({ ok: true, status: "pending", reused: false });
+    expect(first.job.commandPreview).toBe("bash scripts/sync-jk-oci.sh --reload-current");
+    expect(first.job.needsNetwork).toBe(true);
+    expect(first.job.destructive).toBe(true);
+
+    const secondResponse = await fetch(`${app!.baseUrl}/api/jk/control/deployment/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "rm -rf /" }),
+    });
+    expect(secondResponse.status).toBe(202);
+    const second = await secondResponse.json() as any;
+    expect(second).toMatchObject({ ok: true, status: "pending", reused: true, approvalId: first.approvalId });
+
+    const approvals = await (await fetch(`${app!.baseUrl}/api/jk/control/approvals`)).json() as any;
+    const deploymentApprovals = approvals.approvals.filter((item: any) => item.commandPreview === "bash scripts/sync-jk-oci.sh --reload-current");
+    expect(deploymentApprovals).toHaveLength(1);
   });
 
   it("loads sanitized host-local quick links without hardcoding them in the public UI", async () => {
@@ -409,6 +521,83 @@ describe("JK Control Center", () => {
     const body = await response.json() as any;
     expect(body.lease.preset).toBe("read-only");
     expect(body.roleContext.effectivePermission).toBe("read-only");
+  });
+
+  it("arms a control lease from the owner Control Center", async () => {
+    const response = await fetch(`${app!.baseUrl}/api/jk/control/projects/proj/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "control", controlApps: ["TextEdit", "Google Chrome", "TextEdit"] }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.lease.preset).toBe("control");
+    expect(body.roleContext.effectivePermission).toBe("control");
+    const status = await (await fetch(`${app!.baseUrl}/api/jk/control/status`)).json() as any;
+    expect(status.session.controlAllowlist).toEqual(["TextEdit", "Google Chrome"]);
+  });
+
+  it("refuses empty or sensitive Computer Control allowlists", async () => {
+    const empty = await fetch(`${app!.baseUrl}/api/jk/control/projects/proj/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "control", controlApps: [] }),
+    });
+    expect(empty.status).toBe(400);
+
+    const sensitive = await fetch(`${app!.baseUrl}/api/jk/control/projects/proj/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "control", controlApps: ["1Password"] }),
+    });
+    expect(sensitive.status).toBe(400);
+    expect(await sensitive.json()).toMatchObject({ code: "SENSITIVE_TARGET_BLOCKED" });
+  });
+
+  it("approving an old card does not authorize a later undeclared command", async () => {
+    if (!app) throw new Error("test app missing");
+    const input = { projectId: "proj", command: "qa-A", cwd: ".", taskIdentity: "goal:qa", workSessionId: "ws_qa",
+      needsNetwork: false, destructive: true };
+    const first = await requestLocalShellApproval(stateDir, input);
+    const oldCard = await fetch(`${app.baseUrl}/api/jk/control/approvals`, { signal: AbortSignal.timeout(15000) });
+    expect(oldCard.status).toBe(200);
+    expect(await oldCard.json()).toMatchObject({ approvals: [first] });
+    const retry = await requestLocalShellApproval(stateDir, { ...input, bundle: { label: "wider", entries: [input, { ...input, command: "qa-B" }] } });
+    const response = await fetch(`${app.baseUrl}/api/jk/control/approvals/${first.id}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
+      signal: AbortSignal.timeout(15000),
+    });
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(await consumeLocalShellApprovalGrant(stateDir, { ...input, command: "qa-B" })).toBeNull();
+    expect(retry).toEqual(first);
+    expect(result).toMatchObject({ ok: true, approval: { ...first, status: "approved" }, job: null });
+    expect(await consumeLocalShellApprovalGrant(stateDir, input)).toMatchObject({ approvalId: first.id });
+  });
+
+  it.each(["approve", "supervise", "deny"] as const)("uses the stored %s decision for conflicting HTTP retries", async (decision) => {
+    if (!app) throw new Error("test app missing");
+    const input = { projectId: "proj", command: "node --version", cwd: ".", reason: "stored decision",
+      taskIdentity: "goal:goal-1", needsNetwork: true, destructive: false };
+    const requested = await requestLocalShellApproval(stateDir, input);
+    const queued = await queueLocalShellJob(stateDir, requested, input);
+    const storedStatus = decision === "deny" ? "denied" : "succeeded";
+    await updateLocalShellJob(stateDir, queued.id, (current) => ({ ...current, status: storedStatus }));
+    await resolveLocalShellApproval(stateDir, requested.id, decision);
+    const resolved = once(jobEvents, "local.approval.resolved", { signal: AbortSignal.timeout(15000) });
+    const response = await fetch(`${app.baseUrl}/api/jk/control/approvals/${requested.id}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: decision === "deny" ? "approve" : "deny" }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const [audit] = await resolved;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      approval: { status: decision === "deny" ? "denied" : "approved", resolvedDecision: decision },
+      job: { id: queued.id, status: storedStatus },
+    });
+    expect(audit).toMatchObject({ approvalId: requested.id, decision });
+    expect(await readLocalShellJob(stateDir, queued.id)).toMatchObject({ status: storedStatus });
   });
 
   it("surfaces shell approvals only on loopback and accepts supervised task approval", async () => {
@@ -450,6 +639,33 @@ describe("JK Control Center", () => {
     expect(pendingAfter.approvals).toHaveLength(0);
   });
 
+  it("does not execute an approved pending job after its task workspace is archived", async () => {
+    await git(projectRoot, ["init", "--quiet"]);
+    await git(projectRoot, ["config", "user.name", "JK test"]);
+    await git(projectRoot, ["config", "user.email", "test@localhost"]);
+    await writeFile(path.join(projectRoot, "base.txt"), "source");
+    await git(projectRoot, ["add", "."]);
+    await git(projectRoot, ["commit", "--quiet", "-m", "baseline"]);
+    const tasks = new TaskWorkspaceStore(stateDir);
+    const task = await tasks.create({ projectId: "proj", name: "example-service", root: projectRoot, aliases: [] }, "ws_pending", "Pending job");
+    const approvalInput = {
+      projectId: task.id, command: `node -e "require('node:fs').writeFileSync('must-not-run.txt','bad')"`,
+      cwd: ".", reason: "pending workspace command", workSessionId: task.workSessionId,
+      needsNetwork: true, destructive: false,
+    };
+    const requested = await requestLocalShellApproval(stateDir, approvalInput);
+    await queueLocalShellJob(stateDir, requested, { ...approvalInput, writesWorkspace: true, timeoutSec: 10,
+      executionTarget: await deriveLocalExecutionTarget(tempRoot, { projectId: task.id, root: tasks.root(task.id) }) });
+    await tasks.locked(task.id, () => tasks.archive(task.id));
+    const response = await fetch(`${app!.baseUrl}/api/jk/control/approvals/${requested.id}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(response.status).toBe(200);
+    expect((await readLocalShellJob(stateDir, requested.id))?.status).toBe("failed");
+    await expect(readFile(path.join(tasks.root(task.id), "must-not-run.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(projectRoot, "must-not-run.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("runs the exact queued shell job immediately after local approval without a caller retry", async () => {
     const command = `node -e "require('node:fs').writeFileSync('approved-job.txt','ok')"`;
     const approvalInput = {
@@ -464,11 +680,13 @@ describe("JK Control Center", () => {
     const requested = await requestLocalShellApproval(stateDir, approvalInput);
     await queueLocalShellJob(stateDir, requested, {
       ...approvalInput,
+      executionTarget: await deriveLocalExecutionTarget(tempRoot, { projectId: "proj", root: projectRoot }),
       timeoutSec: 10,
       writesWorkspace: true,
       continuation: { workSessionId: null, goalId: "goal-1", loopId: "loop-1" },
     });
 
+    const finished = once(jobEvents, "local.job.finished", { signal: AbortSignal.timeout(15000) });
     const resolved = await fetch(`${app!.baseUrl}/api/jk/control/approvals/${requested.id}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -477,13 +695,8 @@ describe("JK Control Center", () => {
     expect(resolved.status).toBe(200);
     expect((await resolved.json() as any).job.status).toBe("running");
 
-    let job = await readLocalShellJob(stateDir, requested.id);
-    // node startup can take seconds under parallel CI load; poll by deadline
-    const jobDeadline = Date.now() + 15_000;
-    while (Date.now() < jobDeadline && job?.status === "running") {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      job = await readLocalShellJob(stateDir, requested.id);
-    }
+    await finished;
+    const job = await readLocalShellJob(stateDir, requested.id);
     expect(job).toMatchObject({ status: "succeeded", exitCode: 0 });
     expect(await readFile(path.join(projectRoot, "approved-job.txt"), "utf8")).toBe("ok");
 
@@ -511,6 +724,7 @@ describe("JK Control Center", () => {
     const requested = await requestLocalShellApproval(stateDir, approvalInput);
     await queueLocalShellJob(stateDir, requested, {
       ...approvalInput,
+      executionTarget: await deriveLocalExecutionTarget(tempRoot, { projectId: "proj", root: projectRoot }),
       timeoutSec: 10,
       writesWorkspace: true,
       continuation: { workSessionId: null, goalId: "goal-1", loopId: "loop-1" },
@@ -523,6 +737,7 @@ describe("JK Control Center", () => {
     });
     expect(activate.status).toBe(200);
 
+    const finished = once(jobEvents, "local.job.finished", { signal: AbortSignal.timeout(15000) });
     const resolved = await fetch(`${app!.baseUrl}/api/jk/control/approvals/${requested.id}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -531,12 +746,8 @@ describe("JK Control Center", () => {
     expect(resolved.status).toBe(200);
     expect((await resolved.json() as any).job.status).toBe("running");
 
-    let job = await readLocalShellJob(stateDir, requested.id);
-    const jobDeadline = Date.now() + 15_000;
-    while (Date.now() < jobDeadline && job?.status === "running") {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      job = await readLocalShellJob(stateDir, requested.id);
-    }
+    await finished;
+    const job = await readLocalShellJob(stateDir, requested.id);
     expect(job).toMatchObject({ status: "succeeded", exitCode: 0 });
     expect(await readFile(path.join(projectRoot, "approved-after-lease-change.txt"), "utf8")).toBe("ok");
 

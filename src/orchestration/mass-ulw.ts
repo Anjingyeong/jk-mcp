@@ -123,7 +123,11 @@ export function buildMassUlwPlan(input: {
       const lanesComparable = comparable(left.id, right.id);
       const leftReadsAndWrites = [...left.readScopes, ...left.writeScopes];
       const rightReadsAndWrites = [...right.readScopes, ...right.writeScopes];
-      const writeCollision = left.writeScopes.some((scope) =>
+      // A write/write overlap is unsafe only when the lanes could run in the
+      // same wave. If one lane depends on the other, the dependency graph
+      // already serializes the shared write scope and the overlap must not
+      // collapse the entire MASS ULW plan back to single-lane execution.
+      const writeCollision = !lanesComparable && left.writeScopes.some((scope) =>
         right.writeScopes.some((other) => fanoutScopesOverlap(scope, other)));
       const concurrentReadCollision = !lanesComparable && (
         left.writeScopes.some((scope) => rightReadsAndWrites.some((other) => fanoutScopesOverlap(scope, other))) ||
@@ -173,7 +177,9 @@ export function buildMassUlwPlan(input: {
   );
   const policyBlocked = input.executionProfile === "fast";
   const uniqueHardBlocks = [...new Set(hardBlocks)];
-  const recommended = !policyBlocked && uniqueHardBlocks.length === 0 && netGain >= threshold;
+  const hasParallelWave = waves.some((wave) => wave.length > 1);
+  const noParallelism = lanes.length < 2 || criticalPathWork >= serialWork || !hasParallelWave;
+  const recommended = !policyBlocked && !noParallelism && uniqueHardBlocks.length === 0 && netGain >= threshold;
 
   return {
     state: recommended ? "fanout" : "sequential",
@@ -198,6 +204,8 @@ export function buildMassUlwPlan(input: {
         ? `Fan-out blocked by safety guard(s): ${uniqueHardBlocks.join(", ")}.`
         : policyBlocked
           ? "Fast profile keeps candidate lanes sequential to avoid coordination overhead."
+          : noParallelism
+            ? "Dependency graph exposes no concurrent wave; keep the work sequential."
           : recommended
             ? `Performance-first fan-out gain ${netGain} clears the ${input.executionProfile} threshold (>= ${threshold}) after coordination and context-pollution costs.`
             : `Performance-first fan-out gain ${netGain} does not clear the ${input.executionProfile} threshold (>= ${threshold}); keep the work sequential.`,

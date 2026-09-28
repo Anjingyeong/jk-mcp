@@ -491,7 +491,7 @@ function formHtml(params: {
   const copy = copyForLocale(params.locale);
   const dir = pageDirection(params.locale);
   const scopeText = params.scopes.length > 0 ? params.scopes.join(" ") : "chatgpt2codex";
-  const resourceText = params.resource?.href ?? "chatgpt2codex MCP endpoint";
+  const resourceText = params.resource?.href ?? "jk MCP endpoint";
   const error = params.error ? `<p class="error" role="alert">${htmlEscape(params.error)}</p>` : "";
   const hiddenFields = Object.entries(params.fields)
     .filter((entry): entry is [string, string] => entry[1] !== undefined)

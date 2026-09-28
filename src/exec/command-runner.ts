@@ -242,7 +242,7 @@ function buildExecFileInvocation(cmd: string, args: string[]): { file: string; a
   return { file: cmd, args };
 }
 
-function killProcessTree(pid: number | undefined, done: () => void): void {
+export function killProcessTree(pid: number | undefined, done: () => void): void {
   if (!pid) {
     done();
     return;
@@ -301,6 +301,7 @@ export async function runCommand(
   timeoutSec?: number,
   expectedManifestFingerprint?: string,
   approvedRisky = false,
+  signal?: AbortSignal,
 ): Promise<{
   exitCode: number;
   stdoutSummary: string;
@@ -357,11 +358,14 @@ export async function runCommand(
   return await new Promise((resolve, reject) => {
     let settled = false;
     let timedOut = false;
+    let interrupted = false;
     let timeoutHandle: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       fn();
     };
 
@@ -375,7 +379,7 @@ export async function runCommand(
         windowsHide: true,
       },
       (error, stdout, stderr) => {
-        if (timedOut) return;
+        if (timedOut || interrupted) return;
         const durationMs = Date.now() - start;
         const stdoutBuf = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? "", "utf8");
         const stderrBuf = Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? "", "utf8");
@@ -395,6 +399,16 @@ export async function runCommand(
         );
       },
     );
+
+    onAbort = () => {
+      if (settled || interrupted) return;
+      interrupted = true;
+      killProcessTree(child.pid, () => finish(() => reject(
+        signal?.reason instanceof Error ? signal.reason : new Error("Command execution interrupted"),
+      )));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
 
     timeoutHandle = setTimeout(() => {
       timedOut = true;

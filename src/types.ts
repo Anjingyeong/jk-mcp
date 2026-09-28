@@ -1,5 +1,5 @@
 /**
- * chatgpt2codex shared contract.
+ * jk shared contract.
  *
  * This module is the single source of truth for cross-module types used by
  * every tool implementation. Per PRD (docs/UNIFIED-PRD.md §8, §10) and
@@ -13,6 +13,8 @@
 // ---------------------------------------------------------------------------
 // Domain data model (PRD §10)
 // ---------------------------------------------------------------------------
+
+import type { ExecutionTarget } from "./executors/target-protocol.js";
 
 /** Canonical project metadata as tracked in the central registry. */
 export interface Project {
@@ -30,10 +32,11 @@ export interface Project {
   executorKind?: "local" | "remote";
   executorOnline?: boolean;
   sourceProjectId?: string;
+  executionTarget?: ExecutionTarget;
 }
 
 /**
- * Registry entry as persisted in `~/.local/share/chatgpt2codex/projects.json`.
+ * Registry entry as persisted in `~/.local/share/jk/projects.json`.
  * Currently identical in shape to `Project`; kept as a distinct alias so the
  * on-disk contract can diverge from the in-memory/API contract later without
  * a breaking rename.
@@ -44,7 +47,7 @@ export type ProjectRegistryEntry = Project;
  * Lease preset controlling the ceiling of permitted mutating operations.
  * `control` is the Option B human-confirmed desktop-control preset: it grants
  * only `read` + `control` capabilities (never write/image/remote) and is
- * only reachable when the install-time `CHATGPT2CODEX_CONTROL` feature flag
+ * only reachable when the install-time `JK_CONTROL` feature flag
  * is enabled (src/control/policy.ts isControlEnabled).
  */
 export type LeasePreset = "read-only" | "tests-only" | "full-write" | "image-only" | "control";

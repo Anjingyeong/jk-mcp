@@ -10,9 +10,9 @@ $ErrorActionPreference = "Stop"
 
 $Root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $BuildRoot = Join-Path $Root "build\linux"
-$PackageDir = Join-Path $BuildRoot "chatgpt2codex-linux-x64"
+$PackageDir = Join-Path $BuildRoot "jk-linux-x64"
 if (-not $OutputRun -or $OutputRun.Trim().Length -eq 0) {
-  $OutputRun = Join-Path $BuildRoot "chatgpt2codex-linux-x64.run"
+  $OutputRun = Join-Path $BuildRoot "jk-linux-x64.run"
 }
 $OutputRun = [System.IO.Path]::GetFullPath($OutputRun)
 
@@ -56,9 +56,9 @@ Assert-UnderPath $PackageDir $BuildRoot
 $Npm = Get-ToolPath @("npm.cmd", "npm")
 $Tar = Get-ToolPath @("tar.exe", "tar")
 
-Write-Host "[chatgpt2codex] installing dependencies..."
+Write-Host "[jk] installing dependencies..."
 Invoke-Checked $Npm @("install")
-Write-Host "[chatgpt2codex] building TypeScript..."
+Write-Host "[jk] building TypeScript..."
 Invoke-Checked $Npm @("run", "build")
 
 if (Test-Path -LiteralPath $PackageDir) {
@@ -74,8 +74,8 @@ Copy-Tree (Join-Path $Root "assets") (Join-Path $PackageDir "assets")
 foreach ($file in @("package.json", "package-lock.json", "README.md")) {
   Copy-Item -LiteralPath (Join-Path $Root $file) -Destination (Join-Path $PackageDir $file) -Force
 }
-Copy-Item -LiteralPath (Join-Path $Root "linux\chatgpt2codex") -Destination (Join-Path $PackageDir "chatgpt2codex") -Force
-Copy-Item -LiteralPath (Join-Path $Root "linux\start-chatgpt2codex.sh") -Destination (Join-Path $PackageDir "start-chatgpt2codex.sh") -Force
+Copy-Item -LiteralPath (Join-Path $Root "linux\jk") -Destination (Join-Path $PackageDir "jk") -Force
+Copy-Item -LiteralPath (Join-Path $Root "linux\start-jk.sh") -Destination (Join-Path $PackageDir "start-jk.sh") -Force
 Copy-Item -LiteralPath (Join-Path $Root "linux\install-linux.sh") -Destination (Join-Path $PackageDir "install-linux.sh") -Force
 
 Push-Location $PackageDir
@@ -85,7 +85,7 @@ try {
   Pop-Location
 }
 
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("chatgpt2codex-linux-build-" + [System.Guid]::NewGuid().ToString("N"))
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("jk-linux-build-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 try {
   if (-not $NodeVersion -or $NodeVersion.Trim().Length -eq 0) {
@@ -94,7 +94,7 @@ try {
   }
   $NodeArchive = Join-Path $TempDir "node-linux-x64.tar.xz"
   $NodeUrl = "https://nodejs.org/dist/v$NodeVersion/node-v$NodeVersion-linux-x64.tar.xz"
-  Write-Host "[chatgpt2codex] downloading Linux Node.js $NodeVersion..."
+  Write-Host "[jk] downloading Linux Node.js $NodeVersion..."
   Download-File $NodeUrl $NodeArchive
   Invoke-Checked $Tar @("-xf", $NodeArchive, "-C", $TempDir)
   $NodeBin = Join-Path $TempDir "node-v$NodeVersion-linux-x64\bin\node"
@@ -102,7 +102,7 @@ try {
   Copy-Item -LiteralPath $NodeBin -Destination (Join-Path $PackageDir "bin\node") -Force
 
   $Cloudflared = Join-Path $PackageDir "bin\cloudflared"
-  Write-Host "[chatgpt2codex] downloading Linux cloudflared..."
+  Write-Host "[jk] downloading Linux cloudflared..."
   Download-File "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" $Cloudflared
 
   if (-not $SkipRipgrep) {
@@ -110,7 +110,7 @@ try {
       $RgVersion = "15.1.0"
       $RgArchive = Join-Path $TempDir "ripgrep-linux.tar.gz"
       $RgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/$RgVersion/ripgrep-$RgVersion-x86_64-unknown-linux-musl.tar.gz"
-      Write-Host "[chatgpt2codex] downloading Linux ripgrep $RgVersion..."
+      Write-Host "[jk] downloading Linux ripgrep $RgVersion..."
       Download-File $RgUrl $RgArchive
       Invoke-Checked $Tar @("-xzf", $RgArchive, "-C", $TempDir)
       $RgBin = Join-Path $TempDir "ripgrep-$RgVersion-x86_64-unknown-linux-musl\rg"
@@ -147,10 +147,11 @@ PORT="${PORT:-7979}"
 
 usage() {
   cat <<'EOF'
-Usage: chatgpt2codex-linux-x64.run [options]
+Usage: jk-linux-x64.run [options]
 
 Options:
-  --prefix PATH       Install path. Default: /opt/chatgpt2codex as root, otherwise ~/.local/share/chatgpt2codex-app
+  --prefix PATH       Default: /opt/jk as root, otherwise ~/.local/share/jk-app
+                      Existing legacy installations retain their current prefix.
   --no-launch         Install only
   --launch            Install and start in the foreground (default)
   --systemd           Install and start a system service (root)
@@ -207,19 +208,26 @@ done
 
 if [ -z "$PREFIX" ]; then
   if [ "$(id -u)" -eq 0 ]; then
-    PREFIX="/opt/chatgpt2codex"
+    canonical_prefix="/opt/jk"
+    legacy_prefix="/opt/chatgpt2codex"
   else
-    PREFIX="$HOME/.local/share/chatgpt2codex-app"
+    canonical_prefix="$HOME/.local/share/jk-app"
+    legacy_prefix="$HOME/.local/share/chatgpt2codex-app"
+  fi
+  if [ -e "$legacy_prefix" ] || [ -f /etc/systemd/system/chatgpt2codex.service ] || [ -f "$HOME/.config/systemd/user/chatgpt2codex.service" ]; then
+    PREFIX="$legacy_prefix"
+  else
+    PREFIX="$canonical_prefix"
   fi
 fi
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt2codex-run.XXXXXX")"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/jk-run.XXXXXX")"
 cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT
 
-archive_line="$(awk '/^__CHATGPT2CODEX_PAYLOAD_BELOW__$/ { print NR + 1; exit 0; }' "$0")"
+archive_line="$(awk '/^__JK_PAYLOAD_BELOW__$/ { print NR + 1; exit 0; }' "$0")"
 if [ -z "$archive_line" ]; then
   echo "installer payload marker not found" >&2
   exit 1
@@ -234,11 +242,11 @@ bash "$tmp/install-linux.sh" "${install_args[@]}"
 if [ "$LAUNCH" -eq 1 ]; then
   trap - EXIT
   cleanup
-  exec "$PREFIX/start-chatgpt2codex.sh" --workspace "$WORKSPACE" --port "$PORT"
+  exec "$PREFIX/start-jk.sh" --workspace "$WORKSPACE" --port "$PORT"
 fi
 
 exit 0
-__CHATGPT2CODEX_PAYLOAD_BELOW__
+__JK_PAYLOAD_BELOW__
 '@
 
 if (Test-Path -LiteralPath $OutputRun) { Remove-Item -LiteralPath $OutputRun -Force }
@@ -260,4 +268,4 @@ Write-Host ""
 Write-Host "Linux installer ready:"
 Write-Host "  $OutputRun"
 Write-Host "Run on a Linux VPS:"
-Write-Host "  bash chatgpt2codex-linux-x64.run"
+Write-Host "  bash jk-linux-x64.run"

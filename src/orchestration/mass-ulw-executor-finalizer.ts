@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type { MassUlwStore } from "./mass-ulw-store.js";
 import type { MassUlwCommittedPublicationReceipt, MassUlwIntegrationResult, MassUlwPublishResult } from "./mass-ulw-workspace.js";
 import type { MassUlwWorkspaceLike, VerificationEngine, VerificationResult } from "./mass-ulw-executor-types.js";
+import { MassUlwStageError, massUlwFailureFromError, type MassUlwFailureDiagnostic } from "./mass-ulw-failure.js";
 import { CommittedPublicationReceiptSchema, massUlwPublishFingerprint } from "./mass-ulw-publish-recovery.js";
 function optionalFingerprint(value: unknown): string | undefined { return typeof value === "string" && value.length > 0 ? value : undefined; }
 export class MassUlwFinalizer { constructor(private readonly config: {
@@ -15,7 +16,7 @@ export class MassUlwFinalizer { constructor(private readonly config: {
     loopId: string,
     workspace: MassUlwWorkspaceLike,
     integration: MassUlwIntegrationResult,
-  ): Promise<{ passed: boolean; invocationCount: 0 | 1 }> {
+  ): Promise<{ passed: boolean; invocationCount: 0 | 1; failure?: MassUlwFailureDiagnostic }> {
     const document = await this.config.store.load(loopId);
     if (document.integrationVerification.status === "passed") {
       return {
@@ -23,7 +24,11 @@ export class MassUlwFinalizer { constructor(private readonly config: {
         invocationCount: 1,
       };
     }
-    if (document.integrationVerification.status !== "not-started") return { passed: false, invocationCount: 0 };
+    if (document.integrationVerification.status !== "not-started") {
+      const attemptId = "attemptId" in document.integrationVerification ? document.integrationVerification.attemptId : undefined;
+      const failure = attemptId ? document.attempts.find((attempt) => attempt.id === attemptId)?.failure : undefined;
+      return { passed: false, invocationCount: 0, ...(failure ? { failure } : {}) };
+    }
 
     await this.config.authorizeIntegratedVerification();
     const attemptId = `${loopId}:integration-verification:1`;
@@ -37,14 +42,32 @@ export class MassUlwFinalizer { constructor(private readonly config: {
         fingerprint: integration.commit,
         changedPaths: [...integration.changedPaths],
         invocationCount: 1,
+        baseCommit: workspace.baselineCommit,
       });
     } catch (error) {
-      await this.config.store.completeIntegrationVerification(loopId, attemptId, "failed");
-      throw error;
+      const failure = error instanceof MassUlwStageError
+        ? error.diagnostic
+        : massUlwFailureFromError(error, {
+            laneId: null,
+            stage: "final_verification",
+            baseCommit: workspace.baselineCommit,
+            checkoutCommit: integration.commit,
+            retryable: false,
+          });
+      await this.config.store.completeIntegrationVerification(loopId, attemptId, "failed", failure);
+      return { passed: false, invocationCount: 1, failure };
     }
     const passed = result.passed && optionalFingerprint(result.fingerprint) !== undefined;
-    await this.config.store.completeIntegrationVerification(loopId, attemptId, passed ? "passed" : "failed");
-    return { passed, invocationCount: 1 };
+    const failure = passed ? undefined : result.failure ?? massUlwFailureFromError(result.message ?? "Integrated verification failed", {
+      laneId: null,
+      stage: "final_verification",
+      baseCommit: workspace.baselineCommit,
+      checkoutCommit: integration.commit,
+      retryable: false,
+      message: result.message ?? "Integrated verification failed",
+    });
+    await this.config.store.completeIntegrationVerification(loopId, attemptId, passed ? "passed" : "failed", failure);
+    return { passed, invocationCount: 1, ...(failure ? { failure } : {}) };
   }
 
   async reconcilePublished(loopId: string, receipt: MassUlwCommittedPublicationReceipt): Promise<void> {

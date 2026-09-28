@@ -11,9 +11,9 @@ dist/
 .env.*
 *.log
 .chatgpt2codex/
+.jk/
 .gpt2codex/
 .omo/
-/.jk/
 /.local-tools/
 /build/
 /bin/
@@ -31,4 +31,5 @@ dist/
 /apply-windows-e2e-patch.cmd
 /restore-windows-e2e-patch.cmd
 /patch-chatgpt2codex-windows-e2e.mjs
+/patch-jk-windows-e2e.mjs
 *.before-windows-e2e

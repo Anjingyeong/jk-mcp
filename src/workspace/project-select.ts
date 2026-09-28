@@ -8,13 +8,13 @@ import {
 } from "../types.js";
 
 /** Default lease TTL when no config is threaded in (PRD §7 Project Lease). */
-const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+export const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Issue a new active project Lease (PRD §7 Project Lease / §8.2
  * project_select) for the given registry entry and preset.
  */
-export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset): Lease {
+export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset, ttlMs = DEFAULT_LEASE_TTL_MS): Lease {
   const issuedAt = Date.now();
   return {
     projectId: entry.projectId,
@@ -22,7 +22,7 @@ export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset): Lea
     projectRoot: entry.root,
     preset,
     issuedAt,
-    expiresAt: issuedAt + DEFAULT_LEASE_TTL_MS,
+    expiresAt: issuedAt + ttlMs,
   };
 }
 
@@ -33,7 +33,12 @@ export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset): Lea
  * while still extending the normal short-lived TTL. A changed project root,
  * preset, or expired lease gets a fresh identity.
  */
-export function renewLease(entry: ProjectRegistryEntry, preset: LeasePreset, current?: Lease): Lease {
+export function renewLease(
+  entry: ProjectRegistryEntry,
+  preset: LeasePreset,
+  current?: Lease,
+  ttlMs = DEFAULT_LEASE_TTL_MS,
+): Lease {
   const issuedAt = Date.now();
   if (
     current &&
@@ -45,10 +50,23 @@ export function renewLease(entry: ProjectRegistryEntry, preset: LeasePreset, cur
     return {
       ...current,
       issuedAt,
-      expiresAt: issuedAt + DEFAULT_LEASE_TTL_MS,
+      expiresAt: issuedAt + ttlMs,
     };
   }
-  return makeLease(entry, preset);
+  return makeLease(entry, preset, ttlMs);
+}
+
+/**
+ * Sliding renewal for a lease that is being used: once less than half of the
+ * TTL remains, extend it by a full TTL while keeping its identity, so approval
+ * grants keyed by the lease survive long work. Returns null when no extension
+ * is due. Expired leases are never revived here, and control leases (desktop
+ * input) never slide.
+ */
+export function slideLease(lease: Lease, ttlMs = DEFAULT_LEASE_TTL_MS, now = Date.now()): Lease | null {
+  if (lease.preset === "control" || now > lease.expiresAt) return null;
+  if (lease.expiresAt - now >= ttlMs / 2) return null;
+  return { ...lease, expiresAt: now + ttlMs };
 }
 
 /** Shape session state is expected to carry the active lease under (PRD §10 sessions.json). */

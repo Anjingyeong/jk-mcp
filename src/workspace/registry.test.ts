@@ -164,11 +164,11 @@ describe("scanWorkspace", () => {
   });
 
   it("keeps the development JK runtime registered when the selected workspace is another project", async () => {
-    const selectedProject = path.join(root, "SampleApp");
+    const selectedProject = path.join(root, "CleanTube");
     const runtimeRoot = path.join(root, "chatgpt2codex-source");
     await mkdir(selectedProject, { recursive: true });
     await mkdir(runtimeRoot, { recursive: true });
-    await writeFile(path.join(selectedProject, "package.json"), JSON.stringify({ name: "sample-app" }));
+    await writeFile(path.join(selectedProject, "package.json"), JSON.stringify({ name: "cleantube" }));
     await writeFile(path.join(runtimeRoot, "package.json"), JSON.stringify({ name: "chatgpt2codex" }));
 
     const entries = await scanWorkspaceWithRuntimeSelf(selectedProject, runtimeRoot, "development");
@@ -182,7 +182,7 @@ describe("scanWorkspace", () => {
   });
 
   it("does not widen the registry with the runtime root outside development mode", async () => {
-    const selectedProject = path.join(root, "SampleApp");
+    const selectedProject = path.join(root, "CleanTube");
     const runtimeRoot = path.join(root, "portable-runtime");
     await mkdir(selectedProject, { recursive: true });
     await mkdir(runtimeRoot, { recursive: true });
@@ -227,6 +227,13 @@ describe("findProject", () => {
   it("returns not_found for unknown projectId", () => {
     const result = findProject(entries, { projectId: "nope" });
     expect(result).toEqual({ ok: false, reason: "not_found" });
+  });
+
+  it("falls back to name/alias when projectId is not a canonical id", () => {
+    for (const projectId of ["beta", "Beta"]) {
+      const result = findProject(entries, { projectId, name: projectId });
+      expect(result).toEqual({ ok: true, entry: beta });
+    }
   });
 
   it("resolves exact single match by name", () => {

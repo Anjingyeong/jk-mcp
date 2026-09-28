@@ -46,7 +46,14 @@ describe("Mass ULW planning", () => {
       lane("A", { writeScopes: ["src/shared"] }),
       lane("B", { writeScopes: ["src/shared/a.ts"], dependsOn: ["A"] }),
     ]);
-    expect(dependentWriteWrite.join(" ")).toContain("scope-collision:A<->B");
+    expect(dependentWriteWrite.join(" ")).not.toContain("scope-collision:A<->B");
+    expect(buildMassUlwPlan({
+      executionProfile: "max",
+      candidates: [
+        lane("A", { writeScopes: ["src/shared"] }),
+        lane("B", { writeScopes: ["src/shared/a.ts"], dependsOn: ["A"] }),
+      ],
+    }).waves).toEqual([["A"], ["B"]]);
     const writeRead = blockedBy([
       lane("A", { writeScopes: ["src/shared"] }),
       lane("B", { writeScopes: [], readScopes: ["src/shared/a.ts"] }),
@@ -87,5 +94,21 @@ describe("Mass ULW planning", () => {
       threshold: 0.25,
       netGain: 1.2,
     });
+
+    const fullySerial = [
+      lane("A", { latencyBound: true }),
+      lane("B", { latencyBound: true, dependsOn: ["A"] }),
+      lane("C", { latencyBound: true, dependsOn: ["B"] }),
+      lane("D", { latencyBound: true, dependsOn: ["C"] }),
+    ];
+    const serialPlan = buildMassUlwPlan({ executionProfile: "max", candidates: fullySerial });
+    expect(serialPlan).toMatchObject({
+      state: "sequential",
+      recommended: false,
+      serialWork: 12,
+      criticalPathWork: 12,
+      waves: [["A"], ["B"], ["C"], ["D"]],
+    });
+    expect(serialPlan.rationale).toContain("no concurrent wave");
   });
 });

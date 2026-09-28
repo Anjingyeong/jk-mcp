@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rm, unlink } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import path from "node:path";
 import { z } from "zod";
 
@@ -51,7 +52,7 @@ export async function writeMassUlwIdentityIndex(
     await handle.close();
   }
   try {
-    await rename(temporary, target);
+    await renameWithRetry(temporary, target);
     await chmod(target, FILE_MODE);
   } catch (error) {
     await unlink(temporary).catch(() => undefined);

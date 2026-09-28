@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import path from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
@@ -13,6 +14,7 @@ const MEMORY_FILE = "project-memory.json";
 const MAX_CONTEXT_PACKS = 24;
 const MAX_RESULTS = 80;
 const MAX_KNOWN_FIXES = 100;
+const MAX_FEEDBACK = 60;
 
 const ContextPackEntrySchema = z.object({
   key: z.string().min(1),
@@ -45,10 +47,21 @@ const KnownFixSchema = z.object({
   updatedAt: z.number().int().nonnegative(),
 });
 
+const ProjectFeedbackSchema = z.object({
+  id: z.string().min(1),
+  key: z.string().min(1).max(200),
+  text: z.string().min(1).max(300),
+  tags: z.array(z.string().min(1).max(80)).max(12),
+  count: z.number().int().positive(),
+  firstAt: z.number().int().nonnegative(),
+  lastAt: z.number().int().nonnegative(),
+});
+
 const ProjectMemorySchema = z.object({
   contextPacks: z.array(ContextPackEntrySchema).default([]),
   results: z.array(ResultCacheEntrySchema).default([]),
   knownFixes: z.array(KnownFixSchema).default([]),
+  feedback: z.array(ProjectFeedbackSchema).default([]),
 });
 
 const MemoryFileSchema = z.object({
@@ -60,6 +73,7 @@ const MemoryFileSchema = z.object({
 type ContextPackEntry = z.infer<typeof ContextPackEntrySchema>;
 type ResultCacheEntry = z.infer<typeof ResultCacheEntrySchema>;
 export type KnownFix = z.infer<typeof KnownFixSchema>;
+export type ProjectFeedback = z.infer<typeof ProjectFeedbackSchema>;
 type MemoryFile = z.infer<typeof MemoryFileSchema>;
 
 const writeQueues = new Map<string, Promise<void>>();
@@ -69,7 +83,7 @@ function emptyMemory(): MemoryFile {
 }
 
 function projectMemory(doc: MemoryFile, projectId: string): z.infer<typeof ProjectMemorySchema> {
-  return doc.projects[projectId] ?? { contextPacks: [], results: [], knownFixes: [] };
+  return doc.projects[projectId] ?? { contextPacks: [], results: [], knownFixes: [], feedback: [] };
 }
 
 function trimNewest<T extends { createdAt: number }>(items: T[], max: number): T[] {
@@ -191,7 +205,7 @@ export class ProjectMemoryStore {
     const tmp = path.join(this.stateDir, `.${MEMORY_FILE}.${process.pid}.${randomBytes(5).toString("hex")}.tmp`);
     const validated = MemoryFileSchema.parse({ ...doc, version: 1, updatedAt: Date.now() });
     await writeFile(tmp, JSON.stringify(validated, null, 2), { encoding: "utf8", mode: FILE_MODE });
-    await rename(tmp, target);
+    await renameWithRetry(tmp, target);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -300,5 +314,58 @@ export class ProjectMemoryStore {
       .filter((fix) => fix.score > 0 || q.length === 0)
       .sort((a, b) => b.score - a.score || b.updatedAt - a.updatedAt)
       .slice(0, Math.max(1, Math.min(maxResults, 20)));
+  }
+
+  /**
+   * Record one project-scoped piece of user feedback ("UI too bright", "no PASS
+   * before Play QA"). The same normalized key increments a count instead of
+   * duplicating, so recurrence is cheap to detect. Project-scoped only; this is
+   * never a store for personal memory.
+   */
+  async recordFeedback(projectId: string, input: { key?: string; text: string; tags?: string[] }): Promise<ProjectFeedback> {
+    return this.enqueue(async () => {
+      const doc = await this.read();
+      const current = projectMemory(doc, projectId);
+      const now = Date.now();
+      const text = input.text.trim().slice(0, 300);
+      const key = normalizeText(input.key?.trim() || text).slice(0, 200);
+      const tags = Array.from(new Set((input.tags ?? []).map((tag) => normalizeText(tag)).filter(Boolean))).slice(0, 12);
+      const existing = current.feedback.find((item) => item.key === key);
+      const next: ProjectFeedback = existing
+        ? { ...existing, text, tags: Array.from(new Set([...existing.tags, ...tags])).slice(0, 12), count: existing.count + 1, lastAt: now }
+        : { id: `fb_${randomUUID()}`, key, text, tags, count: 1, firstAt: now, lastAt: now };
+      current.feedback = [next, ...current.feedback.filter((item) => item.id !== next.id)]
+        .sort((a, b) => b.lastAt - a.lastAt)
+        .slice(0, MAX_FEEDBACK);
+      doc.projects[projectId] = current;
+      await this.write(doc);
+      return next;
+    });
+  }
+
+  async listFeedback(projectId: string): Promise<ProjectFeedback[]> {
+    return projectMemory(await this.read(), projectId).feedback;
+  }
+
+  /**
+   * Select a few recurring (count >= minCount) project feedback items relevant
+   * to the given text. With no relevance signal, only strongly recurring items
+   * (count >= minCount + 1) are returned, so unrelated preferences stay out.
+   */
+  async selectRelevantFeedback(projectId: string, query: string, options: { max?: number; minCount?: number } = {}): Promise<Array<ProjectFeedback & { score: number }>> {
+    const max = Math.max(1, Math.min(options.max ?? 3, 5));
+    const minCount = Math.max(1, options.minCount ?? 2);
+    const queryTokens = new Set(tokens(query));
+    return (await this.listFeedback(projectId))
+      .filter((item) => item.count >= minCount)
+      .map((item) => {
+        const itemTokens = new Set([...tokens(item.key), ...tokens(item.text), ...item.tags.flatMap(tokens)]);
+        let overlap = 0;
+        for (const token of itemTokens) if (queryTokens.has(token)) overlap += 1;
+        return { ...item, score: overlap * 10 + item.count };
+      })
+      .filter((item) => item.score >= 10 || item.count >= minCount + 1)
+      .sort((a, b) => b.score - a.score || b.lastAt - a.lastAt)
+      .slice(0, max);
   }
 }

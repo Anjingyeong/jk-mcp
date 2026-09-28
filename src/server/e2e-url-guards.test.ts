@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "./mcp-server.js";
 import type { Lease, ToolContext } from "../types.js";
 import { requestLocalShellApproval, resolveLocalShellApproval, taskApprovalIdentity } from "../policy/local-approvals.js";
+import { targetApprovalIdentity } from "../policy/local-shell-jobs.js";
+import { deriveLocalExecutionTarget } from "../executors/target-protocol.js";
 
 /**
  * e2e_run_command's `screenshotUrl` input reached captureE2eUrlScreenshot
@@ -123,7 +125,8 @@ describe("e2e_run_command screenshotUrl guard", () => {
   it("shares one task approval with external HTTP E2E verification", async () => {
     const task = { workSessionId: "ws_release", goalId: "goal-release" };
     const ctx = makeCtx(stateDir, projectRoot, task);
-    const identity = taskApprovalIdentity(task);
+    const identity = targetApprovalIdentity(
+      await deriveLocalExecutionTarget(ctx.workspaceRoot, { projectId: "proj", root: projectRoot }), taskApprovalIdentity(task));
     expect(identity).toBeTruthy();
     const requested = await requestLocalShellApproval(stateDir, {
       projectId: "proj",

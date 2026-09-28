@@ -21,7 +21,7 @@ describe("image metadata", () => {
     const saved = await saveImage(root, "proj", PNG_1X1, "banner.png", { loop: true });
 
     await expect(fs.access(path.join(root, `${saved.filePath}.json`))).rejects.toThrow();
-    const metadataFiles = await fs.readdir(path.join(root, ".chatgpt2codex", "image-metadata"));
+    const metadataFiles = await fs.readdir(path.join(root, ".jk", "image-metadata"));
     expect(metadataFiles).toHaveLength(1);
   });
 });

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DomainError, ErrorCode } from "../types.js";
-import { isAutonomousCloudInventoryRead } from "./local-shell.js";
+import { isAutonomousCloudInventoryRead, isSafeTaskFollowupNetworkRead } from "./local-shell.js";
 import { isAutonomousDevelopmentNetworkCommand } from "./local-shell.js";
 import { classifyReadOnlyNetworkApprovalScope, guardShellCommand, inspectShellCommand, runLocalShell } from "./local-shell.js";
 
@@ -146,6 +146,43 @@ describe("guardShellCommand", () => {
     expect(() => guardShellCommand("Remove-Item .\\build\\old -Recurse -Force", { destructive: true })).not.toThrow();
   });
 
+  it("treats deletion/termination verbs as destructive only in command position", () => {
+    for (const command of [
+      "python TEMP_qa.py --mode rd",
+      "node scripts/build.js --no-kill",
+      'echo "del" > note.txt',
+      'npm run test -- --grep "kill switch"',
+      "git log --grep=rd",
+    ]) {
+      expect(inspectShellCommand(command), command).toEqual({ needsNetwork: false, destructive: false });
+    }
+    for (const command of [
+      "del /q build\\old.txt",
+      "cmd /c del /q x",
+      "rd /s /q dist",
+      "rmdir out",
+      "Remove-Item .\\build\\old -Recurse -Force",
+      "Get-ChildItem *.tmp | Remove-Item",
+      "ls && kill 123",
+      "ps aux | xargs kill",
+      "& Remove-Item x",
+      'powershell -Command "Remove-Item x"',
+      'pwsh -c "ri x"',
+      'bash -c "kill 1"',
+      "powershell -EncodedCommand AAAA",
+      "kill -TERM 1234",
+      "timeout 5 kill 1",
+      'kill "unterminated',
+      "echo $(kill 1)",
+      'cmd /d /c "if exist disposable.tmp del /q disposable.tmp & echo bundled>marker.txt"',
+      "for %f in (*.tmp) do del %f",
+      "Get-ChildItem *.tmp | ForEach-Object { Remove-Item $_ }",
+      "find . -name '*.pid' -exec kill {} ;",
+    ]) {
+      expect(inspectShellCommand(command).destructive, command).toBe(true);
+    }
+  });
+
   it("ships the high-level JK runtime reload action referenced by the approval policy", async () => {
     const scriptPath = path.join(process.cwd(), "scripts", "reload-jk-runtime.sh");
     await expect(fs.access(scriptPath)).resolves.toBeUndefined();
@@ -227,6 +264,18 @@ describe("guardShellCommand", () => {
       expect(isAutonomousCloudInventoryRead("curl https://example.com")).toBe(false);
     });
 
+    it("recognizes only narrow GitHub status reads as task-approved follow-ups", () => {
+      expect(isSafeTaskFollowupNetworkRead("gh run list --limit 5")).toBe(true);
+      expect(isSafeTaskFollowupNetworkRead("gh run view 123 --log && gh release view v1.2.3")).toBe(true);
+      expect(isSafeTaskFollowupNetworkRead("gh workflow view build.yml --yaml")).toBe(true);
+      expect(isSafeTaskFollowupNetworkRead("gh run rerun 123")).toBe(false);
+      expect(isSafeTaskFollowupNetworkRead("gh workflow run build.yml")).toBe(false);
+      expect(isSafeTaskFollowupNetworkRead("gh release upload v1 app.zip")).toBe(false);
+      expect(isSafeTaskFollowupNetworkRead("gh release delete v1 --yes")).toBe(false);
+      expect(isSafeTaskFollowupNetworkRead("gh run view 123 --web")).toBe(false);
+      expect(isSafeTaskFollowupNetworkRead("gh run view $(cat id.txt)")).toBe(false);
+    });
+
     it("groups verified AWS inventory reads into one 15-minute scope", () => {
       const command =
         '"%LOCALAPPDATA%\\Programs\\Amazon\\AWSCLIV2\\aws.exe" sts get-caller-identity --query Arn --output text && ' +
@@ -297,4 +346,28 @@ describe("runLocalShell", () => {
       code: ErrorCode.APPROVAL_REQUIRED,
     });
   });
+
+  it("aborts a running child process promptly when its signal is cancelled", async () => {
+    const controller = new AbortController();
+    const marker = path.join(root, "active.marker");
+    const running = runLocalShell(
+      root,
+      "node -e \"require('fs').writeFileSync('active.marker','1');setTimeout(()=>{},60000)\"",
+      undefined,
+      30,
+      undefined,
+      controller.signal,
+    );
+    for (let attempts = 0; attempts < 100; attempts += 1) {
+      try {
+        await fs.access(marker);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (attempts === 99) throw new Error("child process did not start");
+    }
+    controller.abort(new Error("fixture cancellation"));
+    await expect(running).rejects.toThrow(/fixture cancellation/u);
+  }, 5_000);
 });

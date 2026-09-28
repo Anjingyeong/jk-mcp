@@ -84,10 +84,8 @@ export async function requireRepositoryRoot(repositoryRoot: string): Promise<{ r
   let top: string;
   let head: string;
   try {
-    [top, head] = await Promise.all([
-      git(root, ["rev-parse", "--show-toplevel"]),
-      git(root, ["rev-parse", "--verify", "HEAD^{commit}"]),
-    ]);
+    head = await git(root, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    top = await git(root, ["rev-parse", "--show-toplevel"]);
   } catch (error) {
     throw new Error(`Mass ULW requires a local Git repository with HEAD: ${(error as Error).message}`);
   }

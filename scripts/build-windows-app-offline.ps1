@@ -125,8 +125,8 @@ $Npm = Get-ToolPath @("npm.cmd")
 if (-not (Test-Path -LiteralPath (Join-Path $Root "node_modules"))) {
   throw "Offline node_modules is missing. Run npm install once before using the offline Windows packager."
 }
-Write-Host "[chatgpt2codex] using existing offline dependencies..."
-Write-Host "[chatgpt2codex] building TypeScript..."
+Write-Host "[JK] using existing offline dependencies..."
+Write-Host "[JK] building TypeScript..."
 Invoke-Checked $Npm @("run", "build")
 
 if (Test-Path -LiteralPath $OutputDir) {
@@ -140,16 +140,20 @@ Copy-Tree (Join-Path $Root "browser") (Join-Path $OutputDir "browser")
 Copy-Tree (Join-Path $Root "assets") (Join-Path $OutputDir "assets")
 
 $IconPath = Join-Path $OutputDir "JK.ico"
-New-WindowsIcon (Join-Path $Root "assets\jk-icon.png") $IconPath
+$CanonicalIcon = Join-Path $Root "assets\JK.ico"
+if (-not (Test-Path -LiteralPath $CanonicalIcon)) {
+  throw "Canonical JK Windows icon not found: $CanonicalIcon"
+}
+Copy-Item -LiteralPath $CanonicalIcon -Destination $IconPath -Force
 
 foreach ($file in @("package.json", "package-lock.json")) {
   Copy-Item -LiteralPath (Join-Path $Root $file) -Destination (Join-Path $OutputDir $file) -Force
 }
 
-Write-Host "[chatgpt2codex] copying offline node_modules..."
+Write-Host "[JK] copying offline node_modules..."
 Copy-Tree (Join-Path $Root "node_modules") (Join-Path $OutputDir "node_modules")
 
-foreach ($file in @("README.md", "start-chatgpt.ps1", "start-chatgpt.cmd")) {
+foreach ($file in @("README.md", "start-jk.ps1", "start-jk.cmd")) {
   Copy-Item -LiteralPath (Join-Path $Root $file) -Destination (Join-Path $OutputDir $file) -Force
 }
 
@@ -160,7 +164,7 @@ if ($Node) {
   throw "node.exe was not found. Node is required to build and package JK."
 }
 
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("chatgpt2codex-windows-app-" + [System.Guid]::NewGuid().ToString("N"))
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("jk-windows-app-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 try {
 $Cloudflared = Get-ToolPath @("cloudflared.exe", "cloudflared") -Optional
@@ -168,7 +172,7 @@ if ($Cloudflared) {
   Copy-Item -LiteralPath $Cloudflared -Destination (Join-Path $OutputDir "bin\cloudflared.exe") -Force
 } else {
   $Cloudflared = Join-Path $TempDir "cloudflared.exe"
-  Write-Host "[chatgpt2codex] downloading Windows cloudflared..."
+  Write-Host "[JK] downloading Windows cloudflared..."
   Download-File "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" $Cloudflared
   Copy-Item -LiteralPath $Cloudflared -Destination (Join-Path $OutputDir "bin\cloudflared.exe") -Force
 }
@@ -180,7 +184,7 @@ if ($Ripgrep) {
   $RgVersion = "15.1.0"
   $RgArchive = Join-Path $TempDir "ripgrep.zip"
   $RgDir = Join-Path $TempDir "ripgrep"
-  Write-Host "[chatgpt2codex] downloading Windows ripgrep $RgVersion..."
+  Write-Host "[JK] downloading Windows ripgrep $RgVersion..."
   Download-File "https://github.com/BurntSushi/ripgrep/releases/download/$RgVersion/ripgrep-$RgVersion-x86_64-pc-windows-msvc.zip" $RgArchive
   Expand-Archive -LiteralPath $RgArchive -DestinationPath $RgDir -Force
   $RgBin = Get-ChildItem -LiteralPath $RgDir -Recurse -Filter "rg.exe" | Select-Object -First 1
@@ -197,9 +201,9 @@ $CscCandidates = @(
 )
 $Csc = $CscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $Csc) {
-  Write-Warning "csc.exe was not found. start-chatgpt.cmd was packaged, but JK.exe could not be built."
+  Write-Warning "csc.exe was not found. start-jk.cmd was packaged, but JK.exe could not be built."
 } else {
-  $LauncherSource = Join-Path $Root "windows\ChatGPTToCodexLauncher.cs"
+  $LauncherSource = Join-Path $Root "windows\JKLauncher.cs"
   $LauncherExe = Join-Path $OutputDir "JK.exe"
   Invoke-Checked $Csc @(
     "/nologo",
@@ -223,5 +227,5 @@ if (Test-Path -LiteralPath (Join-Path $OutputDir "JK.exe")) {
   Write-Host "  $OutputDir\JK.exe"
 } else {
   Write-Host "Run:"
-  Write-Host "  $OutputDir\start-chatgpt.cmd"
+  Write-Host "  $OutputDir\start-jk.cmd"
 }

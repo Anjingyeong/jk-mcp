@@ -253,7 +253,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       baseUrl: publicUrl,
       resourceServerUrl,
       scopesSupported: config.oauth.scopes,
-      resourceName: "chatgpt2codex",
+      resourceName: "jk",
     }),
   );
 
@@ -269,7 +269,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   });
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "chatgpt2codex" });
+    res.json({ ok: true, name: "jk" });
   });
 
   app.get("/privacy", (_req, res) => {
@@ -277,9 +277,9 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       .type("text/plain")
       .send(
         [
-          "chatgpt2codex privacy notice",
+          "jk privacy notice",
           "",
-          "chatgpt2codex is a local MCP/action bridge controlled by the owner of this server.",
+          "jk is a local MCP/action bridge controlled by the owner of this server.",
           "Custom GPT Actions sent to this server are used only to select local projects, save/import ChatGPT images, list saved images, and check action status.",
           "The server stores operational audit entries and saved image files on the owner's local machine. It does not sell data, run advertising profiles, or call OpenAI Images/Codex APIs to generate images.",
           "Do not send secrets or unrelated personal data to this action bridge.",

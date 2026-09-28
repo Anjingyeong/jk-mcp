@@ -31,15 +31,18 @@ describe("control/queue", () => {
 
   it("enqueues a pending action and never auto-executes it", async () => {
     const record = await enqueue(stateDir, {
+      projectId: "windows-main::proj",
       appName: "TextEdit",
       kind: "click",
       target: { windowPoint: { xRel: 0.5, yRel: 0.5 } },
       reason: "test",
     });
     expect(record.status).toBe("pending");
+    expect(record.projectId).toBe("windows-main::proj");
 
     const fetched = await getAction(stateDir, record.actionId);
     expect(fetched?.status).toBe("pending");
+    expect(fetched?.projectId).toBe("windows-main::proj");
     expect(fetched?.result).toBeUndefined();
   });
 

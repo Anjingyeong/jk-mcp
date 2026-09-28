@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 /**
- * chatgpt2codex CLI entrypoint.
+ * jk CLI entrypoint.
  *
  * Minimal hand-rolled argv parsing (no commander dependency) for the three
  * MVP subcommands defined in PRD §5:
  *
- *   chatgpt2codex serve  --workspace <path>
- *   chatgpt2codex init   --workspace <path>
- *   chatgpt2codex doctor
+ *   jk serve  --workspace <path>
+ *   jk init   --workspace <path>
+ *   jk doctor
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
@@ -33,8 +34,14 @@ import { approveAction, isKilled, listActions, rejectAction, setKill, toSummary 
 import { preflightPermissions } from "./control/mac-input.js";
 import { clampMinutes, clearAuto, readAuto, setAuto, type AutoActionKind } from "./control/auto.js";
 import { readExecutorToken, runExecutorWorker } from "./executors/worker.js";
+import { SETUP_COMMAND, formatSetupReady, normalizeSetupPublicUrl, type HttpReadyInfo } from "./cli-setup.js";
 
 const execFileAsync = promisify(execFile);
+const USAGE =
+  "usage: jk <setup|start|serve|init|doctor|owner-token|control|executor> [--workspace <path>] " +
+  "[--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]\n" +
+  "  jk setup  [--workspace <path>] [--quick-tunnel | --public-url <origin>] [--reset-code] [--no-start]\n" +
+  "  jk start  [--quick-tunnel | --public-url <origin>] [--port 7979]";
 
 interface ParsedArgs {
   command: string | undefined;
@@ -65,15 +72,22 @@ function parseArgs(argv: string[]): ParsedArgs {
   return { command, flags, positional };
 }
 
-/** Default state dir per PRD §10: `~/.local/share/chatgpt2codex/`. */
+/** Select one state directory; never move or merge existing installations. */
 function defaultStateDir(): string {
   // Portable/override mode: lets sandboxed runs, USB-portable installs, and
   // multi-instance setups redirect all state without touching $HOME.
-  const override = process.env.CHATGPT2CODEX_STATE_DIR;
-  if (override && override.trim()) return path.resolve(override.trim());
-  return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
+  const override = process.env.JK_STATE_DIR?.trim() || process.env.CHATGPT2CODEX_STATE_DIR?.trim();
+  if (override) return path.resolve(override);
+  const canonical = path.join(os.homedir(), ".local", "share", "jk");
+  const legacy = path.join(os.homedir(), ".local", "share", "chatgpt2codex");
+  return existsSync(canonical) ? canonical : existsSync(legacy) ? legacy : canonical;
 }
 
+/**
+ * `jk setup` remembers the allowed folder (and an optional fixed HTTPS origin)
+ * so the next `jk setup` / `jk start` needs no answers. No secrets live here:
+ * the Owner Token is stored only as a hash by owner-token.ts.
+ */
 interface SavedSetupConfig {
   workspaceRoot: string;
   publicUrl?: string;
@@ -87,11 +101,7 @@ async function saveSetupConfig(workspaceRoot: string, publicUrl?: string): Promi
   const stateDir = defaultStateDir();
   await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
   const saved: SavedSetupConfig = publicUrl ? { workspaceRoot, publicUrl } : { workspaceRoot };
-  await fs.writeFile(
-    setupConfigPath(stateDir),
-    `${JSON.stringify(saved, null, 2)}\n`,
-    { mode: 0o600 },
-  );
+  await fs.writeFile(setupConfigPath(stateDir), `${JSON.stringify(saved, null, 2)}\n`, { mode: 0o600 });
 }
 
 async function loadSavedSetupConfig(): Promise<SavedSetupConfig | undefined> {
@@ -102,8 +112,7 @@ async function loadSavedSetupConfig(): Promise<SavedSetupConfig | undefined> {
     }
     return parsed;
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error instanceof Error ? error : new Error(String(error));
   }
 }
@@ -120,8 +129,7 @@ async function loadSetupWorkspace(): Promise<string | undefined> {
 }
 
 async function loadSetupPublicUrl(): Promise<string | undefined> {
-  const parsed = await loadSavedSetupConfig();
-  const value = parsed?.publicUrl;
+  const value = (await loadSavedSetupConfig())?.publicUrl;
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
@@ -224,7 +232,7 @@ async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<v
   const transport = new StdioServerTransport();
   await server.connect(transport);
   await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot });
-  console.error(`chatgpt2codex serve: listening on stdio (workspace=${ctx.workspaceRoot})`);
+  console.error(`jk serve: listening on stdio (workspace=${ctx.workspaceRoot})`);
 }
 
 interface QuickTunnelHandle {
@@ -232,36 +240,39 @@ interface QuickTunnelHandle {
   publicUrl: string;
 }
 
-interface HttpReadyInfo {
-  connectorUrl: string;
-  workspaceRoot: string;
-}
-
 const QUICK_TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i;
+
+/**
+ * Prefer an explicit override, then the cloudflared bundled with packaged
+ * builds (`<runtime>/bin`), then whatever is on PATH.
+ */
+function resolveCloudflared(): string {
+  const override = process.env.JK_CLOUDFLARED?.trim();
+  if (override) return override;
+  const exe = process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+  const bundled = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", exe);
+  return existsSync(bundled) ? bundled : "cloudflared";
+}
 
 async function startQuickTunnel(port: number): Promise<QuickTunnelHandle> {
   return await new Promise<QuickTunnelHandle>((resolve, reject) => {
-    const child = spawn(
-      "cloudflared",
-      ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${port}`],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const child = spawn(resolveCloudflared(), ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${port}`], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
     let settled = false;
     let recentOutput = "";
     const timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGTERM");
-      reject(new Error("Timed out waiting for Cloudflare Quick Tunnel. Run `cloudflared --version` and retry."));
-    }, 20_000);
+      finishError("Timed out waiting for Cloudflare Quick Tunnel. Run `cloudflared --version` and retry.");
+    }, 30_000);
 
-    const finishError = (message: string) => {
+    function finishError(message: string): void {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       child.kill("SIGTERM");
       reject(new Error(message));
-    };
+    }
     const inspect = (chunk: Buffer | string) => {
       if (settled) return;
       recentOutput = `${recentOutput}${String(chunk)}`.slice(-12_000);
@@ -281,16 +292,17 @@ async function startQuickTunnel(port: number): Promise<QuickTunnelHandle> {
       );
     });
     child.once("exit", (code) => {
-      if (!settled) finishError(`cloudflared exited before a Quick Tunnel URL was issued (exit=${code ?? "unknown"}).`);
+      finishError(`cloudflared exited before a Quick Tunnel URL was issued (exit=${code ?? "unknown"}).`);
     });
   });
 }
 
 /**
- * HTTP mode (PRD §4 Transport Gateway, §5 CLI): `chatgpt2codex serve --http
- * [--port 7979] [--public-url <origin>]`. Exposes the SAME registerTools(ctx)
- * catalog as stdio mode over a Streamable HTTP `/mcp` endpoint, gated by
- * OAuth 2.1 (see src/server/http.ts, src/auth/oauth-provider.ts).
+ * HTTP mode (PRD §4 Transport Gateway, §5 CLI): `jk serve --http
+ * [--port 7979] [--public-url <origin> | --quick-tunnel]`. Exposes the SAME
+ * registerTools(ctx) catalog as stdio mode over a Streamable HTTP `/mcp`
+ * endpoint, gated by OAuth 2.1 (see src/server/http.ts,
+ * src/auth/oauth-provider.ts).
  */
 async function cmdServeHttp(
   flags: Record<string, string | boolean>,
@@ -301,7 +313,7 @@ async function cmdServeHttp(
 
   if (!(await hasOwnerToken(ctx.stateDir))) {
     console.error(
-      "chatgpt2codex serve --http: no owner token found. Run `chatgpt2codex init` first to generate one.",
+      `jk serve --http: no owner token found. Run \`jk setup\` (or \`${SETUP_COMMAND}\`) or \`jk init\` first.`,
     );
     process.exitCode = 1;
     return;
@@ -357,7 +369,7 @@ async function cmdServeHttp(
     managementRoutesEnabled: (process.env.JK_MANAGEMENT_MODE ?? "local").trim().toLowerCase() !== "disabled",
     idleShutdownMs,
     onIdleTimeout: () => {
-      console.error("chatgpt2codex serve --http: idle timeout reached; stopping.");
+      console.error("jk serve --http: idle timeout reached; stopping.");
       shutdown(0);
     },
   });
@@ -366,13 +378,25 @@ async function cmdServeHttp(
   closeHttpServer = running.close;
 
   httpServer = app.listen(port, host, () => {
-    console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);
-    console.error(`chatgpt2codex serve --http: public URL ${publicUrl}/mcp`);
-    console.error(`chatgpt2codex serve --http: workspace=${ctx.workspaceRoot}`);
+    console.error(`jk serve --http: listening on http://${host}:${port}/mcp`);
+    console.error(`jk serve --http: public URL ${publicUrl}/mcp`);
+    console.error(`jk serve --http: workspace=${ctx.workspaceRoot}`);
     if (idleShutdownMs !== undefined) {
-      console.error(`chatgpt2codex serve --http: idle shutdown after ${idleShutdownMinutes} minute(s) without sessions`);
+      console.error(`jk serve --http: idle shutdown after ${idleShutdownMinutes} minute(s) without sessions`);
     }
-    onReady?.({ connectorUrl: `${publicUrl}/mcp`, workspaceRoot: ctx.workspaceRoot });
+    onReady?.({
+      connectorUrl: `${publicUrl}/mcp`,
+      localBaseUrl: `http://${host}:${port}`,
+      workspaceRoot: ctx.workspaceRoot,
+      quickTunnel: quickTunnelRequested,
+    });
+  });
+  quickTunnelProcess?.once("exit", (code) => {
+    if (shuttingDown) return;
+    console.error(
+      `jk start: Cloudflare Quick Tunnel stopped (exit=${code ?? "unknown"}); ${publicUrl}/mcp no longer works. ` +
+        "Restart JK to get a new address.",
+    );
   });
 
   await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot, transport: "http" });
@@ -406,12 +430,7 @@ interface SetupDependency {
 const SETUP_DEPENDENCIES: SetupDependency[] = [
   { label: "Git", command: "git", args: ["--version"], wingetId: "Git.Git" },
   { label: "ripgrep", command: "rg", args: ["--version"], wingetId: "BurntSushi.ripgrep.MSVC" },
-  {
-    label: "Cloudflare Quick Tunnel",
-    command: "cloudflared",
-    args: ["--version"],
-    wingetId: "Cloudflare.cloudflared",
-  },
+  { label: "Cloudflare Quick Tunnel", command: "cloudflared", args: ["--version"], wingetId: "Cloudflare.cloudflared" },
 ];
 
 function setupIsInteractive(): boolean {
@@ -421,9 +440,7 @@ function setupIsInteractive(): boolean {
 function expandUserPath(value: string): string {
   const trimmed = value.trim().replace(/^['"]|['"]$/g, "");
   if (trimmed === "~") return os.homedir();
-  if (trimmed.startsWith(`~${path.sep}`) || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
-    return path.join(os.homedir(), trimmed.slice(2));
-  }
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) return path.join(os.homedir(), trimmed.slice(2));
   return trimmed;
 }
 
@@ -441,28 +458,6 @@ async function askYesNo(prompt: SetupPrompt, question: string, defaultYes: boole
   return answer === "y" || answer === "yes";
 }
 
-function normalizeSetupPublicUrl(value: string): string {
-  const raw = value.trim().replace(/^['"]|['"]$/g, "");
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
-  let parsed: URL;
-  try {
-    parsed = new URL(withScheme);
-  } catch {
-    throw new Error("Enter a valid HTTPS address, for example: https://jk.example.com");
-  }
-  if (parsed.protocol !== "https:") {
-    throw new Error("A fixed ChatGPT connector address must use HTTPS.");
-  }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error("Use only the public HTTPS origin, for example: https://jk.example.com");
-  }
-  const pathname = parsed.pathname.replace(/\/+$/, "");
-  if (pathname && pathname !== "/mcp") {
-    throw new Error("Use the domain only (or a trailing /mcp), for example: https://jk.example.com");
-  }
-  return parsed.origin;
-}
-
 async function chooseSetupPublicUrl(
   flags: Record<string, string | boolean>,
   prompt: SetupPrompt | null,
@@ -476,13 +471,12 @@ async function chooseSetupPublicUrl(
     console.error(`Saved fixed HTTPS address: ${remembered}/mcp`);
     if (!prompt || (await askYesNo(prompt, "Use this fixed address again?", true))) return remembered;
   }
-
   if (!prompt) return undefined;
 
   console.error("");
   console.error("Choose how ChatGPT will reach JK:");
-  console.error("  1. Quick Tunnel (recommended) - no domain needed; address can change after restart.");
-  console.error("  2. Fixed HTTPS domain - for users who already configured a Named Tunnel or HTTPS reverse proxy.");
+  console.error("  1. Quick Tunnel (recommended) - no domain needed. The address CHANGES every time JK restarts.");
+  console.error("  2. Your own HTTPS domain - address stays the same. Requires a Named Tunnel or HTTPS reverse proxy.");
   while (true) {
     const mode = (await prompt.question("Connection mode (Enter = 1, or type 2): ")).trim();
     if (!mode || mode === "1") return undefined;
@@ -490,12 +484,11 @@ async function chooseSetupPublicUrl(
       console.error("Type 1 for Quick Tunnel or 2 for a fixed HTTPS domain.");
       continue;
     }
-
     console.error("");
     console.error("Your domain must already forward HTTPS traffic to JK at http://127.0.0.1:7979.");
-    console.error("A domain name by itself is not enough; configure Cloudflare Named Tunnel or another HTTPS reverse proxy first.");
+    console.error("A domain name alone is not enough; configure Cloudflare Named Tunnel or another HTTPS reverse proxy first.");
     while (true) {
-      const answer = await prompt.question("Fixed HTTPS address (example: https://jk.example.com): ");
+      const answer = await prompt.question("Fixed HTTPS address (example: https://mcp.example.com): ");
       try {
         return normalizeSetupPublicUrl(answer);
       } catch (error) {
@@ -519,34 +512,27 @@ async function browseForWorkspaceWindows(initialDirectory: string): Promise<stri
       timeout: 120_000,
       windowsHide: false,
     });
-    const selected = stdout.trim();
-    return selected || undefined;
+    return stdout.trim() || undefined;
   } catch {
     return undefined;
   }
 }
 
+/** Never default to a filesystem root or the Windows system folder. */
 async function defaultSetupWorkspace(): Promise<string> {
   const current = path.resolve(process.cwd());
-  const filesystemRoot = path.parse(current).root;
-  let unsafeDefault = current === filesystemRoot;
-
+  let unsafeDefault = current === path.parse(current).root;
   if (process.platform === "win32") {
     const windowsDir = process.env.WINDIR ?? process.env.SystemRoot;
     if (windowsDir) {
-      const relativeToWindows = path.relative(path.resolve(windowsDir), current);
-      if (relativeToWindows === "" || (!relativeToWindows.startsWith("..") && !path.isAbsolute(relativeToWindows))) {
-        unsafeDefault = true;
-      }
+      const rel = path.relative(path.resolve(windowsDir), current);
+      if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) unsafeDefault = true;
     }
   }
-
   if (!unsafeDefault) return current;
-
   const documents = path.join(os.homedir(), "Documents");
   const documentsStat = await fs.stat(documents).catch(() => null);
-  if (documentsStat?.isDirectory()) return documents;
-  return os.homedir();
+  return documentsStat?.isDirectory() ? documents : os.homedir();
 }
 
 async function chooseSetupWorkspace(
@@ -566,9 +552,7 @@ async function chooseSetupWorkspace(
   console.error("Choose the folder ChatGPT is allowed to work in.");
   while (true) {
     const browseHint = process.platform === "win32" ? ", B = browse" : "";
-    const answer = await prompt.question(`Folder (Enter = ${current}${browseHint}): `);
-    let candidate = answer.trim();
-    if (!candidate) candidate = current;
+    let candidate = (await prompt.question(`Folder (Enter = ${current}${browseHint}): `)).trim() || current;
     if (process.platform === "win32" && candidate.toLowerCase() === "b") {
       const selected = await browseForWorkspaceWindows(current);
       if (!selected) {
@@ -597,7 +581,7 @@ async function refreshWindowsPath(): Promise<void> {
     const refreshed = stdout.trim();
     if (refreshed) process.env.PATH = `${refreshed};${process.env.PATH ?? ""}`;
   } catch {
-    // A fresh terminal will pick up PATH changes even if the current process cannot.
+    // A fresh terminal will pick up PATH changes even if this process cannot.
   }
 }
 
@@ -610,11 +594,12 @@ async function runVisibleProcess(command: string, args: string[]): Promise<numbe
 }
 
 async function missingSetupDependencies(includeCloudflared: boolean): Promise<SetupDependency[]> {
-  const dependencies = includeCloudflared
-    ? SETUP_DEPENDENCIES
-    : SETUP_DEPENDENCIES.filter((dependency) => dependency.command !== "cloudflared");
   const missing: SetupDependency[] = [];
-  for (const dependency of dependencies) {
+  for (const dependency of SETUP_DEPENDENCIES) {
+    if (dependency.command === "cloudflared") {
+      if (includeCloudflared && !(await checkCommand(resolveCloudflared(), dependency.args))) missing.push(dependency);
+      continue;
+    }
     if (!(await checkCommand(dependency.command, dependency.args))) missing.push(dependency);
   }
   return missing;
@@ -624,7 +609,7 @@ async function ensureSetupDependencies(prompt: SetupPrompt | null, includeCloudf
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
   if (!Number.isFinite(nodeMajor) || nodeMajor < 22) {
     console.error(`Node.js 22 or newer is required (current: ${process.version}).`);
-    console.error("Install the current Node.js LTS release, open a new terminal, then run `npx -y jk-mcp setup` again.");
+    console.error(`Install the current Node.js LTS release, open a new terminal, then run \`${SETUP_COMMAND}\` again.`);
     return false;
   }
 
@@ -634,7 +619,7 @@ async function ensureSetupDependencies(prompt: SetupPrompt | null, includeCloudf
     return true;
   }
 
-  console.error(`Missing helper tools: ${missing.map((dependency) => dependency.label).join(", ")}`);
+  console.error(`Missing helper tools: ${missing.map((d) => d.label).join(", ")}`);
   if (process.platform !== "win32") {
     console.error("Install the missing tools from their official package source, then run setup again.");
     return false;
@@ -643,13 +628,12 @@ async function ensureSetupDependencies(prompt: SetupPrompt | null, includeCloudf
   const wingetReady = await checkCommand("winget", ["--version"]);
   if (!prompt || !wingetReady) {
     console.error("On Windows, install the missing tools with Windows Package Manager (winget), then run setup again:");
-    for (const dependency of missing) console.error(`  winget install --id ${dependency.wingetId} -e`);
+    for (const d of missing) console.error(`  winget install --id ${d.wingetId} -e`);
     return false;
   }
 
   console.error("Windows Package Manager will be asked to install only these fixed package IDs:");
-  for (const dependency of missing) console.error(`  ${dependency.label}: ${dependency.wingetId}`);
-
+  for (const d of missing) console.error(`  ${d.label}: ${d.wingetId}`);
   const approved = await askYesNo(
     prompt,
     "Install the missing tools now with Windows Package Manager? JK will only request the official package IDs shown above.",
@@ -660,18 +644,18 @@ async function ensureSetupDependencies(prompt: SetupPrompt | null, includeCloudf
     return false;
   }
 
-  for (const dependency of missing) {
-    console.error(`\nInstalling ${dependency.label} (${dependency.wingetId})...`);
+  for (const d of missing) {
+    console.error(`\nInstalling ${d.label} (${d.wingetId})...`);
     const exitCode = await runVisibleProcess("winget", [
       "install",
       "--id",
-      dependency.wingetId,
+      d.wingetId,
       "-e",
       "--accept-package-agreements",
       "--accept-source-agreements",
     ]);
     if (exitCode !== 0) {
-      console.error(`${dependency.label} installation did not complete (exit=${exitCode}).`);
+      console.error(`${d.label} installation did not complete (exit=${exitCode}).`);
       return false;
     }
   }
@@ -679,67 +663,30 @@ async function ensureSetupDependencies(prompt: SetupPrompt | null, includeCloudf
   await refreshWindowsPath();
   missing = await missingSetupDependencies(includeCloudflared);
   if (missing.length > 0) {
-    console.error(`Installed, but this terminal cannot see: ${missing.map((dependency) => dependency.label).join(", ")}.`);
-    console.error("Close this terminal, open a new PowerShell window, and run `npx -y jk-mcp setup` again.");
+    console.error(`Installed, but this terminal cannot see: ${missing.map((d) => d.label).join(", ")}.`);
+    console.error(`Close this terminal, open a new one, and run \`${SETUP_COMMAND}\` again.`);
     return false;
   }
   console.error("✓ Required helper tools are ready.");
   return true;
 }
 
-function printSetupReady(info: HttpReadyInfo, connectionCode: string | undefined): void {
-  console.error("");
-  console.error("============================================================");
-  console.error("JK is ready for ChatGPT");
-  console.error("============================================================");
-  console.error("1. Keep this window open while you use JK.");
-  console.error("2. In ChatGPT, open Apps / Connectors and add a custom MCP connector.");
-  console.error("3. Paste this address:");
-  console.error("");
-  console.error(`   ${info.connectorUrl}`);
-  console.error("");
-  if (connectionCode) {
-    console.error("If ChatGPT asks for your private connection code, use this once and save it somewhere private:");
-    console.error("");
-    console.error(`   ${connectionCode}`);
-    console.error("");
-  } else {
-    console.error("Your existing private connection code is still active.");
-    console.error("If you no longer have it, stop JK with Ctrl+C and run `npx -y jk-mcp setup --reset-code`.");
-    console.error("");
-  }
-  console.error(`Allowed folder: ${info.workspaceRoot}`);
-  console.error("");
-  console.error("Connection test:");
-  console.error("  In a new ChatGPT chat, try: @jk 프로젝트 목록 보여줘");
-  console.error("  Then try: @jk <project-name> 상태 확인해줘");
-  console.error("");
-  console.error("If a folder exists but JK cannot find it as a project, add a project marker such as");
-  console.error("  .git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .chatgpt2codex");
-  console.error("  inside that folder, then ask JK to refresh the workspace index.");
-  console.error("");
-  console.error("Next time, run the same command again: `npx -y jk-mcp setup`.");
-  console.error("============================================================");
-}
-
 async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> {
-  const interactive = setupIsInteractive();
-  const prompt = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  const prompt = setupIsInteractive() ? createInterface({ input: process.stdin, output: process.stdout }) : null;
   let workspaceRoot: string;
   let connectionCode: string | undefined;
   let publicUrl: string | undefined;
   const noStart = flags["no-start"] === true;
 
   try {
-    console.error("JK first-time setup");
+    console.error("JK setup");
     console.error("You do not need to understand MCP, OAuth, or Cloudflare to continue.");
     console.error("");
 
     workspaceRoot = await chooseSetupWorkspace(flags, prompt);
     publicUrl = await chooseSetupPublicUrl(flags, prompt);
-    const useQuickTunnel = !publicUrl;
 
-    if (!(await ensureSetupDependencies(prompt, useQuickTunnel && !noStart))) {
+    if (!(await ensureSetupDependencies(prompt, !publicUrl && !noStart))) {
       process.exitCode = 1;
       return;
     }
@@ -760,18 +707,18 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
       console.error(`✓ Found ${registry.length} project(s): ${visible}${extra}`);
     } else {
       console.error("! No projects were detected inside the allowed folder.");
-      console.error("  JK detects folders containing .git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .chatgpt2codex.");
-      console.error("  To register a plain folder, create an empty .chatgpt2codex file inside that folder, then run setup again.");
+      console.error("  JK detects folders containing .git, package.json, requirements.txt, Cargo.toml, go.mod, pubspec.yaml, or .jk.");
+      console.error("  To register a plain folder, create an empty .jk file inside it, then run setup again.");
     }
 
     const tokenExists = await hasOwnerToken(stateDir);
     let resetCode = flags["reset-code"] === true || flags["rotate-owner-token"] === true;
     if (tokenExists && !resetCode && prompt) {
       console.error("");
-      console.error("A private connection code already exists. For security, JK stores only its hash and cannot display the old code again.");
+      console.error("A connection code already exists. JK stores only its hash and cannot display the old code again.");
       resetCode = await askYesNo(
         prompt,
-        "Create and show a new connection code now? Existing authorized sessions will need to reconnect.",
+        "Create and show a new connection code now? ChatGPT will need to log in again (the connector stays registered).",
         false,
       );
     }
@@ -782,7 +729,7 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
       if (tokenExists) await new JsonOAuthStore(stateDir).clearTokens();
       console.error(`✓ ${tokenExists ? "New" : "Private"} connection code created. It will be shown below once.`);
     } else {
-      console.error("✓ Existing private connection code kept.");
+      console.error("✓ Existing connection code kept.");
     }
   } finally {
     prompt?.close();
@@ -790,13 +737,11 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
 
   if (noStart) {
     console.error("");
-    console.error("Setup saved. Start JK later with: `npx -y jk-mcp setup`");
+    console.error(`Setup saved. Start JK later with \`jk start\` or \`${SETUP_COMMAND}\`.`);
     if (publicUrl) console.error(`Saved fixed connector address: ${publicUrl}/mcp`);
     if (connectionCode) {
-      console.error("Private connection code (shown once):");
+      console.error("Connection code (shown once):");
       console.error(connectionCode);
-    } else {
-      console.error("Existing private connection code kept. Run setup with --reset-code if you need a new visible code.");
     }
     return;
   }
@@ -807,7 +752,28 @@ async function cmdSetup(flags: Record<string, string | boolean>): Promise<void> 
   delete serveFlags["no-start"];
   delete serveFlags["reset-code"];
   delete serveFlags["rotate-owner-token"];
-  await cmdServeHttp(serveFlags, (info) => printSetupReady(info, connectionCode));
+  await cmdServeHttp(serveFlags, (info) => {
+    for (const line of formatSetupReady(info, connectionCode)) console.error(line);
+  });
+}
+
+/**
+ * `jk start`: run with the saved setup. An explicit --public-url or
+ * --quick-tunnel wins; otherwise a saved fixed domain is reused; otherwise
+ * a Quick Tunnel is opened (use `jk serve --http` for loopback-only).
+ */
+async function cmdStart(flags: Record<string, string | boolean>): Promise<void> {
+  const serveFlags: Record<string, string | boolean> = { ...flags };
+  if (typeof serveFlags["public-url"] === "string") {
+    serveFlags["public-url"] = normalizeSetupPublicUrl(serveFlags["public-url"]);
+  } else if (serveFlags["quick-tunnel"] !== true) {
+    const saved = await loadSetupPublicUrl();
+    if (saved) serveFlags["public-url"] = saved;
+    else serveFlags["quick-tunnel"] = true;
+  }
+  await cmdServeHttp(serveFlags, (info) => {
+    for (const line of formatSetupReady(info, undefined)) console.error(line);
+  });
 }
 
 async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
@@ -824,7 +790,7 @@ async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
   await ledger.append({ type: "workspace.opened", workspaceRoot });
 
   console.error(
-    `chatgpt2codex init: initialized state dir ${stateDir} with ${registry.length} project(s) from ${workspaceRoot}`,
+    `jk init: initialized state dir ${stateDir} with ${registry.length} project(s) from ${workspaceRoot}`,
   );
 
   // PRD §11 SR-04: owner secret lives only as a hash on disk; the plaintext
@@ -833,18 +799,21 @@ async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
   const alreadyHasToken = await hasOwnerToken(stateDir);
   if (alreadyHasToken && !flags["rotate-owner-token"]) {
     console.error(
-      "chatgpt2codex init: owner token already set (pass --rotate-owner-token to generate a new one).",
+      "jk init: owner token already set (pass --rotate-owner-token to generate a new one).",
     );
   } else {
     const ownerToken = generateOwnerToken();
     await storeOwnerToken(stateDir, ownerToken);
+    // Rotation must revoke sessions issued under the previous token; the
+    // connector (client registration) is preserved so only login repeats.
+    if (alreadyHasToken) await new JsonOAuthStore(stateDir).clearTokens();
     console.error("");
-    console.error("chatgpt2codex init: generated a new HTTP owner token (shown once, never logged again):");
+    console.error("jk init: generated a new HTTP owner token (shown once, never logged again):");
     console.error("");
     console.error(`  ${ownerToken}`);
     console.error("");
     console.error(
-      "Store this securely (e.g. a password manager). It is required to approve the OAuth /authorize prompt when a ChatGPT/MCP client connects over `chatgpt2codex serve --http`.",
+      "Store this securely (e.g. a password manager). It is required to approve the OAuth /authorize prompt when a ChatGPT/MCP client connects over `jk serve --http`.",
     );
   }
 }
@@ -886,13 +855,13 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
     return;
   }
 
-  console.error("usage: chatgpt2codex owner-token --status|--generate|--set-stdin [--workspace <path>]");
+  console.error("usage: jk owner-token --status|--generate|--set-stdin [--workspace <path>]");
   console.error(`workspace: ${path.resolve(workspace)}`);
   process.exitCode = 1;
 }
 
 /**
- * `chatgpt2codex control <list|approve|approve-all|reject|kill|preflight|auto> [actionId]`
+ * `jk control <list|approve|approve-all|reject|kill|preflight|auto> [actionId]`
  *
  * The local-only human-approval surface for Option B desktop control
  * (src/control/queue.ts). This is the mechanism a local approver (today:
@@ -914,7 +883,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
     }
     case "approve": {
       if (!actionId) {
-        console.error("usage: chatgpt2codex control approve <actionId>");
+        console.error("usage: jk control approve <actionId>");
         process.exitCode = 1;
         return;
       }
@@ -956,7 +925,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
       switch (mode) {
         case "on": {
           if (!isControlEnabled()) {
-            console.error("Desktop control is not enabled (CHATGPT2CODEX_CONTROL); refusing to enable auto-approve.");
+            console.error("Desktop control is not enabled (JK_CONTROL); refusing to enable auto-approve.");
             process.exitCode = 1;
             return;
           }
@@ -969,7 +938,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
               : [];
           if (apps.length === 0) {
             console.error(
-              "usage: chatgpt2codex control auto on --apps <a,b,...> [--minutes N] [--kinds click,type,key] [--max N]",
+              "usage: jk control auto on --apps <a,b,...> [--minutes N] [--kinds click,type,key,scroll] [--max N]",
             );
             process.exitCode = 1;
             return;
@@ -980,7 +949,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
               ? (flags.kinds
                   .split(",")
                   .map((entry) => entry.trim())
-                  .filter((entry): entry is AutoActionKind => entry === "click" || entry === "type" || entry === "key"))
+                  .filter((entry): entry is AutoActionKind => entry === "click" || entry === "type" || entry === "key" || entry === "scroll"))
               : undefined;
           const maxCountRaw = typeof flags.max === "string" ? Number(flags.max) : undefined;
           const maxCount = maxCountRaw !== undefined && !Number.isNaN(maxCountRaw) ? maxCountRaw : undefined;
@@ -1018,7 +987,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
         }
         default:
           console.error(
-            "usage: chatgpt2codex control auto <on --apps a,b [--minutes N] [--kinds click,type,key] [--max N] | off | status>",
+            "usage: jk control auto <on --apps a,b [--minutes N] [--kinds click,type,key,scroll] [--max N] | off | status>",
           );
           process.exitCode = 1;
           return;
@@ -1026,7 +995,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
     }
     case "reject": {
       if (!actionId) {
-        console.error("usage: chatgpt2codex control reject <actionId>");
+        console.error("usage: jk control reject <actionId>");
         process.exitCode = 1;
         return;
       }
@@ -1069,7 +1038,7 @@ async function cmdControl(positional: string[], flags: Record<string, string | b
       return;
     }
     default:
-      console.error("usage: chatgpt2codex control <list|approve|approve-all|reject|kill|preflight|auto> [actionId]");
+      console.error("usage: jk control <list|approve|approve-all|reject|kill|preflight|auto> [actionId]");
       process.exitCode = 1;
   }
 }
@@ -1087,7 +1056,6 @@ async function cmdDoctor(): Promise<void> {
   const nodeVersion = process.version;
   const rgVersion = await checkCommand("rg", ["--version"]);
   const gitVersion = await checkCommand("git", ["--version"]);
-  const cloudflaredVersion = await checkCommand("cloudflared", ["--version"]);
   const workspacePath = process.cwd();
 
   let toolCount = "unknown";
@@ -1112,14 +1080,13 @@ async function cmdDoctor(): Promise<void> {
   console.log(`node: ${nodeVersion}`);
   console.log(`ripgrep: ${rgVersion ?? "not found"}`);
   console.log(`git: ${gitVersion ?? "not found"}`);
-  console.log(`cloudflared: ${cloudflaredVersion ?? "not found — only required for --quick-tunnel"}`);
   console.log(`workspace: ${workspacePath}`);
   console.log(`state dir: ${stateDir}`);
   console.log(`registered tools: ${toolCount}`);
   console.log(
-    `http/oauth: owner token ${ownerTokenReady ? "configured" : "NOT SET — run `chatgpt2codex init` to generate one"}`,
+    `http/oauth: owner token ${ownerTokenReady ? "configured" : "NOT SET — run `jk init` to generate one"}`,
   );
-  console.log(`http default endpoint: http://127.0.0.1:7979/mcp (start via \`chatgpt2codex serve --http\`)`);
+  console.log(`http default endpoint: http://127.0.0.1:7979/mcp (start via \`jk serve --http\`)`);
   console.log(
     `image intake: pngpaste ${intake.pngpasteAvailable ? "found" : "not found — clipboard image intake unavailable"}, ` +
       `~/Downloads ${intake.downloadsDirExists ? "found" : "NOT FOUND — download intake unavailable"}`,
@@ -1134,20 +1101,23 @@ async function cmdExecutor(flags: Record<string, string | boolean>): Promise<voi
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const hubUrl =
     typeof flags.hub === "string" ? flags.hub : process.env.JK_HUB_URL ?? "";
+  if (!hubUrl.trim()) {
+    throw new Error("Executor hub is not configured. Set JK_HUB_URL or pass --hub <url>.");
+  }
   const executorId =
     typeof flags["executor-id"] === "string" ? flags["executor-id"] : process.env.JK_EXECUTOR_ID ?? "windows-main";
   const tokenFile =
     typeof flags["token-file"] === "string" ? flags["token-file"] : process.env.JK_EXECUTOR_TOKEN_FILE;
   const executorToken = process.env.JK_EXECUTOR_TOKEN ?? (tokenFile ? await readExecutorToken(tokenFile) : "");
-  if (!hubUrl) {
-    throw new Error("Executor hub is not configured. Set JK_HUB_URL or pass --hub <url>.");
-  }
   if (!executorToken) {
     throw new Error(
       "Executor authentication is not configured. Set JK_EXECUTOR_TOKEN or --token-file <path>.",
     );
   }
+  const stateDir = typeof flags["state-dir"] === "string" ? path.resolve(flags["state-dir"])
+    : process.env.JK_EXECUTOR_STATE_DIR?.trim() ? path.resolve(process.env.JK_EXECUTOR_STATE_DIR.trim()) : defaultStateDir();
   await runExecutorWorker({
+    stateDir,
     hubUrl,
     executorToken,
     executorId,
@@ -1160,11 +1130,16 @@ async function cmdExecutor(flags: Record<string, string | boolean>): Promise<voi
 async function main(): Promise<void> {
   const { command, flags, positional } = parseArgs(process.argv.slice(2));
   switch (command) {
-    case "start":
-      await cmdServeHttp(flags);
+    case "--help":
+    case "-h":
+    case "help":
+      console.log(USAGE);
       break;
     case "setup":
       await cmdSetup(flags);
+      break;
+    case "start":
+      await cmdStart(flags);
       break;
     case "serve":
       await cmdServe(flags);
@@ -1184,18 +1159,8 @@ async function main(): Promise<void> {
     case "executor":
       await cmdExecutor(flags);
       break;
-    case "help":
-    case "--help":
-    case "-h":
-    case undefined:
-      console.error(
-        "usage: jk <setup|start|serve|init|doctor|owner-token|control|executor> [--workspace <path>] [--quick-tunnel | --public-url <origin>] [--port 7979] [--no-start]",
-      );
-      break;
     default:
-      console.error(
-        "usage: jk <setup|start|serve|init|doctor|owner-token|control|executor> [--workspace <path>] [--quick-tunnel | --public-url <origin>] [--port 7979] [--no-start]",
-      );
+      console.error(USAGE);
       process.exitCode = 1;
   }
 }

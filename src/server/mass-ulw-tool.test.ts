@@ -80,6 +80,45 @@ describe("mass_ulw_execute MCP boundary", () => {
     expect(mocks.runCommand).toHaveBeenCalledTimes(4);
   }, 120_000);
 
+  it("returns and persists final verification failure diagnostics", async () => {
+    mocks.runCommand.mockImplementation(async (_cwd: string, commandId: string) => ({
+      exitCode: commandId === "npm:final" ? 2 : 0,
+      stdoutSummary: commandId === "npm:final" ? "final stdout" : "verified",
+      stderrSummary: commandId === "npm:final" ? "final stderr" : "",
+      durationMs: 1,
+      outputTruncated: false,
+    }));
+
+    const result = await harness.client.callTool({ name: "mass_ulw_execute", arguments: await approvedInput() });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      status: "blocked",
+      completedLaneIds: ["A", "B", "C"],
+      failureDiagnostics: [expect.objectContaining({
+        laneId: null,
+        stage: "final_verification",
+        command: "npm:final",
+        exitCode: 2,
+        stdoutSummary: "final stdout",
+        stderrSummary: "final stderr",
+        retryable: false,
+      })],
+    });
+    const persisted = await new MassUlwStore(harness.stateDir).load(await harness.executionId());
+    expect(persisted.attempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "integration-verification",
+        status: "failed",
+        failure: expect.objectContaining({
+          stage: "final_verification",
+          command: "npm:final",
+          exitCode: 2,
+        }),
+      }),
+    ]));
+  }, 120_000);
+
   it("revokes a stale fanout approval when Fast becomes sequential", async () => {
     const staleInput = await approvedInput();
     const fast = await harness.client.callTool({

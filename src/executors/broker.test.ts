@@ -14,6 +14,13 @@ import {
   resolveRoutedLocalProject,
   setProjectExecutorRoute,
 } from "./broker.js";
+import { EXECUTOR_PROTOCOL_VERSION, TARGET_CAPABILITY, type RuntimeIdentity } from "./target-protocol.js";
+
+const identity: RuntimeIdentity = {
+  role: "worker", protocolVersion: EXECUTOR_PROTOCOL_VERSION, executorId: "windows-main",
+  instanceId: "instance-1", workspaceRoot: String.raw`C:\shakw`, os: "win32", arch: "x64",
+  capabilities: [TARGET_CAPABILITY, "code_search", "file_read_slice"],
+};
 
 describe("executor broker", () => {
   let stateDir: string;
@@ -35,11 +42,11 @@ describe("executor broker", () => {
 
   async function heartbeat(projectId = "clean-app"): Promise<void> {
     await recordExecutorHeartbeat(stateDir, {
+      ...identity,
       executorId: "windows-main",
       label: "Windows PC",
       platform: "win32/x64",
       workspaceRoot: "C:\\shakw",
-      capabilities: ["code_search", "file_read_slice"],
       projects: [{
         projectId,
         name: projectId,
@@ -63,7 +70,7 @@ describe("executor broker", () => {
     });
   });
 
-  it("routes a canonical project to Windows while online and falls back locally when stale", async () => {
+  it("routes a canonical project to Windows while online and refuses stale mappings", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-17T08:00:00Z"));
     await heartbeat();
@@ -77,8 +84,10 @@ describe("executor broker", () => {
     const stale = await listExecutorStatus(stateDir);
     expect(stale[0]?.online).toBe(false);
 
-    const fallback = await resolveRoutedLocalProject(stateDir, localProject);
-    expect(fallback).toEqual(localProject);
+    await expect(resolveRoutedLocalProject(stateDir, localProject)).rejects.toMatchObject({
+      name: "DomainError",
+      details: { executorId: "windows-main", projectId: "clean-app" },
+    });
   });
 
   it("treats a remote package-name alias as the same logical local project", async () => {
@@ -89,11 +98,11 @@ describe("executor broker", () => {
       aliases: ["songsong"],
     };
     await recordExecutorHeartbeat(stateDir, {
+      ...identity,
       executorId: "windows-main",
       label: "Windows PC",
       platform: "win32/x64",
       workspaceRoot: "C:\\shakw",
-      capabilities: ["code_search"],
       projects: [{
         projectId: "shakw",
         name: "shakw",
@@ -121,13 +130,13 @@ describe("executor broker", () => {
       5_000,
     );
 
-    const job = await pollExecutorJob("windows-main", 1_000);
+    const job = await pollExecutorJob("windows-main", 1_000, identity, stateDir);
     expect(job).toMatchObject({
       executorId: "windows-main",
       tool: "code_search",
       payload: { sourceProjectId: "clean-app", query: "seek" },
     });
-    expect(completeExecutorJob(job!.jobId, { matches: ["player.ts"] })).toBe(true);
+    expect(completeExecutorJob(job!.jobId, { matches: ["player.ts"] }, undefined, "windows-main", identity)).toBe(true);
 
     await expect(resultPromise).resolves.toEqual({ matches: ["player.ts"] });
   });

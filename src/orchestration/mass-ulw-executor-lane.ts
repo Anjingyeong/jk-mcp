@@ -2,9 +2,11 @@ import type { MassUlwLaneCheckout } from "./mass-ulw-workspace.js";
 import type { MassUlwStore } from "./mass-ulw-store.js";
 import type { LaneEngine, LaneExecutionRequest, LaneVerificationRequest, MassUlwAttemptFingerprint, MassUlwExecutionInput, MassUlwRecoveryApproach, VerificationEngine } from "./mass-ulw-executor-types.js";
 import { encodeMassUlwAttemptFingerprint, errorApproachFingerprint, errorFailureFingerprint, fingerprint, recoveryHistory } from "./mass-ulw-executor-recovery.js";
+import { MassUlwStageError, massUlwFailureFromError, type MassUlwFailureDiagnostic } from "./mass-ulw-failure.js";
+import { MassUlwPersistenceError } from "./mass-ulw-executor-types.js";
 const MAX_LANE_ATTEMPTS = 3;
 type LaneOutcome = { laneId: string; status: "completed" | "failed" };
-class LaneAttemptFailure extends Error { readonly failureFingerprint: string; readonly approachFingerprint?: string; constructor(message: string, failureFingerprint: string, approachFingerprint?: string) { super(message); this.name = "LaneAttemptFailure"; this.failureFingerprint = failureFingerprint; this.approachFingerprint = approachFingerprint; } }
+class LaneAttemptFailure extends Error { readonly failureFingerprint: string; readonly approachFingerprint?: string; readonly failure?: MassUlwFailureDiagnostic; constructor(message: string, failureFingerprint: string, approachFingerprint?: string, failure?: MassUlwFailureDiagnostic) { super(message); this.name = "LaneAttemptFailure"; this.failureFingerprint = failureFingerprint; this.approachFingerprint = approachFingerprint; this.failure = failure; } }
 class LaneAuthorizationFailure extends Error { constructor(readonly authorizationCause: unknown) { super("Lane authorization was revoked", { cause: authorizationCause }); this.name = "LaneAuthorizationFailure"; } }
 function optionalFingerprint(value: unknown): string | undefined { return typeof value === "string" && value.length > 0 ? value : undefined; }
 function approachForFailureCount(count: number): MassUlwRecoveryApproach { if (count === 0) return "initial"; if (count === 1) return "inspect-assumption"; return "materially-different-approach"; }
@@ -17,9 +19,10 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
   ): Promise<LaneOutcome> {
     let document = await this.config.store.load(input.loopId);
     let history = recoveryHistory(document, laneId);
-    if (history.length >= MAX_LANE_ATTEMPTS) return { laneId, status: "failed" };
+    const maxAttempts = this.config.laneEngine.failurePolicy === "repair-required" ? 1 : MAX_LANE_ATTEMPTS;
+    if (history.length >= maxAttempts) return { laneId, status: "failed" };
 
-    while (history.length < MAX_LANE_ATTEMPTS) {
+    while (history.length < maxAttempts) {
       document = await this.config.store.load(input.loopId);
       const laneState = document.lanes[laneId]!;
       const previous = history.at(-1);
@@ -43,6 +46,7 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
       };
       const startedFingerprint: MassUlwAttemptFingerprint = {
         version: 1,
+        ...(laneState.strategyGenerations ? { strategyGeneration: laneState.strategyGenerations.at(-1)?.generation ?? 0 } : {}),
         approach,
         approachFingerprint: plannedApproachFingerprint,
         previousFailureFingerprint: request.previousFailureFingerprint,
@@ -64,6 +68,7 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
       });
 
       let approachFingerprint = plannedApproachFingerprint;
+      let recordingCompletion = false;
       try {
         await authorize(this.config.authorizeLaneExecutionStart, request);
         const execution = await this.config.laneEngine.execute(request);
@@ -85,6 +90,7 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
           ...request,
           outputFingerprint: execution.outputFingerprint,
           approachFingerprint,
+          checkoutCommit: execution.checkoutCommit,
         };
         await authorize(this.config.authorizeLaneVerificationStart, verificationRequest);
         const verification = await this.config.verificationEngine.verifyLane(verificationRequest);
@@ -100,9 +106,11 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
             verification.message ?? `Lane ${laneId} verification failed`,
             verification.failureFingerprint ?? verification.fingerprint,
             approachFingerprint,
+            verification.failure,
           );
         }
 
+        recordingCompletion = true;
         await this.config.store.update(input.loopId, (current) => {
           const attempt = current.attempts.find((candidate) => candidate.id === attemptId);
           if (!attempt || attempt.status !== "in-flight") throw new Error(`Lane attempt is not in flight: ${attemptId}`);
@@ -122,6 +130,7 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
         });
         return { laneId, status: "completed" };
       } catch (error) {
+        if (recordingCompletion || error instanceof MassUlwPersistenceError) throw error;
         if (error instanceof LaneAuthorizationFailure) throw error.authorizationCause;
         const phase = error instanceof LaneAttemptFailure && error.message.includes("verification")
           ? "lane-verification"
@@ -132,6 +141,27 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
         approachFingerprint = error instanceof LaneAttemptFailure
           ? error.approachFingerprint ?? approachFingerprint
           : errorApproachFingerprint(error, approachFingerprint);
+        const retryable = history.length + 1 < maxAttempts;
+        const suppliedFailure = error instanceof MassUlwStageError
+          ? error.diagnostic
+          : error instanceof LaneAttemptFailure
+            ? error.failure
+            : undefined;
+        const failure = suppliedFailure
+          ? {
+              ...suppliedFailure,
+              laneId,
+              baseCommit: suppliedFailure.baseCommit ?? checkout.executionBaselineCommit,
+              checkoutCommit: suppliedFailure.checkoutCommit ?? checkout.executionBaselineCommit,
+              retryable,
+            }
+          : massUlwFailureFromError(error, {
+              laneId,
+              stage: phase === "lane-verification" ? "verification" : "execution",
+              baseCommit: checkout.executionBaselineCommit,
+              checkoutCommit: checkout.executionBaselineCommit,
+              retryable,
+            });
         await this.config.store.update(input.loopId, (current) => {
           const attempt = current.attempts.find((candidate) => candidate.id === attemptId);
           if (!attempt || attempt.status !== "in-flight") throw new Error(`Lane attempt is not in flight: ${attemptId}`);
@@ -143,12 +173,13 @@ export class MassUlwLaneRunner { constructor(private readonly config: { store: M
             approachFingerprint,
             failureFingerprint,
           });
+          attempt.failure = failure;
           const lane = current.lanes[laneId]!;
           lane.status = "failed";
           delete lane.completedAt;
         });
         history = [...history, { failureFingerprint, approachFingerprint }];
-        if (history.length >= MAX_LANE_ATTEMPTS) return { laneId, status: "failed" };
+        if (history.length >= maxAttempts) return { laneId, status: "failed" };
       }
     }
     return { laneId, status: "failed" };

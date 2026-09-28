@@ -4,7 +4,7 @@ import path from "node:path";
 import { DomainError, ErrorCode } from "../types.js";
 import { redact } from "../policy/secrets.js";
 import { resolveInProject } from "../policy/paths.js";
-import { buildSafeChildEnv } from "./command-runner.js";
+import { buildSafeChildEnv, killProcessTree } from "./command-runner.js";
 
 const DEFAULT_TIMEOUT_SEC = 60;
 const MAX_TIMEOUT_SEC = 900;
@@ -37,9 +37,6 @@ const APPROVABLE_DESTRUCTIVE_PATTERNS = [
   /\bgit\s+rebase\b/i,
   /\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|-f\b|--delete\b|--mirror\b|\s\+\S)/i,
   /\bcrontab\b(?!\s+-l\b)/i,
-  /\bRemove-Item\b/i,
-  /\b(del|erase|rmdir|rd)\b/i,
-  /\b(kill|pkill|killall)\b/i,
   /\bsystemctl\s+(restart|stop|start|reload|reload-or-restart|try-restart|kill)\b/i,
   /\baws(?:\.exe)?\b[^\n]*\bec2\b[^\n]*\b(run-instances|terminate-instances|authorize-security-group-ingress|create-nat-gateway|allocate-address)\b/i,
   /\baws(?:\.exe)?\b[^\n]*\biam\b[^\n]*\b(create-access-key|delete-access-key|create-login-profile|update-login-profile)\b/i,
@@ -49,6 +46,45 @@ const APPROVABLE_DESTRUCTIVE_PATTERNS = [
   /\boci\b[^\n]*\bnetwork\b[^\n]*\b(create|delete|update)\b/i,
   /\boci\b[^\n]*\bbudgets?\b[^\n]*\b(create|delete|update)\b/i,
 ];
+
+// Deletion/termination verbs that are only destructive when executed as a
+// command. As plain arguments or quoted text (`--mode rd`, `--no-kill`,
+// `echo "del"`) they are data. See isCommandPositionDestructive.
+const COMMAND_POSITION_DESTRUCTIVE_NAMES = new Set([
+  "del", "erase", "rmdir", "rd", "kill", "pkill", "killall", "remove-item", "ri",
+]);
+
+// Fail-closed fallback when the command cannot be parsed: the historical
+// whole-string word match.
+const LEGACY_COMMAND_WORD_PATTERNS = [
+  /\bRemove-Item\b/i,
+  /\b(del|erase|rmdir|rd)\b/i,
+  /\b(kill|pkill|killall)\b/i,
+];
+
+// Prefixes that run the following word as a command. Their own flags and
+// numeric/duration values are skipped before reading the command position.
+const COMMAND_PREFIX_NAMES = new Set([
+  "xargs", "env", "start", "call", "exec", "command", "builtin", "nohup", "nice", "timeout",
+  "time", "watch", "stdbuf", "setsid", "doas", "sudo", "then", "do", "else", "elif", "if",
+  "while", "until", "!",
+]);
+
+// Constructs that run commands from arbitrary later positions (cmd `if exist x
+// del x`, `for ... do`, PowerShell script blocks and ForEach-Object, find
+// -exec). A segment that uses one falls back to the legacy word match.
+const CONTROL_CONSTRUCT_NAMES = new Set([
+  "if", "for", "foreach", "foreach-object", "%", "while", "until", "select", "case",
+  "where-object", "where", "?", "find", "parallel", "invoke-command", "icm", "invoke-expression",
+  "iex", "start-process", "saps", "start-job", "sajb", "start-threadjob", "runas", "schtasks",
+]);
+
+const POWERSHELL_COMMAND_FLAG = /^-(c|co|com|comm|comma|comman|command)$/i;
+const POWERSHELL_ENCODED_FLAG = /^-(e|ec|en|enc|enco|encod|encode|encoded\w*)$/i;
+const POWERSHELL_FILE_FLAG = /^-(f|fi|fil|file)$/i;
+const POWERSHELL_VALUE_FLAG =
+  /^-(ex|ep|exe\w*|executionpolicy|w|wi\w*|windowstyle|o|of|outputformat|if|inp\w*|inputformat|config\w*|wd|wo\w*|workingdirectory|v|version|psconsolefile|settingsfile)$/i;
+const MAX_WRAPPER_DEPTH = 4;
 
 // Zero-charge mode: commands that can increase OCI billable capacity are not
 // merely approval-gated. They are rejected even with a destructive/network
@@ -77,6 +113,7 @@ const NETWORK_COMMAND_PATTERNS = [
   /\b(curl|wget|nc|ncat|netcat|telnet|scp|sftp|ftp|ssh)\b/i,
   /\b(npm|pnpm|yarn|bun)\s+(install|add|update)\b/i,
   /\bgit\s+(pull|fetch|clone|push)\b/i,
+  /(^|[\s"'\\/])gh(?:\.exe)?(?=[\s"']|$)/i,
   /(^|[\s"'\\/])aws(?:\.exe)?(?=[\s"']|$)/i,
   /(^|[\s"'\\/])oci(?=[\s"']|$)/i,
   /\bInvoke-(WebRequest|RestMethod)\b/i,
@@ -240,6 +277,123 @@ function executableName(token: string): string {
   return token.split(/[\\/]/).pop()?.toLowerCase() ?? token.toLowerCase();
 }
 
+/**
+ * Split at every top-level command separator (; newline | || & &&) outside
+ * quotes. Returns null on unbalanced quotes so callers can fail closed.
+ */
+function splitCommandSegments(command: string): string[] | null {
+  const parts: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  for (const char of command) {
+    if (quote) {
+      if (char === quote) quote = null;
+      current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "&" || char === "\n" || char === "\r") {
+      if (current.trim()) parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (quote) return null;
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function legacyCommandWordMatch(command: string): boolean {
+  return LEGACY_COMMAND_WORD_PATTERNS.some((pattern) => pattern.test(command));
+}
+
+/**
+ * True when a deletion/termination verb is executed as a command: first word
+ * of a segment, after a prefix such as xargs/timeout, or inside a cmd /c,
+ * bash -c or powershell -Command script. Unparseable input and command
+ * substitution fall back to the legacy whole-string match (fail closed).
+ */
+function isCommandPositionDestructive(command: string, depth = 0): boolean {
+  if (depth > MAX_WRAPPER_DEPTH) return true;
+  if (/\$\(|`|[<>]\(/.test(command)) return legacyCommandWordMatch(command);
+  const segments = splitCommandSegments(command);
+  if (!segments) return legacyCommandWordMatch(command);
+  for (const segment of segments) {
+    const tokens = tokenizeShellSegment(segment);
+    if (!tokens) return legacyCommandWordMatch(command);
+    if (hasUnquotedBrace(segment) ? legacyCommandWordMatch(segment) : isDestructiveSegment(tokens, depth)) return true;
+  }
+  return false;
+}
+
+function hasUnquotedBrace(segment: string): boolean {
+  let quote: "'" | '"' | null = null;
+  for (const char of segment) {
+    if (quote) {
+      if (char === quote) quote = null;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "{" || char === "}") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isDestructiveSegment(tokens: string[], depth: number): boolean {
+  let index = 0;
+  while (index < tokens.length) {
+    const token = tokens[index]!.replace(/^[({]+/, "");
+    if (!token || /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      index += 1;
+      continue;
+    }
+    const name = executableName(token).replace(/\.exe$/, "");
+    if (COMMAND_POSITION_DESTRUCTIVE_NAMES.has(name)) return true;
+    if (CONTROL_CONSTRUCT_NAMES.has(name)) return legacyCommandWordMatch(tokens.slice(index).join(" "));
+    if (COMMAND_PREFIX_NAMES.has(name)) {
+      index += 1;
+      while (index < tokens.length && (tokens[index]!.startsWith("-") || /^\d+(\.\d+)?[smhd]?$/.test(tokens[index]!))) index += 1;
+      continue;
+    }
+    const rest = tokens.slice(index + 1);
+    if (name === "cmd") {
+      const scriptAt = rest.findIndex((arg) => /^\/[ck]$/i.test(arg));
+      return scriptAt >= 0 && isCommandPositionDestructive(rest.slice(scriptAt + 1).join(" "), depth + 1);
+    }
+    if (name === "bash" || name === "sh" || name === "zsh" || name === "dash") {
+      const scriptAt = rest.findIndex((arg) => /^-[A-Za-z]*c[A-Za-z]*$/.test(arg));
+      return scriptAt >= 0 && scriptAt + 1 < rest.length && isCommandPositionDestructive(rest[scriptAt + 1]!, depth + 1);
+    }
+    if (name === "powershell" || name === "pwsh") return isDestructivePowerShellInvocation(rest, depth);
+    return false;
+  }
+  return false;
+}
+
+function isDestructivePowerShellInvocation(args: string[], depth: number): boolean {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (POWERSHELL_ENCODED_FLAG.test(arg)) return true;
+    if (POWERSHELL_FILE_FLAG.test(arg)) return false;
+    if (POWERSHELL_COMMAND_FLAG.test(arg)) {
+      return isCommandPositionDestructive(args.slice(index + 1).join(" "), depth + 1);
+    }
+    if (POWERSHELL_VALUE_FLAG.test(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    return isCommandPositionDestructive(args.slice(index).join(" "), depth + 1);
+  }
+  return false;
+}
+
 function splitInspectionPipeline(command: string): string[] | null {
   const parts: string[] = [];
   let current = "";
@@ -353,6 +507,36 @@ export function isAutonomousCloudInventoryRead(command: string): boolean {
   const segments = splitTopLevelConjunctions(command);
   if (!segments?.length) return false;
   return segments.every((segment) => isSafeAwsReadOnlySegment(segment) || isSafeOciReadOnlySegment(segment));
+}
+
+function isSafeGhTaskFollowupSegment(segment: string): boolean {
+  const tokens = tokenizeShellSegment(segment);
+  if (!tokens || tokens.length < 3) return false;
+  const executable = executableName(tokens[0]!);
+  if (executable !== "gh" && executable !== "gh.exe") return false;
+
+  const resource = tokens[1]!.toLowerCase();
+  const operation = tokens[2]!.toLowerCase();
+  const safeOperation =
+    (resource === "run" && (operation === "list" || operation === "view")) ||
+    (resource === "release" && (operation === "list" || operation === "view")) ||
+    (resource === "workflow" && (operation === "list" || operation === "view"));
+  if (!safeOperation) return false;
+
+  const args = tokens.slice(3);
+  return !args.some((token) =>
+    containsShellInterpolation(token) || token === "--web" || token === "-w");
+}
+
+/**
+ * Narrow GitHub status/read verifier family that may reuse an already-active
+ * task network grant. This is deliberately not autonomous: callers must also
+ * prove the same goal/work-session approval identity is still active.
+ */
+export function isSafeTaskFollowupNetworkRead(command: string): boolean {
+  const segments = splitTopLevelConjunctions(command);
+  if (!segments?.length) return false;
+  return segments.every(isSafeGhTaskFollowupSegment);
 }
 
 function safeCurlReadScope(segment: string): ReadOnlyNetworkApprovalScope | null {
@@ -475,7 +659,9 @@ export function inspectShellCommand(command: string): ShellCommandRisk {
     }
   }
   return {
-    destructive: executesJkReloadScript(command) || APPROVABLE_DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command)),
+    destructive: executesJkReloadScript(command)
+      || APPROVABLE_DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))
+      || isCommandPositionDestructive(command),
     needsNetwork: NETWORK_COMMAND_PATTERNS.some((pattern) => pattern.test(command)),
   };
 }
@@ -527,6 +713,7 @@ export async function runLocalShell(
   cwd?: string,
   timeoutSec?: number,
   approved?: { needsNetwork?: boolean; destructive?: boolean },
+  signal?: AbortSignal,
 ): Promise<{
   cwd: string;
   exitCode: number;
@@ -553,7 +740,16 @@ export async function runLocalShell(
   const start = Date.now();
 
   return await new Promise((resolve, reject) => {
-    exec(
+    let settled = false;
+    let interrupted = false;
+    let onAbort: (() => void) | undefined;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const child = exec(
       command,
       {
         cwd: commandCwd,
@@ -564,16 +760,17 @@ export async function runLocalShell(
         windowsHide: true,
       },
       (error, stdout, stderr) => {
+        if (interrupted) return;
         const durationMs = Date.now() - start;
         const stdoutBuf = Buffer.from(stdout ?? "", "utf8");
         const stderrBuf = Buffer.from(stderr ?? "", "utf8");
 
         if (error && (error as NodeJS.ErrnoException & { killed?: boolean }).killed) {
-          reject(
+          finish(() => reject(
             new DomainError(ErrorCode.TIMEOUT, `local shell command timed out after ${effectiveTimeoutSec}s`, {
               timeoutSec: effectiveTimeoutSec,
             }),
-          );
+          ));
           return;
         }
 
@@ -581,15 +778,24 @@ export async function runLocalShell(
         const outErr = truncateOutput(stderrBuf);
         const exitCode = typeof error?.code === "number" ? error.code : error ? 1 : 0;
 
-        resolve({
+        finish(() => resolve({
           cwd: path.relative(baseRoot, commandCwd) || ".",
           exitCode,
           stdoutSummary: redact(outStd.text),
           stderrSummary: redact(outErr.text),
           durationMs,
           outputTruncated: outStd.truncated || outErr.truncated,
-        });
+        }));
       },
     );
+    onAbort = () => {
+      if (settled || interrupted) return;
+      interrupted = true;
+      killProcessTree(child.pid, () => finish(() => reject(
+        signal?.reason instanceof Error ? signal.reason : new Error("Local shell execution interrupted"),
+      )));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }

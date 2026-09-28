@@ -48,6 +48,8 @@ export function parseMassUlwAttemptFingerprint(value: string | undefined): MassU
     }
     const result: MassUlwAttemptFingerprint = {
       version: 1,
+      ...(typeof parsed.strategyGeneration === "number" && Number.isInteger(parsed.strategyGeneration) && parsed.strategyGeneration >= 0
+        ? { strategyGeneration: parsed.strategyGeneration } : {}),
       approach: parsed.approach,
       approachFingerprint,
       previousFailureFingerprint,
@@ -74,8 +76,10 @@ export function laneAttempts(document: MassUlwDocument, laneId: string): MassUlw
 }
 
 export function recoveryHistory(document: MassUlwDocument, laneId: string): LaneRecoveryEntry[] {
+  const generation = document.lanes[laneId]?.strategyGenerations?.at(-1)?.generation ?? 0;
   return laneAttempts(document, laneId)
     .filter((attempt) => attempt.status === "failed" || attempt.status === "interrupted")
+    .filter((attempt) => (parseMassUlwAttemptFingerprint(attempt.fingerprint)?.strategyGeneration ?? 0) === generation)
     .map((attempt, index) => {
       const parsed = parseMassUlwAttemptFingerprint(attempt.fingerprint);
       return {

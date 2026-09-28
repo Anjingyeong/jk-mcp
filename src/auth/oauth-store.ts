@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
+import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import { join } from "node:path";
 import { z } from "zod";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -152,7 +153,7 @@ export class JsonOAuthStore {
     doc.updatedAt = Date.now();
     const tmp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(tmp, JSON.stringify(doc, null, 2), { mode: FILE_MODE, encoding: "utf8" });
-    await rename(tmp, this.filePath);
+    await renameWithRetry(tmp, this.filePath);
     try {
       await chmod(this.filePath, FILE_MODE);
     } catch {
@@ -180,7 +181,7 @@ export class JsonOAuthStore {
   ): Promise<OAuthClientInformationFull> {
     return this.locked(async () => {
       if (!client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
-        throw new InvalidRequestError("Client redirect_uri is not allowed for this chatgpt2codex server");
+        throw new InvalidRequestError("Client redirect_uri is not allowed for this jk server");
       }
       const doc = await this.load();
       const now = Math.floor(Date.now() / 1000);
@@ -272,6 +273,12 @@ export class JsonOAuthStore {
     });
   }
 
+  /**
+   * Revoke every issued grant (access + refresh tokens) while keeping
+   * dynamically registered clients. Used on Owner Token rotation: existing
+   * sessions must stop working immediately, but the ChatGPT connector
+   * registration survives so the user only re-runs the login step.
+   */
   async clearTokens(): Promise<void> {
     await this.locked(async () => {
       const doc = await this.load();

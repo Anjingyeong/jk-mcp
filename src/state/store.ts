@@ -1,11 +1,14 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, unlink } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import { join } from "node:path";
 import { z } from "zod";
 import { DomainError, ErrorCode, type ProjectRegistryEntry } from "../types.js";
+import { isTaskWorkspaceId, taskWorkspaceProjects } from "../workspace/task-workspaces.js";
+import { acquireMassUlwLock } from "../orchestration/mass-ulw-lock.js";
 
 /**
- * Central state store under `~/.local/share/chatgpt2codex/` (PRD §10):
+ * Central state store under `~/.local/share/jk/` (PRD §10):
  * projects.json (registry) and sessions.json (active project/mode/lease).
  *
  * Persistence rules (PRD §10, §11 SR-04/SR-08 adjacent hardening):
@@ -85,6 +88,8 @@ const TaskContinuationSchema = z.object({
   status: z.enum(["waiting-approval", "running", "ready-to-resume", "blocked", "denied"]),
   updatedAt: z.number().int().nonnegative(),
   deliveredAt: z.number().int().nonnegative().optional(),
+  resultRevision: z.string().optional(),
+  deliveryToken: z.string().optional(),
 }).nullable().default(null);
 
 const TaskSafetyStatusSchema = z.enum(["unknown", "pass", "fail", "not-required"]);
@@ -107,10 +112,16 @@ const TaskExecutionSafetySchema = z.object({
   operationalDrift: z.array(z.string().min(1).max(2000)).max(30).default([]),
 }).default({});
 
-const TaskStateSchema = z.object({
+export const TaskStateSchema = z.object({
+  loopRevision: z.number().int().nonnegative().optional(),
+  lifecycle: z.enum(["active", "yielded", "reasoning-needed", "blocked", "succeeded"]).optional(),
   goalId: z.string().nullable().default(null),
   loopId: z.string().nullable().default(null),
-  currentGoal: z.string().max(1000).nullable().default(null),
+  // Long-running MASS ULW goals commonly carry safety, verification and
+  // release constraints that exceed a short UI preview. Preserve the full
+  // bounded contract in task state so later turns/recovery lanes do not lose
+  // requirements after the first 1k characters.
+  currentGoal: z.string().max(12000).nullable().default(null),
   currentTask: z.string().max(500).nullable().default(null),
   lastProgressSummary: z.string().max(1000).nullable().default(null),
   completed: z.array(z.string().min(1).max(500)).max(50).default([]),
@@ -144,11 +155,12 @@ const SessionSchema = z.object({
       projectId: z.string(),
       leaseId: z.string(),
       projectRoot: z.string(),
-      preset: z.enum(["read-only", "tests-only", "full-write", "image-only"]),
+      preset: z.enum(["read-only", "tests-only", "full-write", "image-only", "control"]),
       issuedAt: z.number().int().nonnegative(),
       expiresAt: z.number().int().nonnegative(),
     })
     .nullable(),
+  controlAllowlist: z.array(z.string().trim().min(1).max(80)).max(32).default([]),
   // Legacy v2 single-project context. Kept readable for migration only.
   workContext: WorkContextSchema.nullable().default(null),
   workContexts: z.record(z.string(), WorkContextSchema).default({}),
@@ -179,6 +191,7 @@ function emptySession(): SessionDocument {
     activeProjectId: null,
     mode: "observe",
     lease: null,
+    controlAllowlist: [],
     workContext: null,
     workContexts: {},
     workSessions: {},
@@ -219,8 +232,33 @@ export class Store {
       `.${filename}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
     );
     const json = JSON.stringify(data, null, 2);
-    await writeFile(tmp, json, { mode: FILE_MODE, encoding: "utf8" });
-    await rename(tmp, target);
+    const handle = await open(tmp, "wx", FILE_MODE);
+    try {
+      try { await handle.writeFile(json, "utf8"); await handle.sync(); }
+      finally { await handle.close(); }
+      await renameWithRetry(tmp, target);
+    } finally {
+      await unlink(tmp).catch((error: unknown) => {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      });
+    }
+  }
+
+  /** Loop checkpoint authority; caller validates owner and payload under lockedGoalLoop. */
+  async writeGoalLoop(loopId: string, payload: Record<string, unknown>): Promise<void> {
+    z.string().regex(/^[A-Za-z0-9_.-]+$/).max(200).parse(loopId);
+    await new Store(join(this.stateDir, "goals")).atomicWriteJson(loopId + ".loop.json", payload);
+  }
+
+  async lockedGoalLoop<T>(loopId: string, action: () => Promise<T>): Promise<T> {
+    z.string().regex(/^[A-Za-z0-9_.-]+$/).max(200).parse(loopId);
+    const goals = join(this.stateDir, "goals");
+    await mkdir(goals, { recursive: true, mode: DIR_MODE });
+    return this.enqueueSessionWrite(async () => {
+      const lock = await acquireMassUlwLock({ path: join(goals, loopId + ".lock"), now: Date.now,
+        lockedMessage: "Goal loop is busy in another process; retry without replacing its owner" });
+      try { return await action(); } finally { await lock.release(); }
+    }, join(goals, loopId));
   }
 
   private async readJson(filename: string): Promise<unknown | undefined> {
@@ -240,7 +278,7 @@ export class Store {
 
   async loadProjects(): Promise<ProjectRegistryEntry[]> {
     const raw = await this.readJson(PROJECTS_FILE);
-    if (raw === undefined) return [];
+    if (raw === undefined) return taskWorkspaceProjects(this.stateDir);
     const parsed = ProjectsFileSchema.safeParse(raw);
     if (!parsed.success) {
       throw new DomainError(
@@ -248,11 +286,11 @@ export class Store {
         `Store: ${PROJECTS_FILE} failed validation: ${parsed.error.message}`,
       );
     }
-    return parsed.data.projects;
+    return [...parsed.data.projects.filter((entry) => !isTaskWorkspaceId(entry.projectId)), ...await taskWorkspaceProjects(this.stateDir)];
   }
 
   async saveProjects(p: ProjectRegistryEntry[]): Promise<void> {
-    const validated = z.array(ProjectRegistryEntrySchema).parse(p);
+    const validated = z.array(ProjectRegistryEntrySchema).parse(p.filter((entry) => !isTaskWorkspaceId(entry.projectId)));
     const doc: ProjectsFile = {
       version: 1,
       updatedAt: Date.now(),
@@ -305,17 +343,17 @@ export class Store {
     return validated;
   }
 
-  private enqueueSessionWrite<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = sessionWriteQueues.get(this.stateDir) ?? Promise.resolve();
+  private enqueueSessionWrite<T>(operation: () => Promise<T>, key = this.stateDir): Promise<T> {
+    const previous = sessionWriteQueues.get(key) ?? Promise.resolve();
     const run = previous.catch(() => undefined).then(operation);
     const tail = run.then(
       () => undefined,
       () => undefined,
     );
-    sessionWriteQueues.set(this.stateDir, tail);
+    sessionWriteQueues.set(key, tail);
     void tail.then(() => {
-      if (sessionWriteQueues.get(this.stateDir) === tail) {
-        sessionWriteQueues.delete(this.stateDir);
+      if (sessionWriteQueues.get(key) === tail) {
+        sessionWriteQueues.delete(key);
       }
     });
     return run;

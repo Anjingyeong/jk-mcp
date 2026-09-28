@@ -17,7 +17,7 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes to get local human approval
 
-export type ControlActionKind = "click" | "type" | "key";
+export type ControlActionKind = "click" | "type" | "key" | "scroll";
 export type ControlActionStatus = "pending" | "approved" | "rejected" | "done";
 
 export interface ControlActionTarget {
@@ -51,11 +51,13 @@ export interface ResolvedTargetPreview {
  * never be echoed back through a tool result or written to the ledger. */
 export interface ControlActionRecord {
   actionId: string;
+  projectId?: string;
   appName: string;
   kind: ControlActionKind;
   target: ControlActionTarget;
   text?: string;
   keyCode?: number;
+  scrollDelta?: number;
   reason: string;
   createdAt: number;
   expiresAt: number;
@@ -213,11 +215,13 @@ export async function clearKill(stateDir: string): Promise<void> {
 }
 
 export interface EnqueueInput {
+  projectId?: string;
   appName: string;
   kind: ControlActionKind;
   target: ControlActionTarget;
   text?: string;
   keyCode?: number;
+  scrollDelta?: number;
   reason: string;
   ttlMs?: number;
   resolved?: ResolvedTargetPreview;
@@ -230,11 +234,13 @@ export async function enqueue(stateDir: string, input: EnqueueInput): Promise<Co
   const now = Date.now();
   const record: ControlActionRecord = {
     actionId: `ctl_${randomUUID()}`,
+    projectId: input.projectId,
     appName: input.appName,
     kind: input.kind,
     target: input.target,
     text: input.text,
     keyCode: input.keyCode,
+    scrollDelta: input.scrollDelta,
     reason: input.reason,
     createdAt: now,
     expiresAt: now + (input.ttlMs ?? DEFAULT_TTL_MS),

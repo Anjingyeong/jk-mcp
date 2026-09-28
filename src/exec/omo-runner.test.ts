@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { redact } from "../policy/secrets.js";
 import { resolveOmoInvocation, runOmo } from "./omo-runner.js";
 
@@ -15,6 +15,8 @@ describe("omo-runner", () => {
   let previousPath: string | undefined;
 
   beforeEach(async () => {
+    vi.stubEnv("JK_OMO_BIN", undefined);
+    vi.stubEnv("JK_OMO_NODE_CLI", undefined);
     root = await mkdtemp(join(tmpdir(), "chatgpt2codex-omo-root-"));
     codexHome = await mkdtemp(join(tmpdir(), "chatgpt2codex-omo-home-"));
     previousCodexHome = process.env.CODEX_HOME;
@@ -28,6 +30,7 @@ describe("omo-runner", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
     if (previousBin === undefined) delete process.env.CHATGPT2CODEX_OMO_BIN;
@@ -87,6 +90,27 @@ describe("omo-runner", () => {
     );
     return cli;
   }
+
+  it("honors JK-only OMO node CLI over cached discovery", async () => {
+    await installFakeCli("4.19.4");
+    const selected = await installFakeNativeCli();
+    vi.stubEnv("JK_OMO_NODE_CLI", selected);
+    expect((await resolveOmoInvocation()).argsPrefix).toEqual([selected]);
+  });
+
+  it("prefers canonical OMO node CLI over both legacy overrides", async () => {
+    const selected = await installFakeNativeCli();
+    vi.stubEnv("JK_OMO_NODE_CLI", selected);
+    process.env.CHATGPT2CODEX_OMO_BIN = join(root, "missing-legacy-bin");
+    process.env.CHATGPT2CODEX_OMO_NODE_CLI = join(root, "missing-legacy-cli");
+    expect((await resolveOmoInvocation()).argsPrefix).toEqual([selected]);
+  });
+
+  it("validates JK-only OMO binary rather than silently discovering a fallback", async () => {
+    await installFakeCli("4.19.4");
+    vi.stubEnv("JK_OMO_BIN", join(root, "missing-canonical-bin"));
+    await expect(resolveOmoInvocation()).rejects.toMatchObject({ code: "COMMAND_NOT_ALLOWED" });
+  });
 
   it("prefers the newest compatible Codex OMO node CLI without invoking a shell", async () => {
     await installFakeCli("4.9.0");

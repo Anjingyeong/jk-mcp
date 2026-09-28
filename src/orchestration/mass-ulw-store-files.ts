@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { renameWithRetry } from "../util/fs-retry.js";
 import { acquireMassUlwLock } from "./mass-ulw-lock.js";
 import { DIRECTORY_MODE, FILE_MODE, LOOP_ID_PATTERN, MassUlwDocumentSchema } from "./mass-ulw-store-schema.js";
 import type { MassUlwDocument, MassUlwLoopLock, MassUlwStoreOptions } from "./mass-ulw-store-schema.js";
@@ -83,7 +84,7 @@ export class MassUlwStoreFiles {
       await handle.close();
       handle = undefined;
       await chmod(temporary, FILE_MODE);
-      await rename(temporary, target);
+      await renameWithRetry(temporary, target);
       renamed = true;
       await chmod(target, FILE_MODE);
     } finally {

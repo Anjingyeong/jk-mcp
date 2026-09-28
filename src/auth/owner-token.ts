@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual, createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
+import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
+import { renameWithRetry } from "../util/fs-retry.js";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -9,7 +10,7 @@ import { z } from "zod";
  *
  * Storage: only a SHA-256 hash of the token is ever written to disk, under
  * `<stateDir>/owner-token.json` (mode 0600). The plaintext token is shown to
- * the operator exactly once, at `chatgpt2codex init` time, and is never logged.
+ * the operator exactly once, at `jk init` time, and is never logged.
  */
 
 const DIR_MODE = 0o700;
@@ -61,9 +62,9 @@ export async function storeOwnerToken(stateDir: string, token: string): Promise<
     tokenHash: hash(token),
   };
   const target = join(stateDir, OWNER_TOKEN_FILE);
-  const tmp = join(stateDir, `.${OWNER_TOKEN_FILE}.${process.pid}.tmp`);
+  const tmp = join(stateDir, `.${OWNER_TOKEN_FILE}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
   await writeFile(tmp, JSON.stringify(doc, null, 2), { mode: FILE_MODE, encoding: "utf8" });
-  await rename(tmp, target);
+  await renameWithRetry(tmp, target);
   try {
     await chmod(target, FILE_MODE);
   } catch {

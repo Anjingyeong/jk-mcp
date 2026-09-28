@@ -13,7 +13,7 @@ function Ensure-Command([string]$Command, [string]$WingetId) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         throw "Missing $Command and winget is not available. Install $Command manually, then run JK again."
     }
-    Write-Host "[chatgpt2codex] installing $Command via winget..."
+    Write-Host "[JK] installing $Command via winget..."
     winget install --id $WingetId --silent --accept-package-agreements --accept-source-agreements
     Refresh-Path
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
