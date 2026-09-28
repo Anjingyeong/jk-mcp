@@ -1,5 +1,5 @@
 import { EventEmitter, once } from "node:events";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
@@ -34,7 +34,9 @@ describe("execution targets through MCP and owner HTTP approval", () => {
   let entry: ProjectRegistryEntry;
 
   beforeEach(async () => {
-    temp = await fs.mkdtemp(path.join(os.tmpdir(), "jk-tool-target-"));
+    // Canonical long path: on Windows os.tmpdir() may be an 8.3 short name
+    // (C:\Users\RUNNER~1), while JK reports canonical project roots.
+    temp = realpathSync.native(await fs.mkdtemp(path.join(os.tmpdir(), "jk-tool-target-")));
     root = path.join(temp, "hub-project");
     await fs.mkdir(root);
     workerRoot = path.join(temp, "worker-project");

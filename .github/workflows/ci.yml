@@ -45,6 +45,11 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          # windows-latest sets TEMP to an 8.3 short path (C:\Users\RUNNER~1\...);
+          # many fixtures compare temp paths literally. runner.temp is a long path.
+          TEMP: ${{ runner.os == 'Windows' && runner.temp || '' }}
+          TMP: ${{ runner.os == 'Windows' && runner.temp || '' }}
 
   dco:
     if: github.event_name == 'pull_request'

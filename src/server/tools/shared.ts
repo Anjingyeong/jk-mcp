@@ -31,7 +31,7 @@ import { buildActiveRoleContext, enforceActiveRoleToolAccess, type RoleTaskMode 
 import { CONTROL_TOOL_NAMES, isControlChatGptExposed, isControlChatGptExposedForContext } from "../../control/policy.js";
 import { dispatchExecutorJob, getExecutorProjectRegistry, listExecutorStatus, resolveRoutedLocalProject } from "../../executors/broker.js";
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import path from "node:path";
 import { buildTaskSafetyGate, makeDefaultTaskSafety, mergeTaskSafety, type TaskExecutionSafety, type TaskExecutionKind } from "../task-safety.js";
@@ -1072,11 +1072,31 @@ export async function resolveExecutionProject(
   throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, `Project not found: ${q.projectId ?? q.name}`);
 }
 
+/**
+ * Compare two local roots as the filesystem sees them. Windows 8.3 short
+ * names (C:\Users\RUNNER~1) and long names refer to the same folder, and
+ * drive-letter case differs between sources; canonicalize before comparing.
+ */
+export function sameLocalRoot(a: string, b: string): boolean {
+  const canonical = (value: string): string => {
+    const resolved = path.resolve(value);
+    try {
+      return realpathSync.native(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  if (path.resolve(a) === path.resolve(b)) return true;
+  const left = canonical(a);
+  const right = canonical(b);
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
 export function assertSelectedExecutionTarget(entry: ProjectRegistryEntry, lease: Lease): void {
   const saved = lease.leaseId.match(/:target:([a-f0-9]{64})$/u)?.[1];
   const actual = ExecutionTargetSchema.parse(entry.executionTarget);
   const matches = saved ? `target:${saved}` === targetApprovalIdentity(actual)
-    : actual.kind === "local" && path.resolve(lease.projectRoot) === actual.projectRoot;
+    : actual.kind === "local" && sameLocalRoot(lease.projectRoot, actual.projectRoot);
   if (!matches) throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED,
     "Selected execution target changed; select the intended project again before executing", { expected: saved ?? lease.projectRoot, actual });
 }
