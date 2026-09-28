@@ -228,7 +228,10 @@ private final class ServiceController {
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        defaultWorkspace = environmentValue("JK_WORKSPACE", legacy: "CHATGPT2CODEX_WORKSPACE") ?? "\(home)/workspace"
+        // Read ProcessInfo directly: instance methods cannot run before every
+        // stored property is initialized (Swift compile error otherwise).
+        let env = ProcessInfo.processInfo.environment
+        defaultWorkspace = env["JK_WORKSPACE"] ?? env["CHATGPT2CODEX_WORKSPACE"] ?? "\(home)/workspace"
 
         if let resourceRoot = Bundle.main.resourceURL?.appendingPathComponent("jk"),
            FileManager.default.fileExists(atPath: resourceRoot.appendingPathComponent("start-jk.sh").path) {
