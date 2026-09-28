@@ -50,6 +50,9 @@ describe("tool catalog", () => {
         aliases: ["rules-test"],
       };
       const ctx = makeCtx();
+      // A real directory: "/tmp" does not exist on every Windows drive (D:\tmp on CI).
+      ctx.workspaceRoot = path.dirname(root);
+      ctx.config.workspaceRoot = ctx.workspaceRoot;
       ctx.registry = [entry];
       ctx.store.loadProjects = async () => [entry];
       const server = await createServer(ctx);
