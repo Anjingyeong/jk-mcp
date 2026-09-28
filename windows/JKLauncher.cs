@@ -19,9 +19,13 @@ internal static class JKLauncher
     private static void Main(string[] args)
     {
         bool createdNew;
+        // --ui-preview renders the window for design QA with an isolated
+        // single-instance name so it never talks to (or replaces) a live JK.
+        var preview = Array.Exists(args, value => string.Equals(value, "--ui-preview", StringComparison.OrdinalIgnoreCase));
+        var previewSuffix = preview ? ".UiPreview" : string.Empty;
         // Keep the established mutex so existing and renamed launchers share one instance.
-        using (var activationEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ActivationEventName))
-        using (var singleInstance = new System.Threading.Mutex(true, SingleInstanceMutexName, out createdNew))
+        using (var activationEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ActivationEventName + previewSuffix))
+        using (var singleInstance = new System.Threading.Mutex(true, SingleInstanceMutexName + previewSuffix, out createdNew))
         {
             if (!createdNew)
             {
@@ -322,6 +326,14 @@ internal sealed class LauncherForm : Form
         {"cancel", new[] {"Cancel", "취소", "キャンセル", "取消", "取消", "Cancelar", "Annuler", "Abbrechen", "Cancelar", "Annulla", "Annuleren", "Anuluj", "Отмена", "İptal", "Hủy", "Batal", "ยกเลิก", "إلغاء", "रद्द करें", "Скасувати"}},
         {"connectorUrlLabel", new[] {"connector URL", "커넥터 URL"}},
         {"ownerTokenLabel", new[] {"owner token", "소유자 토큰"}},
+        {"launcherTitle", new[] {"Launcher", "런처"}},
+        {"connectorCaption", new[] {"ChatGPT connector URL", "ChatGPT 커넥터 URL"}},
+        {"ownerTokenCaption", new[] {"Owner token", "소유자 토큰"}},
+        {"connectorHintDefault", new[] {"Paste this into ChatGPT › Apps & Connectors, then log in with the owner token.", "ChatGPT › Apps & Connectors에 붙여넣고, 로그인 창에 소유자 토큰을 입력하세요."}},
+        {"connectorHintTemporary", new[] {"Temporary address: it changes every time JK restarts. Use your own domain for a permanent URL.", "임시 주소입니다. JK를 재시작하면 바뀝니다. 고정 주소가 필요하면 본인 도메인을 설정하세요."}},
+        {"activityCaption", new[] {"Activity", "활동 로그"}},
+        {"statusRunning", new[] {"Running", "실행 중"}},
+        {"statusStopped", new[] {"Stopped", "중지됨"}},
         {"copiedItem", new[] {"Copied {0}.", "{0} 복사 완료."}},
         {"copyFailedManual", new[] {"Copy failed. Select the {0} field manually.", "복사에 실패했습니다. {0} 입력칸을 직접 선택해 복사하세요."}},
         {"ownerTokenGenerating", new[] {"Auto-generating owner token...", "소유자 토큰 자동 생성 중..."}},
@@ -407,24 +419,36 @@ internal sealed class LauncherForm : Form
     private JkMassUlw renderedRunMass;
     private string consoleProjectId;
     private JkRoleContext cachedRoleContext;
-    private static readonly System.Drawing.Color JkSidebar = System.Drawing.Color.FromArgb(15, 18, 25);
-    private static readonly System.Drawing.Color JkSidebarHover = System.Drawing.Color.FromArgb(27, 33, 44);
-    private static readonly System.Drawing.Color JkCanvas = System.Drawing.Color.FromArgb(244, 247, 251);
+    private static readonly System.Drawing.Color JkSidebar = System.Drawing.Color.FromArgb(17, 19, 24);
+    private static readonly System.Drawing.Color JkSidebarHover = System.Drawing.Color.FromArgb(30, 33, 41);
+    private static readonly System.Drawing.Color JkSidebarActive = System.Drawing.Color.FromArgb(38, 42, 52);
+    private static readonly System.Drawing.Color JkCanvas = System.Drawing.Color.FromArgb(245, 246, 248);
     private static readonly System.Drawing.Color JkSurface = System.Drawing.Color.White;
-    private static readonly System.Drawing.Color JkSurfaceAlt = System.Drawing.Color.FromArgb(248, 250, 252);
-    private static readonly System.Drawing.Color JkText = System.Drawing.Color.FromArgb(25, 32, 43);
-    private static readonly System.Drawing.Color JkMuted = System.Drawing.Color.FromArgb(101, 113, 130);
+    private static readonly System.Drawing.Color JkSurfaceAlt = System.Drawing.Color.FromArgb(243, 244, 247);
+    private static readonly System.Drawing.Color JkText = System.Drawing.Color.FromArgb(17, 24, 39);
+    private static readonly System.Drawing.Color JkMuted = System.Drawing.Color.FromArgb(107, 114, 128);
     private static readonly System.Drawing.Color JkAccent = System.Drawing.Color.FromArgb(201, 166, 107);
-    private static readonly System.Drawing.Color JkBorder = System.Drawing.Color.FromArgb(224, 229, 236);
-    private static readonly System.Drawing.Color JkConsole = System.Drawing.Color.FromArgb(12, 17, 24);
+    private static readonly System.Drawing.Color JkAccentHover = System.Drawing.Color.FromArgb(214, 182, 128);
+    private static readonly System.Drawing.Color JkAccentText = System.Drawing.Color.FromArgb(38, 29, 14);
+    private static readonly System.Drawing.Color JkBorder = System.Drawing.Color.FromArgb(228, 231, 236);
+    private static readonly System.Drawing.Color JkConsole = System.Drawing.Color.FromArgb(17, 19, 24);
+    private static readonly System.Drawing.Color JkSuccess = System.Drawing.Color.FromArgb(22, 163, 74);
+    private static readonly System.Drawing.Color JkWarning = System.Drawing.Color.FromArgb(180, 110, 20);
+    private bool uiPreview;
+    private Label statusPill;
+    private Label connectorHint;
+    private readonly List<Button> navButtons = new List<Button>();
     private bool autoGenerateOwnerTokenOnNextStart;
 
     internal LauncherForm(string[] args)
     {
         this.args = args;
         disableTunnelForLaunch = Array.Exists(args, value => IsOption(value, "-NoTunnel"));
+        uiPreview = Array.Exists(args, value => string.Equals(value, "--ui-preview", StringComparison.OrdinalIgnoreCase));
         root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "JK");
+        appDataDir = uiPreview
+            ? Path.Combine(Path.GetTempPath(), "JK-ui-preview")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "JK");
         logDir = Path.Combine(appDataDir, "logs");
         selectedProjectFile = Path.Combine(appDataDir, "selected-project.txt");
         settingsFile = Path.Combine(appDataDir, "settings.ini");
@@ -436,7 +460,7 @@ internal sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(githubRepoUrl)) githubRepoUrl = "https://github.com/Anjingyeong/jk-mcp";
         LoadSettings();
         if (string.IsNullOrEmpty(selectedProjectPath)) selectedProjectPath = LoadSelectedProjectPath();
-        if (MigrateLegacyExecutorStartupIntent())
+        if (!uiPreview && MigrateLegacyExecutorStartupIntent())
         {
             launchAtStartup = true;
             startMcpOnOpen = true;
@@ -447,156 +471,232 @@ internal sealed class LauncherForm : Form
         logFile = Path.Combine(logDir, "launcher-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
 
         Text = "JK";
-        Width = 1180;
-        Height = 760;
-        MinimumSize = new System.Drawing.Size(980, 640);
+        Width = 1200;
+        Height = 800;
+        MinimumSize = new System.Drawing.Size(1020, 700);
         StartPosition = FormStartPosition.CenterScreen;
         SetWindowIcon(this);
         BackColor = JkCanvas;
-        Font = new System.Drawing.Font("Segoe UI", 9.25f, System.Drawing.FontStyle.Regular);
+        Font = UiFont(9.5f);
+        DoubleBuffered = true;
 
         statusLabel = new Label();
         statusLabel.Text = "JK: " + L("statusChecking");
-        statusLabel.Dock = DockStyle.Top;
-        statusLabel.Height = 48;
-        statusLabel.Padding = new Padding(20, 14, 20, 0);
-        statusLabel.BackColor = JkSurface;
-        statusLabel.ForeColor = JkText;
-        statusLabel.Font = new System.Drawing.Font("Segoe UI", 10, System.Drawing.FontStyle.Bold);
+        statusLabel.Dock = DockStyle.Fill;
+        statusLabel.AutoEllipsis = true;
+        statusLabel.BackColor = JkCanvas;
+        statusLabel.ForeColor = JkMuted;
+        statusLabel.Font = UiFont(9.75f);
+        statusLabel.Padding = new Padding(1, 2, 0, 0);
 
         logBox = new TextBox();
         logBox.Dock = DockStyle.Fill;
         logBox.Multiline = true;
         logBox.ReadOnly = true;
-        logBox.ScrollBars = ScrollBars.Both;
+        logBox.ScrollBars = ScrollBars.Vertical;
         logBox.WordWrap = false;
-        logBox.Font = new System.Drawing.Font("Consolas", 10);
+        logBox.Font = MonoFont(9.5f);
         logBox.BorderStyle = BorderStyle.None;
         logBox.BackColor = JkConsole;
-        logBox.ForeColor = System.Drawing.Color.FromArgb(218, 226, 238);
-
-        var bottomPanel = new TableLayoutPanel();
-        bottomPanel.Dock = DockStyle.Bottom;
-        bottomPanel.Height = 86;
-        bottomPanel.ColumnCount = 1;
-        bottomPanel.RowCount = 2;
-        bottomPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        bottomPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        bottomPanel.BackColor = JkSurface;
-
-        var urlPanel = new FlowLayoutPanel();
-        urlPanel.Dock = DockStyle.Fill;
-        urlPanel.Padding = new Padding(8, 7, 8, 0);
-        urlPanel.FlowDirection = FlowDirection.LeftToRight;
-        urlPanel.WrapContents = false;
-        urlPanel.BackColor = JkSurface;
+        logBox.ForeColor = System.Drawing.Color.FromArgb(203, 213, 225);
+        logBox.HandleCreated += delegate { UseDarkScrollbars(logBox.Handle); };
 
         urlBox = new TextBox();
-        urlBox.Width = 390;
         urlBox.ReadOnly = true;
         urlBox.Text = "Connector URL will appear here";
+        urlBox.BorderStyle = BorderStyle.None;
         urlBox.BackColor = JkSurfaceAlt;
         urlBox.ForeColor = JkText;
+        urlBox.Font = MonoFont(10.5f);
+        urlBox.Dock = DockStyle.Fill;
+        urlBox.TextChanged += delegate { UpdateConnectorHint(); };
 
         copyButton = new Button();
         copyButton.Text = L("copyConnector");
-        copyButton.Width = 130;
         copyButton.Enabled = false;
         copyButton.Click += delegate { CopyMcpUrl(); };
-        StyleActionButton(copyButton, false);
+        StyleActionButton(copyButton, true);
 
         var openDashboardButton = new Button();
         openDashboardButton.Text = "Control Center";
-        openDashboardButton.Width = 130;
         openDashboardButton.Click += delegate { OpenUrl(ControlCenterUrl()); };
         StyleActionButton(openDashboardButton, true);
 
-        var tokenPanel = new FlowLayoutPanel();
-        tokenPanel.Dock = DockStyle.Fill;
-        tokenPanel.Padding = new Padding(8, 1, 8, 7);
-        tokenPanel.FlowDirection = FlowDirection.LeftToRight;
-        tokenPanel.WrapContents = false;
-        tokenPanel.BackColor = JkSurface;
-
         ownerTokenBox = new TextBox();
-        ownerTokenBox.Width = 520;
         ownerTokenBox.ReadOnly = true;
         ownerTokenBox.Text = "Owner token will be auto-generated and copied on first setup";
+        ownerTokenBox.BorderStyle = BorderStyle.None;
         ownerTokenBox.BackColor = JkSurfaceAlt;
         ownerTokenBox.ForeColor = JkText;
+        ownerTokenBox.Font = UiFont(9.75f);
+        ownerTokenBox.Dock = DockStyle.Fill;
 
         copyOwnerTokenButton = new Button();
         copyOwnerTokenButton.Text = L("copyOwnerToken");
-        copyOwnerTokenButton.Width = 130;
         copyOwnerTokenButton.Enabled = false;
         copyOwnerTokenButton.Click += delegate { CopyOwnerToken(); };
         StyleActionButton(copyOwnerTokenButton, false);
 
         autoGenerateOwnerTokenButton = new Button();
         autoGenerateOwnerTokenButton.Text = L("autoGenerateToken");
-        autoGenerateOwnerTokenButton.Width = 150;
         autoGenerateOwnerTokenButton.Click += delegate { AutoGenerateOwnerToken(); };
         StyleActionButton(autoGenerateOwnerTokenButton, false);
 
         openLogButton = new Button();
         openLogButton.Text = L("showLogs");
-        openLogButton.Width = 80;
         openLogButton.Click += delegate { ShowLogs(); };
         StyleActionButton(openLogButton, false);
 
         stopButton = new Button();
         stopButton.Text = L("stopMCP");
-        stopButton.Width = 90;
         stopButton.Click += delegate { ToggleServer(); };
         StyleActionButton(stopButton, false);
 
-        urlPanel.Controls.Add(urlBox);
-        urlPanel.Controls.Add(copyButton);
-        urlPanel.Controls.Add(openDashboardButton);
-        urlPanel.Controls.Add(openLogButton);
-        urlPanel.Controls.Add(stopButton);
+        foreach (var action in new[] { copyButton, openDashboardButton, copyOwnerTokenButton, autoGenerateOwnerTokenButton, openLogButton, stopButton })
+        {
+            action.Height = 38;
+            action.Width = Math.Max(118, TextRenderer.MeasureText(action.Text, action.Font).Width + 40);
+            action.Margin = new Padding(10, 0, 0, 0);
+        }
+        openDashboardButton.Margin = new Padding(0, 0, 0, 0);
 
-        tokenPanel.Controls.Add(ownerTokenBox);
-        tokenPanel.Controls.Add(copyOwnerTokenButton);
-        tokenPanel.Controls.Add(autoGenerateOwnerTokenButton);
+        // Header: page title + live status text, status pill on the right.
+        var header = new TableLayoutPanel();
+        header.Dock = DockStyle.Fill;
+        header.ColumnCount = 2;
+        header.RowCount = 2;
+        header.BackColor = JkCanvas;
+        header.Margin = new Padding(0, 0, 0, 10);
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        header.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        header.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var pageTitle = new Label();
+        pageTitle.Text = L("launcherTitle");
+        pageTitle.Dock = DockStyle.Fill;
+        pageTitle.Font = UiSemibold(17f);
+        pageTitle.ForeColor = JkText;
+        pageTitle.BackColor = JkCanvas;
+        statusPill = new JkPill();
+        statusPill.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        statusPill.Size = new System.Drawing.Size(128, 30);
+        statusPill.Margin = new Padding(0, 4, 0, 0);
+        statusPill.Font = UiSemibold(9f);
+        statusPill.BackColor = JkCanvas;
+        header.Controls.Add(pageTitle, 0, 0);
+        header.Controls.Add(statusLabel, 0, 1);
+        header.Controls.Add(statusPill, 1, 0);
+        header.SetRowSpan(statusPill, 2);
 
-        bottomPanel.Controls.Add(urlPanel, 0, 0);
-        bottomPanel.Controls.Add(tokenPanel, 0, 1);
+        // Connection card: the two things every user needs to copy into ChatGPT.
+        var connectionCard = NewCard(JkSurface);
+        var connection = new TableLayoutPanel();
+        connection.Dock = DockStyle.Fill;
+        connection.BackColor = JkSurface;
+        connection.ColumnCount = 3;
+        connection.RowCount = 5;
+        connection.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        connection.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        connection.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        connection.Controls.Add(NewCaption(L("connectorCaption"), JkSurface), 0, 0);
+        connection.SetColumnSpan(connection.GetControlFromPosition(0, 0), 3);
+        connection.Controls.Add(NewField(urlBox), 0, 1);
+        connection.Controls.Add(copyButton, 1, 1);
+        connection.SetColumnSpan(copyButton, 2);
+        connectorHint = new Label();
+        connectorHint.Dock = DockStyle.Fill;
+        connectorHint.BackColor = JkSurface;
+        connectorHint.ForeColor = JkMuted;
+        connectorHint.Font = UiFont(9f);
+        connectorHint.Padding = new Padding(1, 6, 0, 0);
+        connectorHint.AutoEllipsis = true;
+        connection.Controls.Add(connectorHint, 0, 2);
+        connection.SetColumnSpan(connectorHint, 3);
+        connection.Controls.Add(NewCaption(L("ownerTokenCaption"), JkSurface), 0, 3);
+        connection.SetColumnSpan(connection.GetControlFromPosition(0, 3), 3);
+        connection.Controls.Add(NewField(ownerTokenBox), 0, 4);
+        connection.Controls.Add(copyOwnerTokenButton, 1, 4);
+        connection.Controls.Add(autoGenerateOwnerTokenButton, 2, 4);
+        connectionCard.Controls.Add(connection);
+        UpdateConnectorHint();
 
+        // Summary: four compact stat cards.
         var summaryPanel = new TableLayoutPanel();
-        summaryPanel.Dock = DockStyle.Top;
-        summaryPanel.Height = 100;
+        summaryPanel.Dock = DockStyle.Fill;
         summaryPanel.ColumnCount = 4;
-        summaryPanel.RowCount = 2;
-        summaryPanel.Padding = new Padding(18, 10, 18, 8);
-        summaryPanel.BackColor = JkSurfaceAlt;
-        summaryPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
-        summaryPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
-        summaryPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
-        summaryPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
-        summaryPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
-        summaryPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
-
-        summaryPanel.Controls.Add(NewSummaryTitle("PROJECT"), 0, 0);
-        summaryPanel.Controls.Add(NewSummaryTitle("ROLE"), 1, 0);
-        summaryPanel.Controls.Add(NewSummaryTitle("MODE"), 2, 0);
-        summaryPanel.Controls.Add(NewSummaryTitle("SKILLS"), 3, 0);
+        summaryPanel.RowCount = 1;
+        summaryPanel.BackColor = JkCanvas;
+        summaryPanel.Margin = new Padding(0, 0, 0, 14);
+        for (var column = 0; column < 4; column++) summaryPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        summaryPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         dashboardProjectValue = NewSummaryValue("—");
         dashboardRoleValue = NewSummaryValue("Default");
         dashboardModeValue = NewSummaryValue("—");
         dashboardSkillsValue = NewSummaryValue("—");
-        summaryPanel.Controls.Add(dashboardProjectValue, 0, 1);
-        summaryPanel.Controls.Add(dashboardRoleValue, 1, 1);
-        summaryPanel.Controls.Add(dashboardModeValue, 2, 1);
-        summaryPanel.Controls.Add(dashboardSkillsValue, 3, 1);
+        var summaryTitles = new[] { "PROJECT", "ROLE", "MODE", "SKILLS" };
+        var summaryValues = new[] { dashboardProjectValue, dashboardRoleValue, dashboardModeValue, dashboardSkillsValue };
+        for (var column = 0; column < 4; column++)
+        {
+            var stat = NewCard(JkSurface);
+            stat.Margin = new Padding(column == 0 ? 0 : 7, 0, column == 3 ? 0 : 7, 0);
+            stat.Padding = new Padding(16, 12, 16, 10);
+            var statTitle = NewSummaryTitle(summaryTitles[column]);
+            statTitle.Dock = DockStyle.Top;
+            statTitle.Height = 20;
+            stat.Controls.Add(summaryValues[column]);
+            stat.Controls.Add(statTitle);
+            summaryPanel.Controls.Add(stat, column, 0);
+        }
+
+        // Primary actions.
+        var actions = new FlowLayoutPanel();
+        actions.Dock = DockStyle.Fill;
+        actions.FlowDirection = FlowDirection.LeftToRight;
+        actions.WrapContents = false;
+        actions.BackColor = JkCanvas;
+        actions.Margin = new Padding(0, 0, 0, 14);
+        actions.Controls.Add(openDashboardButton);
+        actions.Controls.Add(stopButton);
+        actions.Controls.Add(openLogButton);
+
+        // Activity log in a dark rounded card.
+        var logCard = NewCard(JkConsole);
+        logCard.BorderColor = JkConsole;
+        logCard.Padding = new Padding(18, 12, 10, 12);
+        logCard.Margin = new Padding(0);
+        var logCaption = NewCaption(L("activityCaption"), JkConsole);
+        logCaption.ForeColor = System.Drawing.Color.FromArgb(148, 163, 184);
+        logCaption.Dock = DockStyle.Top;
+        logCaption.Height = 26;
+        logCard.Controls.Add(logBox);
+        logCard.Controls.Add(logCaption);
+
+        var layout = new TableLayoutPanel();
+        layout.Dock = DockStyle.Fill;
+        layout.ColumnCount = 1;
+        layout.RowCount = 5;
+        layout.Padding = new Padding(28, 20, 28, 24);
+        layout.BackColor = JkCanvas;
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 74));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 218));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(header, 0, 0);
+        layout.Controls.Add(connectionCard, 0, 1);
+        layout.Controls.Add(summaryPanel, 0, 2);
+        layout.Controls.Add(actions, 0, 3);
+        layout.Controls.Add(logCard, 0, 4);
 
         dashboardPanel = new Panel();
         dashboardPanel.Dock = DockStyle.Fill;
         dashboardPanel.BackColor = JkCanvas;
-        dashboardPanel.Controls.Add(logBox);
-        dashboardPanel.Controls.Add(bottomPanel);
-        dashboardPanel.Controls.Add(summaryPanel);
-        dashboardPanel.Controls.Add(statusLabel);
+        dashboardPanel.Controls.Add(layout);
         runsPanel = BuildRunsPanel();
 
         contentHost = new Panel();
@@ -606,11 +706,11 @@ internal sealed class LauncherForm : Form
 
         var sidebar = new Panel();
         sidebar.Dock = DockStyle.Left;
-        sidebar.Width = 210;
+        sidebar.Width = 220;
         sidebar.BackColor = JkSidebar;
 
         var brandLogo = new PictureBox();
-        brandLogo.SetBounds(20, 18, 42, 42);
+        brandLogo.SetBounds(22, 22, 36, 36);
         brandLogo.SizeMode = PictureBoxSizeMode.Zoom;
         brandLogo.BackColor = JkSidebar;
         try
@@ -625,23 +725,25 @@ internal sealed class LauncherForm : Form
 
         var brand = new Label();
         brand.Text = "JK";
-        brand.Font = new System.Drawing.Font("Segoe UI", 18, System.Drawing.FontStyle.Bold);
+        brand.Font = UiSemibold(15f);
         brand.ForeColor = System.Drawing.Color.White;
-        brand.SetBounds(74, 17, 112, 28);
+        brand.BackColor = JkSidebar;
+        brand.SetBounds(68, 18, 120, 26);
         sidebar.Controls.Add(brand);
 
         var brandSubtitle = new Label();
         brandSubtitle.Text = "Runtime Console";
-        brandSubtitle.Font = new System.Drawing.Font("Segoe UI", 8.5f, System.Drawing.FontStyle.Regular);
-        brandSubtitle.ForeColor = System.Drawing.Color.FromArgb(151, 162, 179);
-        brandSubtitle.SetBounds(75, 43, 118, 20);
+        brandSubtitle.Font = UiFont(8.5f);
+        brandSubtitle.ForeColor = System.Drawing.Color.FromArgb(139, 148, 163);
+        brandSubtitle.BackColor = JkSidebar;
+        brandSubtitle.SetBounds(69, 42, 130, 18);
         sidebar.Controls.Add(brandSubtitle);
 
         var dashboardNav = NewNavigationButton("Launcher", 82);
-        dashboardNav.Click += delegate { ShowDashboardPage(); };
+        dashboardNav.Click += delegate { SetActiveNav(dashboardNav); ShowDashboardPage(); };
         sidebar.Controls.Add(dashboardNav);
         var runsNav = NewNavigationButton("Runs", 126);
-        runsNav.Click += delegate { ShowRunsPage(); };
+        runsNav.Click += delegate { SetActiveNav(runsNav); ShowRunsPage(); };
         sidebar.Controls.Add(runsNav);
         var approvalsNav = NewNavigationButton("Approvals", 170);
         approvalsNav.Click += delegate { OpenUrl(ApprovalsPageUrl()); };
@@ -655,6 +757,20 @@ internal sealed class LauncherForm : Form
         var settingsNav = NewNavigationButton("Settings", 302);
         settingsNav.Click += delegate { ShowSettings(); };
         sidebar.Controls.Add(settingsNav);
+        SetNavGlyph(dashboardNav, "\uE80F");
+        SetNavGlyph(runsNav, "\uE768");
+        SetNavGlyph(approvalsNav, "\uE73E");
+        SetNavGlyph(controlCenterNav, "\uE8A7");
+        SetNavGlyph(updatesNav, "\uE896");
+        SetNavGlyph(settingsNav, "\uE713");
+        navButtons.AddRange(new Button[] { dashboardNav, runsNav, approvalsNav, controlCenterNav, updatesNav, settingsNav });
+        SetActiveNav(dashboardNav);
+
+        var sidebarDivider = new Panel();
+        sidebarDivider.Dock = DockStyle.Right;
+        sidebarDivider.Width = 1;
+        sidebarDivider.BackColor = System.Drawing.Color.FromArgb(34, 37, 45);
+        sidebar.Controls.Add(sidebarDivider);
 
         Controls.Add(contentHost);
         Controls.Add(sidebar);
@@ -690,6 +806,16 @@ internal sealed class LauncherForm : Form
 
         Shown += delegate
         {
+            if (uiPreview)
+            {
+                ShowUiPreviewState();
+                if (Array.Exists(args, value => string.Equals(value, "--ui-preview-runs", StringComparison.OrdinalIgnoreCase)))
+                {
+                    SetActiveNav(navButtons[1]);
+                    ShowConsolePage(runsPanel);
+                }
+                return;
+            }
             if (startMcpOnOpen || args.Length > 0)
             {
                 StartLauncher();
@@ -1479,14 +1605,273 @@ internal sealed class LauncherForm : Form
 
     private static void StyleActionButton(Button button, bool primary)
     {
+        // Custom-painted rounded button. The stock flat button is only used
+        // for input handling; Paint draws the whole surface.
         button.FlatStyle = FlatStyle.Flat;
-        button.FlatAppearance.BorderSize = 1;
-        button.FlatAppearance.BorderColor = primary ? JkAccent : JkBorder;
-        button.FlatAppearance.MouseOverBackColor = primary ? System.Drawing.Color.FromArgb(221, 190, 135) : System.Drawing.Color.FromArgb(240, 244, 249);
+        button.FlatAppearance.BorderSize = 0;
+        button.FlatAppearance.MouseOverBackColor = primary ? JkAccentHover : JkSurfaceAlt;
+        button.FlatAppearance.MouseDownBackColor = primary ? JkAccentHover : JkSurfaceAlt;
         button.BackColor = primary ? JkAccent : JkSurface;
-        button.ForeColor = primary ? System.Drawing.Color.FromArgb(31, 25, 16) : JkText;
-        button.Font = new System.Drawing.Font("Segoe UI", 9, System.Drawing.FontStyle.Bold);
+        button.ForeColor = primary ? JkAccentText : JkText;
+        button.Font = UiSemibold(9f);
         button.Cursor = Cursors.Hand;
+        var hover = false;
+        var down = false;
+        button.MouseEnter += delegate { hover = true; button.Invalidate(); };
+        button.MouseLeave += delegate { hover = false; down = false; button.Invalidate(); };
+        button.MouseDown += delegate { down = true; button.Invalidate(); };
+        button.MouseUp += delegate { down = false; button.Invalidate(); };
+        button.EnabledChanged += delegate { button.Invalidate(); };
+        button.TextChanged += delegate { button.Invalidate(); };
+        button.Paint += delegate(object sender, PaintEventArgs e) { PaintActionButton(button, e.Graphics, primary, hover, down); };
+    }
+
+    private static void PaintActionButton(Button button, System.Drawing.Graphics g, bool primary, bool hover, bool down)
+    {
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.Clear(EffectiveBackColor(button.Parent));
+        System.Drawing.Color fill;
+        System.Drawing.Color border;
+        System.Drawing.Color text;
+        if (!button.Enabled)
+        {
+            fill = primary ? System.Drawing.Color.FromArgb(232, 222, 204) : JkSurfaceAlt;
+            border = primary ? fill : JkBorder;
+            text = primary ? System.Drawing.Color.FromArgb(146, 128, 98) : System.Drawing.Color.FromArgb(160, 166, 176);
+        }
+        else if (primary)
+        {
+            fill = down ? System.Drawing.Color.FromArgb(186, 150, 92) : hover ? JkAccentHover : JkAccent;
+            border = fill;
+            text = JkAccentText;
+        }
+        else
+        {
+            fill = down ? System.Drawing.Color.FromArgb(233, 236, 241) : hover ? JkSurfaceAlt : JkSurface;
+            border = hover ? System.Drawing.Color.FromArgb(206, 211, 219) : JkBorder;
+            text = JkText;
+        }
+        var rect = new System.Drawing.Rectangle(0, 0, button.Width - 1, button.Height - 1);
+        using (var path = RoundedRect(rect, 8))
+        using (var brush = new System.Drawing.SolidBrush(fill))
+        using (var pen = new System.Drawing.Pen(border))
+        {
+            g.FillPath(brush, path);
+            g.DrawPath(pen, path);
+        }
+        TextRenderer.DrawText(g, button.Text, button.Font, button.ClientRectangle, text,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    }
+
+    private static System.Drawing.Color EffectiveBackColor(Control control)
+    {
+        while (control != null)
+        {
+            if (control.BackColor.A == 255) return control.BackColor;
+            control = control.Parent;
+        }
+        return JkCanvas;
+    }
+
+    internal static System.Drawing.Drawing2D.GraphicsPath RoundedRect(System.Drawing.Rectangle rect, int radius)
+    {
+        var path = new System.Drawing.Drawing2D.GraphicsPath();
+        var d = Math.Max(1, Math.Min(radius * 2, Math.Min(rect.Width, rect.Height)));
+        path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+        path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+        path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+        path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
+    private static readonly string UiFamily = PickFont("Segoe UI");
+    private static readonly string MonoFamily = PickFont("Cascadia Mono", "Consolas");
+    private static readonly string IconFamily = PickFont("Segoe Fluent Icons", "Segoe MDL2 Assets", "");
+
+    private static string PickFont(params string[] candidates)
+    {
+        try
+        {
+            using (var installed = new System.Drawing.Text.InstalledFontCollection())
+            {
+                var names = new HashSet<string>(installed.Families.Select(family => family.Name), StringComparer.OrdinalIgnoreCase);
+                foreach (var candidate in candidates)
+                {
+                    if (string.IsNullOrEmpty(candidate) || names.Contains(candidate)) return candidate;
+                }
+            }
+        }
+        catch
+        {
+            // Font enumeration is best-effort; fall back to the last candidate.
+        }
+        return candidates[candidates.Length - 1];
+    }
+
+    private static System.Drawing.Font UiFont(float size)
+    {
+        return new System.Drawing.Font(UiFamily, size, System.Drawing.FontStyle.Regular);
+    }
+
+    private static System.Drawing.Font UiSemibold(float size)
+    {
+        try { return new System.Drawing.Font("Segoe UI Semibold", size, System.Drawing.FontStyle.Regular); }
+        catch { return new System.Drawing.Font(UiFamily, size, System.Drawing.FontStyle.Bold); }
+    }
+
+    private static System.Drawing.Font MonoFont(float size)
+    {
+        return new System.Drawing.Font(MonoFamily, size, System.Drawing.FontStyle.Regular);
+    }
+
+    private static JkCard NewCard(System.Drawing.Color fill)
+    {
+        var card = new JkCard();
+        card.FillColor = fill;
+        card.Dock = DockStyle.Fill;
+        card.Padding = new Padding(20, 16, 20, 14);
+        card.Margin = new Padding(0, 0, 0, 14);
+        return card;
+    }
+
+    private static Label NewCaption(string text, System.Drawing.Color background)
+    {
+        var label = new Label();
+        label.Text = text.ToUpperInvariant();
+        label.Dock = DockStyle.Fill;
+        label.BackColor = background;
+        label.ForeColor = JkMuted;
+        label.Font = UiSemibold(8.25f);
+        label.Padding = new Padding(1, 4, 0, 0);
+        return label;
+    }
+
+    /// <summary>Wraps a borderless TextBox in a rounded, filled input field.</summary>
+    private static JkCard NewField(TextBox box)
+    {
+        var field = new JkCard();
+        field.FillColor = JkSurfaceAlt;
+        field.BorderColor = JkBorder;
+        field.Radius = 8;
+        field.Dock = DockStyle.Fill;
+        field.Margin = new Padding(0, 1, 0, 1);
+        field.Padding = new Padding(12, 10, 12, 4);
+        field.Controls.Add(box);
+        field.Click += delegate { box.Focus(); box.SelectAll(); };
+        return field;
+    }
+
+    /// <summary>Static sample state for --ui-preview (design QA screenshots). Starts nothing.</summary>
+    private void ShowUiPreviewState()
+    {
+        statusLabel.Text = "MCP endpoint available; waiting for ChatGPT connection";
+        UpdateStatusPill(true);
+        urlBox.Text = "https://sample-quiet-river.trycloudflare.com/mcp";
+        copyButton.Enabled = true;
+        ownerTokenBox.Text = L("ownerTokenConfigured");
+        copyOwnerTokenButton.Enabled = false;
+        stopButton.Text = L("stopMCP");
+        dashboardProjectValue.Text = "my-app";
+        dashboardRoleValue.Text = "Default";
+        dashboardModeValue.Text = "Full write";
+        dashboardSkillsValue.Text = "—";
+        logBox.Text = string.Join("\r\n", new[]
+        {
+            "[JK] runtime mode: portable",
+            "[JK] workspace: C:\\Users\\me\\workspace",
+            "[JK] 1/3 starting public tunnel...",
+            "[JK] 2/3 starting local HTTP/OAuth MCP server...",
+            "jk serve --http: listening on http://127.0.0.1:7979/mcp",
+            "[JK] connector URL: https://sample-quiet-river.trycloudflare.com/mcp",
+            "[JK] 3/3 public health OK"
+        });
+    }
+
+    private void UpdateConnectorHint()
+    {
+        if (connectorHint == null) return;
+        var url = urlBox == null ? string.Empty : (urlBox.Text ?? string.Empty);
+        if (url.IndexOf("trycloudflare.com", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            connectorHint.Text = "\u26A0  " + L("connectorHintTemporary");
+            connectorHint.ForeColor = JkWarning;
+        }
+        else
+        {
+            connectorHint.Text = L("connectorHintDefault");
+            connectorHint.ForeColor = JkMuted;
+        }
+    }
+
+    private void UpdateStatusPill(bool running)
+    {
+        if (statusPill == null) return;
+        var pill = (JkPill)statusPill;
+        pill.Active = running;
+        pill.Text = running ? L("statusRunning") : L("statusStopped");
+    }
+
+    private void SetActiveNav(Button active)
+    {
+        foreach (var button in navButtons)
+        {
+            var nav = button as JkNavButton;
+            if (nav != null) nav.Active = object.ReferenceEquals(button, active);
+        }
+
+    }
+
+    private static void SetNavGlyph(Button button, string glyph)
+    {
+        var nav = button as JkNavButton;
+        if (nav != null && !string.IsNullOrEmpty(IconFamily)) nav.Glyph = glyph;
+    }
+
+    [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
+
+    /// <summary>Modern Explorer list/scrollbar styling for light surfaces.</summary>
+    private static void UseExplorerTheme(IntPtr handle)
+    {
+        try { SetWindowTheme(handle, "Explorer", null); }
+        catch { /* keep the default theme */ }
+    }
+
+    /// <summary>Dark native scrollbars for controls on dark surfaces (Windows 10 1809+).</summary>
+    private static void UseDarkScrollbars(IntPtr handle)
+    {
+        try { SetWindowTheme(handle, "DarkMode_Explorer", null); }
+        catch { /* older Windows: keep the default theme */ }
+    }
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+    /// <summary>Dark title bar + rounded corners on Windows 10/11; no-op elsewhere.</summary>
+    private static void ApplyWindowChrome(IntPtr handle)
+    {
+        try
+        {
+            var dark = 1;
+            DwmSetWindowAttribute(handle, 20, ref dark, 4);
+            var round = 2;
+            DwmSetWindowAttribute(handle, 33, ref round, 4);
+            var caption = System.Drawing.ColorTranslator.ToWin32(JkSidebar);
+            DwmSetWindowAttribute(handle, 35, ref caption, 4);
+            var captionText = System.Drawing.ColorTranslator.ToWin32(System.Drawing.Color.FromArgb(229, 231, 235));
+            DwmSetWindowAttribute(handle, 36, ref captionText, 4);
+        }
+        catch
+        {
+            // dwmapi missing or attribute unsupported: keep the default frame.
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplyWindowChrome(Handle);
     }
 
     private static Label NewSummaryTitle(string text)
@@ -1494,9 +1879,10 @@ internal sealed class LauncherForm : Form
         var label = new Label();
         label.Text = text;
         label.Dock = DockStyle.Fill;
-        label.Padding = new Padding(4, 3, 4, 0);
-        label.Font = new System.Drawing.Font("Segoe UI", 8, System.Drawing.FontStyle.Bold);
+        label.Padding = new Padding(0, 0, 0, 0);
+        label.Font = UiSemibold(8f);
         label.ForeColor = JkMuted;
+        label.BackColor = JkSurface;
         return label;
     }
 
@@ -1505,28 +1891,168 @@ internal sealed class LauncherForm : Form
         var label = new Label();
         label.Text = text;
         label.Dock = DockStyle.Fill;
-        label.Padding = new Padding(4, 2, 4, 0);
-        label.Font = new System.Drawing.Font("Segoe UI", 10, System.Drawing.FontStyle.Bold);
+        label.Padding = new Padding(0, 4, 0, 0);
+        label.Font = UiSemibold(11.5f);
         label.ForeColor = JkText;
+        label.BackColor = JkSurface;
         label.AutoEllipsis = true;
         return label;
     }
 
     private static Button NewNavigationButton(string text, int top)
     {
-        var button = new Button();
+        var button = new JkNavButton();
         button.Text = text;
-        button.SetBounds(14, top, 182, 38);
-        button.FlatStyle = FlatStyle.Flat;
-        button.FlatAppearance.BorderSize = 0;
-        button.FlatAppearance.MouseOverBackColor = JkSidebarHover;
-        button.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-        button.Padding = new Padding(14, 0, 0, 0);
+        button.SetBounds(12, top, 196, 38);
         button.BackColor = JkSidebar;
-        button.ForeColor = System.Drawing.Color.FromArgb(190, 199, 212);
-        button.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
-        button.Cursor = Cursors.Hand;
+        button.Font = UiSemibold(9.5f);
         return button;
+    }
+
+    /// <summary>Rounded panel; corners are painted with the parent's colour.</summary>
+    internal sealed class JkCard : Panel
+    {
+        private System.Drawing.Color fillColor = JkSurface;
+        public System.Drawing.Color BorderColor = JkBorder;
+        public int Radius = 12;
+
+        /// <summary>Card fill; also the BackColor children inherit.</summary>
+        public System.Drawing.Color FillColor
+        {
+            get { return fillColor; }
+            set { fillColor = value; BackColor = value; Invalidate(); }
+        }
+
+        public JkCard()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+            BackColor = fillColor;
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            e.Graphics.Clear(EffectiveBackColor(Parent));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var rect = new System.Drawing.Rectangle(0, 0, Width - 1, Height - 1);
+            using (var path = RoundedRect(rect, Radius))
+            using (var brush = new System.Drawing.SolidBrush(FillColor))
+            using (var pen = new System.Drawing.Pen(BorderColor))
+            {
+                g.FillPath(brush, path);
+                g.DrawPath(pen, path);
+            }
+        }
+
+    }
+
+    /// <summary>Status pill: green dot + text when active, grey when stopped.</summary>
+    internal sealed class JkPill : Label
+    {
+        private bool active;
+
+        public bool Active
+        {
+            get { return active; }
+            set { active = value; Invalidate(); }
+        }
+
+        public JkPill()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            AutoSize = false;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.Clear(EffectiveBackColor(Parent));
+            var fill = active ? System.Drawing.Color.FromArgb(220, 252, 231) : System.Drawing.Color.FromArgb(236, 238, 242);
+            var dot = active ? JkSuccess : System.Drawing.Color.FromArgb(156, 163, 175);
+            var ink = active ? System.Drawing.Color.FromArgb(21, 128, 61) : JkMuted;
+            var textWidth = TextRenderer.MeasureText(Text ?? string.Empty, Font).Width;
+            var width = Math.Min(Width - 1, textWidth + 38);
+            var rect = new System.Drawing.Rectangle(Width - 1 - width, 0, width, Height - 1);
+            using (var path = RoundedRect(rect, rect.Height / 2))
+            using (var brush = new System.Drawing.SolidBrush(fill))
+            {
+                g.FillPath(brush, path);
+            }
+            using (var brush = new System.Drawing.SolidBrush(dot))
+            {
+                g.FillEllipse(brush, rect.X + 13, rect.Y + rect.Height / 2 - 4, 8, 8);
+            }
+            var textRect = new System.Drawing.Rectangle(rect.X + 27, rect.Y, rect.Width - 30, rect.Height);
+            TextRenderer.DrawText(g, Text, Font, textRect, ink, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine);
+        }
+    }
+
+    /// <summary>Sidebar item with icon glyph, hover fill, and an accent bar when active.</summary>
+    internal sealed class JkNavButton : Button
+    {
+        private bool active;
+        private bool hover;
+        public string Glyph;
+
+        public bool Active
+        {
+            get { return active; }
+            set { active = value; Invalidate(); }
+        }
+
+        public JkNavButton()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            Cursor = Cursors.Hand;
+            TabStop = true;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = false; Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.Clear(EffectiveBackColor(Parent));
+            if (active || hover)
+            {
+                using (var path = RoundedRect(new System.Drawing.Rectangle(0, 0, Width - 1, Height - 1), 8))
+                using (var brush = new System.Drawing.SolidBrush(active ? JkSidebarActive : JkSidebarHover))
+                {
+                    g.FillPath(brush, path);
+                }
+            }
+            if (active)
+            {
+                using (var path = RoundedRect(new System.Drawing.Rectangle(0, 10, 3, Height - 21), 1))
+                using (var brush = new System.Drawing.SolidBrush(JkAccent))
+                {
+                    g.FillPath(brush, path);
+                }
+            }
+            var ink = active ? System.Drawing.Color.White : hover ? System.Drawing.Color.FromArgb(226, 230, 236) : System.Drawing.Color.FromArgb(160, 168, 181);
+            var textLeft = 16;
+            if (!string.IsNullOrEmpty(Glyph) && !string.IsNullOrEmpty(IconFamily))
+            {
+                using (var iconFont = new System.Drawing.Font(IconFamily, 11f, System.Drawing.FontStyle.Regular))
+                {
+                    var glyphInk = active ? JkAccent : ink;
+                    TextRenderer.DrawText(g, Glyph, iconFont, new System.Drawing.Rectangle(14, 0, 22, Height), glyphInk,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+                }
+                textLeft = 46;
+            }
+            TextRenderer.DrawText(g, Text, Font, new System.Drawing.Rectangle(textLeft, 0, Width - textLeft - 8, Height), ink,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        }
     }
 
     private System.Drawing.Bitmap BuildSidebarBrandImage()
@@ -1750,9 +2276,10 @@ internal sealed class LauncherForm : Form
         layout.ColumnCount = 1;
         layout.RowCount = 3;
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 122));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.BackColor = JkCanvas;
         panel.Controls.Add(layout);
 
         var header = new TableLayoutPanel();
@@ -1764,12 +2291,13 @@ internal sealed class LauncherForm : Form
         var headerCopy = new Panel();
         headerCopy.Dock = DockStyle.Fill;
         var title = NewLabel("Runs", 0, 0, 520);
-        title.Font = new System.Drawing.Font("Segoe UI", 22, System.Drawing.FontStyle.Bold);
+        title.Font = UiSemibold(17f);
         title.ForeColor = JkText;
-        title.Height = 34;
-        var description = NewLabel("JK가 지금 무엇을 실행하고 왜 기다리는지 앱 안에서 바로 확인합니다.", 2, 38, 620);
+        title.Height = 36;
+        var description = NewLabel("JK가 지금 무엇을 실행하고 왜 기다리는지 앱 안에서 바로 확인합니다.", 1, 38, 620);
         description.ForeColor = JkMuted;
-        description.Height = 28;
+        description.Font = UiFont(9.75f);
+        description.Height = 26;
         headerCopy.Controls.Add(title);
         headerCopy.Controls.Add(description);
         runConnectionValue = new Label();
@@ -1781,10 +2309,11 @@ internal sealed class LauncherForm : Form
         header.Controls.Add(runConnectionValue, 1, 0);
         layout.Controls.Add(header, 0, 0);
 
+        var summaryCard = NewCard(JkSurface);
         var summary = new TableLayoutPanel();
         summary.Dock = DockStyle.Fill;
         summary.BackColor = JkSurface;
-        summary.Padding = new Padding(16, 12, 16, 10);
+        summary.Padding = new Padding(0);
         summary.ColumnCount = 2;
         summary.RowCount = 3;
         summary.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
@@ -1795,7 +2324,8 @@ internal sealed class LauncherForm : Form
         runGoalValue = new Label();
         runGoalValue.Dock = DockStyle.Fill;
         runGoalValue.Text = "활성 실행 없음";
-        runGoalValue.Font = new System.Drawing.Font("Segoe UI", 12, System.Drawing.FontStyle.Bold);
+        runGoalValue.Font = UiSemibold(13f);
+        runGoalValue.ForeColor = JkText;
         runGoalValue.AutoEllipsis = true;
         runTaskValue = new Label();
         runTaskValue.Dock = DockStyle.Fill;
@@ -1806,6 +2336,7 @@ internal sealed class LauncherForm : Form
         runMetaValue.Dock = DockStyle.Fill;
         runMetaValue.Text = "IDLE";
         runMetaValue.ForeColor = JkMuted;
+        runMetaValue.Font = UiSemibold(8.5f);
         runWaitValue = new Label();
         runWaitValue.Dock = DockStyle.Fill;
         runWaitValue.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
@@ -1817,12 +2348,16 @@ internal sealed class LauncherForm : Form
         summary.SetColumnSpan(runTaskValue, 2);
         summary.Controls.Add(runMetaValue, 0, 2);
         summary.Controls.Add(runWaitValue, 1, 2);
-        layout.Controls.Add(summary, 0, 1);
+        summaryCard.Controls.Add(summary);
+        layout.Controls.Add(summaryCard, 0, 1);
 
         var split = new SplitContainer();
         split.Dock = DockStyle.Fill;
         split.Orientation = Orientation.Vertical;
-        split.BackColor = JkBorder;
+        split.BackColor = JkCanvas;
+        split.SplitterWidth = 14;
+        split.Panel1.BackColor = JkCanvas;
+        split.Panel2.BackColor = JkCanvas;
         split.SizeChanged += delegate
         {
             const int panel1Min = 280;
@@ -1835,28 +2370,29 @@ internal sealed class LauncherForm : Form
             split.SplitterDistance = Math.Max(panel1Min, Math.Min(maximum, target));
         };
 
-        var lanesPanel = new Panel();
-        lanesPanel.Dock = DockStyle.Fill;
-        lanesPanel.BackColor = JkSurface;
+        var lanesPanel = NewCard(JkSurface);
+        lanesPanel.Margin = new Padding(0);
+        lanesPanel.Padding = new Padding(18, 12, 18, 14);
         var lanesTitle = new Label();
         lanesTitle.Text = "작업 / lane DAG";
         lanesTitle.Dock = DockStyle.Top;
-        lanesTitle.Height = 34;
-        lanesTitle.Padding = new Padding(14, 9, 0, 0);
-        lanesTitle.Font = new System.Drawing.Font("Segoe UI", 10, System.Drawing.FontStyle.Bold);
-        lanesTitle.BackColor = JkSurfaceAlt;
+        lanesTitle.Height = 30;
+        lanesTitle.Padding = new Padding(0, 4, 0, 0);
+        lanesTitle.Font = UiSemibold(10.5f);
+        lanesTitle.BackColor = JkSurface;
         lanesTitle.ForeColor = JkText;
         runDagValue = new Label();
         runDagValue.Text = "병렬 작업이 시작되면 의존관계를 표시합니다.";
         runDagValue.Dock = DockStyle.Top;
         runDagValue.Height = 40;
-        runDagValue.Padding = new Padding(14, 7, 14, 4);
+        runDagValue.Padding = new Padding(0, 4, 0, 4);
+        runDagValue.BackColor = JkSurface;
         runDagValue.ForeColor = JkMuted;
         runDagValue.AutoEllipsis = true;
         runLaneFlow = new Panel();
         runLaneFlow.Dock = DockStyle.Fill;
         runLaneFlow.AutoScroll = true;
-        runLaneFlow.BackColor = JkSurfaceAlt;
+        runLaneFlow.BackColor = JkSurface;
         runLaneFlow.SizeChanged += delegate { LayoutRunDag(); };
         runLaneFlow.Scroll += delegate { runLaneFlow.Invalidate(); };
         runLaneFlow.Paint += delegate(object sender, PaintEventArgs e) { DrawRunDagEdges(e.Graphics); };
@@ -1865,16 +2401,16 @@ internal sealed class LauncherForm : Form
         lanesPanel.Controls.Add(lanesTitle);
         split.Panel1.Controls.Add(lanesPanel);
 
-        var eventsPanel = new Panel();
-        eventsPanel.Dock = DockStyle.Fill;
-        eventsPanel.BackColor = JkSurface;
+        var eventsPanel = NewCard(JkSurface);
+        eventsPanel.Margin = new Padding(0);
+        eventsPanel.Padding = new Padding(14, 12, 10, 14);
         var eventsTitle = new Label();
         eventsTitle.Text = "최근 이벤트";
         eventsTitle.Dock = DockStyle.Top;
-        eventsTitle.Height = 34;
-        eventsTitle.Padding = new Padding(14, 9, 0, 0);
-        eventsTitle.Font = new System.Drawing.Font("Segoe UI", 9, System.Drawing.FontStyle.Bold);
-        eventsTitle.BackColor = JkSurfaceAlt;
+        eventsTitle.Height = 30;
+        eventsTitle.Padding = new Padding(4, 4, 0, 0);
+        eventsTitle.Font = UiSemibold(10.5f);
+        eventsTitle.BackColor = JkSurface;
         eventsTitle.ForeColor = JkText;
         runEventList = new ListView();
         runEventList.Dock = DockStyle.Fill;
@@ -1884,6 +2420,8 @@ internal sealed class LauncherForm : Form
         runEventList.BorderStyle = BorderStyle.None;
         runEventList.BackColor = JkSurface;
         runEventList.ForeColor = JkText;
+        runEventList.Font = UiFont(9f);
+        runEventList.HandleCreated += delegate { UseExplorerTheme(runEventList.Handle); };
         runEventList.Columns.Add("Time", 68);
         runEventList.Columns.Add("Event", 120);
         runEventList.Columns.Add("Detail", 220);
@@ -2896,6 +3434,9 @@ internal sealed class LauncherForm : Form
             form.FormBorderStyle = FormBorderStyle.FixedDialog;
             form.MaximizeBox = false;
             form.MinimizeBox = false;
+            form.BackColor = JkSurface;
+            form.Font = UiFont(9.5f);
+            form.HandleCreated += delegate { ApplyWindowChrome(form.Handle); };
 
             var title = NewLabel(L("settingsTitle"), 24, 18, 500);
             title.Font = new System.Drawing.Font(title.Font.FontFamily, 14, System.Drawing.FontStyle.Bold);
@@ -3075,6 +3616,7 @@ internal sealed class LauncherForm : Form
         toggleTrayItem.Text = running ? L("stopMCP") : L("startMCP");
         stopButton.Text = running ? L("stopMCP") : L("startMCP");
         stopButton.Enabled = true;
+        UpdateStatusPill(running);
         restartTrayItem.Enabled = true;
         restartTrayItem.Text = L("restartMCP");
         var connector = DisplayConnectorUrl();

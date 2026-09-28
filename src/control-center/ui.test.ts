@@ -141,4 +141,16 @@ describe("Control Center dashboard links and mobile layout", () => {
     expect(CONTROL_CENTER_HTML).toContain(".run-event { grid-template-columns: 1fr auto; }");
     expect(CONTROL_CENTER_HTML).toContain(".run-dag-scroll { margin-inline:");
   });
+
+  it("puts the DAG on a full-width stage with wave bands, edge states, legend, and focus highlighting", () => {
+    expect(CONTROL_CENTER_HTML).toContain('class="dag-stage" data-dashboard-region="dag"');
+    expect(CONTROL_CENTER_HTML).toContain('data-edge-state="');
+    expect(CONTROL_CENTER_HTML).toContain('class="run-dag-wave" data-wave-state="');
+    expect(CONTROL_CENTER_HTML).toContain('class="run-legend"');
+    expect(CONTROL_CENTER_HTML).toContain("installMassUlwGraphFocus");
+    expect(CONTROL_CENTER_HTML).toContain('.run-dag-edge[data-edge-state="active"]');
+    // The phase rail no longer embeds the graph; it renders once, on the stage.
+    const rail = CONTROL_CENTER_HTML.slice(CONTROL_CENTER_HTML.indexOf("function workflowRailHtml()"), CONTROL_CENTER_HTML.indexOf("async function refreshExecution()"));
+    expect(rail).not.toContain("massUlwStatusHtml(e)");
+  });
 });

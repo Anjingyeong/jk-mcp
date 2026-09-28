@@ -4,7 +4,15 @@ The Control Center renders the persisted MASS ULW execution plan as a read-only 
 
 ## JK visual contract
 
-The graph belongs to the same product language as the rest of JK rather than looking like a separate diagnostics widget. The web Control Center uses a graphite shell with the warm JK accent, layered rounded surfaces, pill status treatments, and a visually elevated DAG viewport. The native Windows app uses the embedded JK executable icon as its visible brand mark, a dark branded navigation rail, and a light workspace/console hierarchy that mirrors the web product.
+The graph belongs to the same product language as the rest of JK rather than looking like a separate diagnostics widget. The web Control Center and the native Windows app share one look: a charcoal navigation rail, a light canvas, white rounded cards, and the warm JK amber accent. When a MASS ULW run exists, the DAG is the first thing on the dashboard: a full-width `.dag-stage` card above the work/attention columns.
+
+The DAG stage is built to be read at a glance:
+
+- a segmented progress bar (completed / running / problem / waiting) and a completion percentage;
+- a dotted canvas with one column band per wave (`.run-dag-wave`, `data-wave-state` = `done` | `current` | `idle`) labelled `WAVE n` with a done/total count;
+- nodes coloured by semantic state (left accent bar, tinted icon, pulsing ring while running, striped when blocked);
+- edges coloured by `data-edge-state` (see below), with an animated flow on edges that feed a running lane;
+- a legend, and hover/focus on a node dims everything except that node, its direct dependencies/dependents, and the connecting edges.
 
 These presentation choices must not change execution semantics. Keep the existing lane/status attributes, navigation hooks, accessibility labels, responsive overflow behavior, and runtime/approval boundaries intact when polishing the visuals.
 
@@ -47,8 +55,9 @@ A dependency edge uses `.run-dag-edge` inside `.run-dag-edges` and includes:
 
 - `data-edge-from`: predecessor lane ID.
 - `data-edge-to`: dependent lane ID.
+- `data-edge-state`: `done` (predecessor completed), `active` (predecessor completed and the dependent is running; animated), `blocked` (predecessor failed or blocked), or `pending`. Derived in the browser from the same snapshot; never written back.
 - an SVG cubic path from the predecessor card's right edge to the dependent card's left edge.
-- `marker-end="url(#run-dag-arrow)"` to make direction explicit.
+- `marker-end="url(#run-dag-arrow)"` to make direction explicit. The arrowhead uses `fill: context-stroke`, so it takes the edge colour.
 
 Edges are presentation-only and `aria-hidden`; dependency meaning is already encoded by node identity/status and the persisted execution model. Missing dependency positions are skipped instead of emitting malformed paths.
 
@@ -60,7 +69,9 @@ The graph lives inside `.run-dag-scroll`, a focusable horizontal/vertical overfl
 
 ## Integration contract
 
-`massUlwStatusHtml(e)` is called from the existing workflow panel after the workflow strip and wait-reason block. Keep that integration point stable so the existing dashboard polling (`refreshExecution`) updates strip, wait reason, graph, and recent events from one execution snapshot.
+`dashboard()` renders `massUlwStatusHtml(e)` inside `<section class="dag-stage" data-dashboard-region="dag">` directly under the page heading whenever the active execution has a MASS ULW document. The workflow panel keeps the phase strip, wait reason, and recent events. Dashboard polling (`refreshExecution`) re-renders the whole dashboard from one execution snapshot, so the stage and the workflow panel stay consistent.
+
+QA: `bun scripts/qa/jk-command-center-server.mjs dist mass-ulw` serves a synthetic 9-lane / 4-wave run covering every node and edge state.
 
 When changing these primitives:
 

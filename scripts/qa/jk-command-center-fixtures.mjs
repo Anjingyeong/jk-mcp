@@ -1,5 +1,5 @@
 export const EPOCH = Date.UTC(2026, 8, 6, 3, 0, 0);
-export const CASES = ['active', 'quiet-active', 'empty', 'offline-worker', 'verification-failure', 'long-ko'];
+export const CASES = ['active', 'quiet-active', 'empty', 'offline-worker', 'verification-failure', 'long-ko', 'mass-ulw'];
 export const ROUTES = ['dashboard', 'projects', 'approvals', 'logs', 'system', 'roles', 'skills', 'guide', 'goals'];
 
 // Identifiers, paths, commands and account-looking values are all synthetic.
@@ -32,6 +32,34 @@ export function fixture(name = 'active') {
     roles: { ok: true, roles, activeRoleContext: roleContext, workflowPresets: [{ id: 'qa-review', name: 'QA Review', preference: 'discover -> verify -> review' }] },
   };
   if (name === 'quiet-active') result.approvals.approvals = [];
+  if (name === 'mass-ulw') {
+    const lane = (id, task, status, wave, dependsOn, attempts = 1) => ({ id, task, status, dependsOn, attempts, wave, completedAt: status === 'completed' ? EPOCH - 60000 : null });
+    const lanes = [
+      lane('scout', 'Map the auth and session modules', 'completed', 0, []),
+      lane('schema', 'Define the settings schema and defaults', 'completed', 0, []),
+      lane('api', 'Implement settings API endpoints', 'in-flight', 1, ['scout', 'schema']),
+      lane('ui', 'Build the settings form UI', 'in-flight', 1, ['schema']),
+      lane('migrate', 'Write the data migration for old configs', 'failed', 1, ['schema'], 2),
+      lane('tests', 'Add integration tests for the API', 'planned', 2, ['api']),
+      lane('e2e', 'Run browser E2E over the settings flow', 'planned', 2, ['api', 'ui']),
+      lane('docs', 'Update the user guide', 'blocked', 2, ['migrate']),
+      lane('review', 'Final review and release notes', 'planned', 3, ['tests', 'e2e', 'docs']),
+    ];
+    const waves = [0, 1, 2, 3].map(index => {
+      const members = lanes.filter(item => item.wave === index);
+      const status = members.every(item => item.status === 'completed') ? 'completed' : members.some(item => item.status === 'in-flight') ? 'in-flight' : members.some(item => item.status === 'failed') ? 'failed' : 'planned';
+      return { index, laneIds: members.map(item => item.id), status, completedAt: status === 'completed' ? EPOCH - 60000 : null };
+    });
+    Object.assign(execution, {
+      phase: 'implement',
+      task: 'Ship the new settings experience',
+      massUlw: {
+        createdAt: EPOCH - 840000, updatedAt: EPOCH - 5000, currentWave: 1, waves, lanes,
+        runningLanes: ['api', 'ui'], failedLanes: ['migrate'], blockedLanes: ['docs'], blockedDependencies: ['migrate'],
+        verification: 'in-flight',
+      },
+    });
+  }
   if (name === 'offline-worker') {
     result.status.executors.items[0].online = false;
     result.status.executors.items[0].lastSeenAtMs = EPOCH - 3600000;

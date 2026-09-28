@@ -5,7 +5,7 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
+  <meta name="color-scheme" content="light" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2320211f'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-size='13' font-family='Arial' font-weight='700' fill='%23c9a66b'%3EJK%3C/text%3E%3C/svg%3E" />
   <title>JK Control Center</title>
   <meta name="description" content="JK 개인 작업 현황, 승인 요청, 실행 위치와 최근 결과를 확인하는 command center." />
@@ -387,6 +387,132 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
       .approval-actions .btn { flex: 1 1 100%; min-height: 42px; }
       .quick-links-head { align-items: flex-start; flex-direction: column; }
     }
+    /* ================================================================
+       JK light theme (matches the Windows app): charcoal navigation rail,
+       light canvas, white rounded cards, warm amber accent. Tokens are
+       re-declared so every existing rule follows; the sidebar keeps the
+       dark palette by scoping the old tokens to it.
+       ================================================================ */
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f3f4f7;
+      --panel-inset: #f7f8fa; --panel-hover: #eef0f4;
+      --line: #e4e7ec; --line-strong: #cfd5de;
+      --text: #111827; --muted: #6b7280;
+      --accent: #c9a66b; --accent-hover: #d6b680; --accent-soft: #fbf3e4; --on-accent: #261d0e; --accent-ink: #94702f;
+      --ok: #15803d; --ok-soft: #e8f7ee; --warn: #b45309;
+      --danger: #dc2626; --danger-soft: #fdeded; --info: #2563eb; --info-soft: #ebf2ff;
+      --shadow-card: 0 1px 2px rgba(16,24,40,.04), 0 6px 18px rgba(16,24,40,.05);
+      --dag-running: #d4a24c; --dag-ready: #2563eb; --dag-done: #16a34a; --dag-fail: #dc2626; --dag-block: #d97706; --dag-idle: #9aa3b2;
+    }
+    body { background: var(--bg); }
+    .sidebar {
+      --bg: #111318; --panel: #181b22; --panel-2: #22262f; --panel-inset: #14161c; --panel-hover: #262a34;
+      --line: #262a33; --line-strong: #3a404c; --text: #f3f4f6; --muted: #9aa3b2;
+      --accent-soft: #2b2318;
+      color-scheme: dark; color: var(--text); background: #111318; border-right: 1px solid #1f222a; box-shadow: none;
+    }
+    .sidebar .nav button.active { background: #262a34; color: #fff; border-color: transparent; box-shadow: inset 3px 0 0 var(--accent); }
+    .sidebar .nav button:hover { background: #1e2129; }
+    .topbar { background: rgba(245,246,248,.86); border-bottom: 1px solid var(--line); }
+    .status-chip { background: var(--panel); box-shadow: none; }
+    .btn { background: var(--panel); box-shadow: 0 1px 2px rgba(16,24,40,.05); }
+    .btn:hover { background: var(--panel-2); }
+    .btn.primary { background: var(--accent); color: var(--on-accent); box-shadow: 0 4px 14px rgba(201,166,107,.28); }
+    .btn.ghost { background: transparent; box-shadow: none; }
+    .metric, .panel { background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow-card); }
+    .work-surface { border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow-card); }
+    .work-surface .workflow-panel { border: 0; box-shadow: none; background: transparent; }
+    .attention-surface { border-radius: 0 14px 14px 0; }
+    .badge { background: var(--panel); }
+    .dashboard-eyebrow, .workflow-step.active, .badge.active, .guide-step .num { color: var(--accent-ink); }
+    .badge.active { border-color: var(--accent); }
+    .badge.warn { color: var(--warn); border-color: #f3c98b; background: #fff6e8; }
+    .online { color: var(--ok); }
+    .mobile-head { background: var(--bg); }
+    dialog { box-shadow: 0 24px 80px rgba(16,24,40,.22); }
+    dialog::backdrop { background: rgba(17,24,39,.45); }
+    .run-wait-reason { border-radius: 0 10px 10px 0; }
+
+    /* ---------------- DAG stage ---------------- */
+    .dag-stage { margin-bottom: var(--space-6); }
+    .mass-run { margin-top: 0; padding: 22px 24px 20px; border: 1px solid var(--line); border-radius: 20px; background: var(--panel); box-shadow: var(--shadow-card); }
+    .mass-run-head { align-items: center; }
+    .mass-run-title { font-size: 20px; font-weight: 720; letter-spacing: -.02em; }
+    .run-percent { font-size: 22px; font-weight: 760; letter-spacing: -.03em; color: var(--text); margin-left: 6px; line-height: 1; }
+    .mass-run-head .badges { align-items: center; }
+    .run-progress { display: flex; gap: 3px; height: 8px; margin-top: 16px; border-radius: 999px; overflow: hidden; background: var(--panel-2); }
+    .run-progress-seg { min-width: 6px; border-radius: 999px; }
+    .run-progress-seg[data-seg="completed"] { background: var(--dag-done); }
+    .run-progress-seg[data-seg="running"] { background: linear-gradient(90deg, var(--dag-running), #efc97a, var(--dag-running)); background-size: 200% 100%; animation: dag-shimmer 1.8s linear infinite; }
+    .run-progress-seg[data-seg="trouble"] { background: var(--dag-fail); }
+    .run-progress-seg[data-seg="waiting"] { background: #d7dce4; }
+    .run-stats { gap: 8px; margin-top: 14px; }
+    .run-stats > span { display: inline-flex; align-items: baseline; gap: 4px; padding: 5px 11px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
+    .run-stats > span[data-stat="running"] strong { color: var(--accent-ink); }
+    .run-stats > span[data-stat="completed"] strong { color: var(--dag-done); }
+    .run-stats > span.danger-text { background: var(--danger-soft); }
+    .run-dag { margin-top: 16px; padding: 12px 12px 10px; border: 1px solid var(--line); border-radius: 16px;
+      background-color: #fafbfc;
+      background-image: radial-gradient(circle at 1px 1px, #d9dee6 1px, transparent 0);
+      background-size: 18px 18px; box-shadow: inset 0 1px 2px rgba(16,24,40,.04); }
+    .run-dag-scroll { min-height: 170px; }
+    .run-dag-wave { position: absolute; top: 6px; border-radius: 14px; background: rgba(255,255,255,.55); border: 1px dashed transparent; pointer-events: none; }
+    .run-dag-wave[data-wave-state="current"] { background: rgba(212,162,76,.07); border-color: rgba(212,162,76,.45); }
+    .run-dag-wave[data-wave-state="done"] { background: rgba(22,163,74,.045); }
+    .run-dag-wave-label { position: absolute; left: 12px; top: 9px; font-size: 10.5px; font-weight: 800; letter-spacing: .12em; color: var(--muted); }
+    .run-dag-wave[data-wave-state="current"] .run-dag-wave-label { color: var(--accent-ink); }
+    .run-dag-wave[data-wave-state="done"] .run-dag-wave-label { color: var(--dag-done); }
+    .run-dag-wave-count { position: absolute; right: 12px; top: 8px; font-size: 11px; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .run-dag-edges { z-index: 1; }
+    .run-dag-edge { stroke: #c3cad5; stroke-width: 2; opacity: 1; transition: stroke var(--motion-fast), opacity var(--motion-fast), stroke-width var(--motion-fast); }
+    .run-dag-edge[data-edge-state="done"] { stroke: #7cc796; }
+    .run-dag-edge[data-edge-state="active"] { stroke: var(--dag-running); stroke-width: 2.5; stroke-dasharray: 7 7; animation: dag-flow .9s linear infinite; }
+    .run-dag-edge[data-edge-state="blocked"] { stroke: #f1a3a3; stroke-dasharray: 4 5; }
+    .run-dag-edge[data-edge-state="pending"] { stroke: #cdd3dc; stroke-dasharray: 2 5; }
+    #run-dag-arrow path { fill: context-stroke; }
+    .run-dag-node { z-index: 2; padding: 12px 14px 11px 16px; border: 1px solid var(--line); border-radius: 14px; background: #fff; color: var(--text); box-shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 20px rgba(16,24,40,.06); transition: transform var(--motion-fast) var(--ease-out), box-shadow var(--motion-fast), opacity var(--motion-fast); outline: none; }
+    .run-dag-node::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--node-color, var(--dag-idle)); }
+    .run-dag-node .run-lane-id { color: var(--muted); font-weight: 600; }
+    .run-dag-node .run-lane-task { font-size: 13px; font-weight: 650; line-height: 1.45; color: var(--text); }
+    .run-dag-node-meta { font-size: 11px; }
+    .run-dag-node-meta span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .run-dag-icon { width: 24px; height: 24px; border-radius: 8px; background: color-mix(in srgb, var(--node-color, var(--dag-idle)) 14%, #fff); color: var(--node-color, var(--dag-idle)); }
+    .run-dag-icon svg { width: 15px; height: 15px; stroke-width: 2.1; }
+    .run-dag-node.status-planned { --node-color: var(--dag-idle); background: #fcfcfd; }
+    .run-dag-node.status-ready { --node-color: var(--dag-ready); border-color: #bcd2fb; }
+    .run-dag-node.status-in-flight { --node-color: var(--dag-running); border-color: #e7c88e; box-shadow: 0 0 0 4px rgba(212,162,76,.14), 0 10px 26px rgba(180,130,40,.16); animation: dag-pulse 2.4s var(--ease-out) infinite; }
+    .run-dag-node.status-in-flight .run-dag-icon svg { animation: dag-spin 2.4s linear infinite; }
+    .run-dag-node.status-completed { --node-color: var(--dag-done); border-color: #bfe5cc; background: linear-gradient(180deg,#f6fcf8,#fff 55%); }
+    .run-dag-node.status-review { --node-color: var(--dag-ready); border-color: #bcd2fb; }
+    .run-dag-node.status-failed { --node-color: var(--dag-fail); border-color: #f5b5b5; background: linear-gradient(180deg,#fff6f6,#fff 55%); }
+    .run-dag-node.status-blocked { --node-color: var(--dag-block); border-color: #f3d29b; background: repeating-linear-gradient(135deg,#fffaf0 0 8px,#fff 8px 16px); }
+    .run-dag-node.status-in-flight .run-dag-icon, .run-dag-node.status-completed .run-dag-icon, .run-dag-node.status-failed .run-dag-icon, .run-dag-node.status-blocked .run-dag-icon { color: var(--node-color); }
+    .run-dag-node:hover, .run-dag-node:focus-visible { transform: translateY(-2px); box-shadow: 0 0 0 2px var(--node-color, var(--dag-idle)), 0 14px 30px rgba(16,24,40,.12); }
+    .run-dag-graph.is-focus .run-dag-node:not(.is-focus):not(.is-related) { opacity: .38; }
+    .run-dag-graph.is-focus .run-dag-edge:not(.is-focus) { opacity: .15; }
+    .run-dag-graph.is-focus .run-dag-edge.is-focus { stroke-width: 3.2; opacity: 1; }
+    .run-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 8px; padding: 8px 6px 2px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--muted); }
+    .run-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .run-legend-item i { width: 10px; height: 10px; border-radius: 3px; background: var(--dag-idle); }
+    .run-legend-item[data-legend="in-flight"] i { background: var(--dag-running); }
+    .run-legend-item[data-legend="ready"] i { background: var(--dag-ready); }
+    .run-legend-item[data-legend="completed"] i { background: var(--dag-done); }
+    .run-legend-item[data-legend="failed"] i { background: var(--dag-fail); }
+    .run-legend-item[data-legend="blocked"] i { background: var(--dag-block); }
+    .run-legend-hint { margin-left: auto; font-size: 11px; opacity: .8; }
+    .run-legend-swipe { display: none; margin-left: auto; font-size: 11px; font-weight: 700; color: var(--accent-ink); }
+    @keyframes dag-flow { to { stroke-dashoffset: -28; } }
+    @keyframes dag-pulse { 0%, 100% { box-shadow: 0 0 0 4px rgba(212,162,76,.14), 0 10px 26px rgba(180,130,40,.16); } 50% { box-shadow: 0 0 0 7px rgba(212,162,76,.06), 0 10px 26px rgba(180,130,40,.16); } }
+    @keyframes dag-spin { to { transform: rotate(360deg); } }
+    @keyframes dag-shimmer { to { background-position: -200% 0; } }
+    @media (max-width: 720px) {
+      .mass-run { padding: 16px; border-radius: 16px; }
+      .mass-run-title { font-size: 16px; }
+      .run-legend-hint { display: none; }
+      .run-legend-swipe { display: inline; }
+      .work-surface { border-radius: 16px; }
+    }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
     }
@@ -638,6 +764,7 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     const resultClass = ['pass','succeeded'].includes(verification) ? 'ok' : ['fail','failed'].includes(verification) ? 'danger' : verification === 'blocked' ? 'warn' : 'default';
     const updatedAt = task ? e.updatedAt : history && (history.updatedAt || history.finishedAt);
     return '<div class="page-head"><div><h1>JK Control Center</h1><div class="sub">작업의 흐름을 확인하고, 필요한 순간에만 승인하세요.</div></div><button class="btn ghost small" data-nav-page="projects">프로젝트 보기</button></div>' +
+      (task && e.massUlw ? '<section class="dag-stage" data-dashboard-region="dag" aria-label="병렬 작업 그래프">' + massUlwStatusHtml(e) + '</section>' : '') +
       '<div class="command-layout"><section class="work-surface" data-dashboard-region="work" data-work-state="' + workState + '" aria-labelledby="work-heading"><div class="section-head"><div class="dashboard-eyebrow">' + (task ? '현재 작업 · 컨텍스트' : workState === 'history' ? '최근 작업 기록' : '다음 작업을 기다립니다') + '</div><span class="badge ' + resultClass + '">' + esc(task ? verification : history && history.status || 'idle') + '</span></div><h2 class="dashboard-task' + (title.length > 100 ? ' long-task' : '') + '" id="work-heading">' + esc(title) + '</h2>' +
       '<dl class="work-ledger"><div><dt>프로젝트</dt><dd>' + esc(project ? project.name : e.projectName || projectId || '선택 안 됨') + '</dd></div><div><dt>선택된 실행 위치</dt><dd>' + esc(projectRouteLabel(project)) + '</dd></div><div><dt>' + (task ? '실행 모드' : '마지막 기록') + '</dt><dd>' + esc(task ? modeLabel(e.mode) : updatedAt ? fmtAge(updatedAt) : '기록 없음') + '</dd></div></dl>' +
       '<div class="work-result"><h3 class="section-title">' + (note ? '최근 진행 내용' : task ? '진행 상황' : '다음 작업') + '</h3><div class="run-summary-note">' + esc(note || (task ? '아직 진행 요약이 보고되지 않았습니다.' : 'ChatGPT에서 @jk로 원하는 작업을 자연어로 말하면 됩니다.')) + '</div>' +
@@ -759,7 +886,7 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
     if (!e.task && !e.goal && !e.phase) return '';
     const startedAt = e.massUlw && e.massUlw.createdAt;
     const elapsed = startedAt ? '<span data-run-started-at="' + esc(startedAt) + '">소요 ' + esc(fmtElapsed(startedAt)) + '</span>' : '';
-    return '<div class="panel workflow-panel"><div class="workflow-head"><div><h2 class="section-title" style="margin-bottom:0">실행 단계</h2><div class="sub">탐색 → 구현 → 검증 중 현재 위치와 병렬 작업을 실시간으로 보여줍니다.</div></div><span class="badge ' + verificationClass + '">' + esc(e.verificationStatus || 'unknown') + '</span></div><div id="workflow-rail-root"><div class="workflow-strip">' + steps + '</div><div class="workflow-meta"><span>' + esc(e.primaryStage || 'idle') + (e.supportingStages && e.supportingStages.length ? ' + ' + esc(e.supportingStages.join(', ')) : '') + '</span><span>' + esc((e.completedCount || 0) + ' 완료 · ' + (e.pendingCount || 0) + ' 대기') + (elapsed ? ' · ' + elapsed : '') + '</span></div>' + runWaitReasonHtml(e) + massUlwStatusHtml(e) + runEventsHtml(e) + '</div></div>';
+    return '<div class="panel workflow-panel"><div class="workflow-head"><div><h2 class="section-title" style="margin-bottom:0">실행 단계</h2><div class="sub">탐색 → 구현 → 검증 중 현재 위치와 병렬 작업을 실시간으로 보여줍니다.</div></div><span class="badge ' + verificationClass + '">' + esc(e.verificationStatus || 'unknown') + '</span></div><div id="workflow-rail-root"><div class="workflow-strip">' + steps + '</div><div class="workflow-meta"><span>' + esc(e.primaryStage || 'idle') + (e.supportingStages && e.supportingStages.length ? ' + ' + esc(e.supportingStages.join(', ')) : '') + '</span><span>' + esc((e.completedCount || 0) + ' 완료 · ' + (e.pendingCount || 0) + ' 대기') + (elapsed ? ' · ' + elapsed : '') + '</span></div>' + runWaitReasonHtml(e) + runEventsHtml(e) + '</div></div>';
   }
   async function refreshExecution() {
     if (document.hidden) return;

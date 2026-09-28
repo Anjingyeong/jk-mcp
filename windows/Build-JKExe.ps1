@@ -69,7 +69,8 @@ try {
     & $csc @compilerArgs
     if ($LASTEXITCODE -ne 0) { throw "C# launcher compilation failed with exit code $LASTEXITCODE." }
     Assert-LauncherIdle
-    if (Test-Path -LiteralPath $out) { [IO.File]::Replace($stagedExe, $out, $null) }
+    # [NullString]::Value: PowerShell would coerce $null to "" (an illegal backup path).
+    if (Test-Path -LiteralPath $out) { [IO.File]::Replace($stagedExe, $out, [NullString]::Value) }
     else { [IO.File]::Move($stagedExe, $out) }
 } finally {
     if (Test-Path -LiteralPath $stagedExe) { Remove-Item -LiteralPath $stagedExe -Force }
