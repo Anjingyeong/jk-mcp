@@ -44,6 +44,8 @@ JK는 AI 구독을 하나 더 늘리지 않고 이 간극을 메우려고 만들
 
 아직 코드 서명이 되어 있지 않습니다. Windows SmartScreen이 뜨면 공식 Releases 페이지에서 받은 파일일 때만 **추가 정보 → 실행**을 누르세요.
 
+macOS에서 "확인되지 않은 개발자" 때문에 열리지 않으면, Finder에서 `.pkg`를 **우클릭(Control-클릭) → 열기 → 열기**를 누르거나 **시스템 설정 → 개인정보 보호 및 보안 → 그래도 열기**를 누르세요.
+
 ### 터미널이 편하다면
 
 Node.js 22+가 있으면 명령 하나로 설정이 끝나고, 커넥터 URL·Control Center·헬스체크 링크가 출력됩니다(Ctrl+클릭으로 열기).
@@ -192,7 +194,7 @@ assets/           JK 공개 리소스
 
 ## 만든 사람
 
-JK는 **Anjingyeong**이 설계하고 만들고 유지보수합니다. 문제, 의견, PR은 [issue tracker](https://github.com/Anjingyeong/jk-mcp/issues)에 남겨주세요. 기여 방법은 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
+JK는 **Anjingyeong**이 설계하고 만들고 유지보수합니다. 문제가 생기면 앱 사이드바나 트레이 메뉴의 **Report issue**, 또는 Control Center의 **문제 신고 · 피드백**을 누르세요. 버전과 OS가 미리 채워진 [issue](https://github.com/Anjingyeong/jk-mcp/issues) 작성 페이지가 열립니다. 보안 문제는 [SECURITY.md](SECURITY.md)를 참고해 비공개로 알려주세요. PR은 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
 
 JK는 **[ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)**에서 시작했고, 원저작자의 허락을 받아 사용했습니다. 원본을 만들어 주신 ezBuilder님께 감사드립니다. [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)와 [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 참고하세요.
 

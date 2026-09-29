@@ -44,6 +44,8 @@ Get the app from the [Releases page](https://github.com/Anjingyeong/jk-mcp/relea
 
 The installers are not code-signed yet. If Windows SmartScreen appears, choose **More info → Run anyway** only when the file came from the official Releases page.
 
+On macOS, if the package is blocked ("cannot be opened because it is from an unidentified developer"), **right-click (Control-click) the `.pkg` in Finder → Open → Open**, or allow it under **System Settings → Privacy & Security → Open Anyway**.
+
 ### Prefer the terminal?
 
 With Node.js 22+ installed, one command sets everything up and prints the connector URL, Control Center link, and health check (Ctrl+click to open):
@@ -192,7 +194,7 @@ assets/           JK public assets
 
 ## Author
 
-JK is designed, built, and maintained by **Anjingyeong**. Issues, feedback, and pull requests are welcome on the [issue tracker](https://github.com/Anjingyeong/jk-mcp/issues); see [CONTRIBUTING.md](CONTRIBUTING.md).
+JK is designed, built, and maintained by **Anjingyeong**. Found a problem? Use **Report issue** in the app sidebar or tray menu, or **문제 신고 · 피드백** in the Control Center; it opens a prefilled [issue](https://github.com/Anjingyeong/jk-mcp/issues) with your version and OS. Security problems: see [SECURITY.md](SECURITY.md). Pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 JK started from **[ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)**, used with the original author's permission. Thanks to ezBuilder for the original work. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) and [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md).
 

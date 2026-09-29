@@ -153,4 +153,12 @@ describe("Control Center dashboard links and mobile layout", () => {
     const rail = CONTROL_CENTER_HTML.slice(CONTROL_CENTER_HTML.indexOf("function workflowRailHtml()"), CONTROL_CENTER_HTML.indexOf("async function refreshExecution()"));
     expect(rail).not.toContain("massUlwStatusHtml(e)");
   });
+
+  it("offers a prefilled issue link with only version/OS/surface", () => {
+    expect(CONTROL_CENTER_HTML).toContain('id="report-issue" href="https://github.com/Anjingyeong/jk-mcp/issues/new?template=bug_report.yml');
+    expect(CONTROL_CENTER_HTML).toContain('rel="noopener noreferrer"');
+    const updater = CONTROL_CENTER_HTML.slice(CONTROL_CENTER_HTML.indexOf("const issueParams"), CONTROL_CENTER_HTML.indexOf("getElementById('report-issue').href"));
+    expect(updater).toContain("runtime.version");
+    expect(updater).not.toMatch(/workspaceRoot|stateDir|token|logs/i);
+  });
 });

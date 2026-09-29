@@ -1,4 +1,5 @@
 import { MASS_ULW_DASHBOARD_SCRIPT } from "./mass-ulw-ui.js";
+import { JK_ISSUES_URL } from "../feedback.js";
 
 export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
 <html lang="ko">
@@ -413,6 +414,8 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
       color-scheme: dark; color: var(--text); background: #111318; border-right: 1px solid #1f222a; box-shadow: none;
     }
     .sidebar .nav button.active { background: #262a34; color: #fff; border-color: transparent; box-shadow: inset 3px 0 0 var(--accent); }
+    .report-issue { display: inline-block; margin-top: 10px; color: var(--muted); font-size: 11.5px; font-weight: 600; text-decoration: none; }
+    .report-issue:hover { color: var(--accent); }
     .sidebar .nav button:hover { background: #1e2129; }
     .topbar { background: rgba(245,246,248,.86); border-bottom: 1px solid var(--line); }
     .status-chip { background: var(--panel); box-shadow: none; }
@@ -531,7 +534,7 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
       <button data-page="system"><span class="dot"></span>Settings</button>
     </nav>
     <div><div class="nav-label">Projects</div><nav class="project-nav" id="project-nav" aria-label="Project navigation"></nav></div>
-    <div class="sidebar-foot"><div class="surface-row" id="sidebar-surface"><span class="online">●</span><strong>Connecting…</strong></div><div id="sidebar-runtime">Runtime checking…</div></div>
+    <div class="sidebar-foot"><div class="surface-row" id="sidebar-surface"><span class="online">●</span><strong>Connecting…</strong></div><div id="sidebar-runtime">Runtime checking…</div><a class="report-issue" id="report-issue" href="${JK_ISSUES_URL}/new?template=bug_report.yml&amp;surface=Control%20Center" target="_blank" rel="noopener noreferrer">문제 신고 · 피드백 ↗</a></div>
   </aside>
   <main class="main">
     <header class="topbar">
@@ -647,6 +650,13 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     document.getElementById('top-project').textContent = project ? project.name + ' · ' + project.projectId : 'No project';
     document.getElementById('top-role').innerHTML = (manualOverride ? 'Override ' : 'Auto ') + '<strong>' + esc(manualOverride ? (role.name || 'Role') : modeLabel(execution.mode)) + '</strong>';
     document.getElementById('sidebar-runtime').textContent = state.status ? ('PID ' + state.status.runtime.pid + ' · ' + Math.floor(state.status.runtime.uptimeSec) + 's') : 'Runtime unavailable';
+    if (state.status && state.status.runtime) {
+      // Only version/OS/surface are prefilled; never paths, logs, or tokens.
+      const issueParams = new URLSearchParams({ template: 'bug_report.yml', surface: 'Control Center' });
+      if (state.status.runtime.version) issueParams.set('version', state.status.runtime.version);
+      if (state.status.runtime.platform) issueParams.set('os', state.status.runtime.platform);
+      document.getElementById('report-issue').href = '${JK_ISSUES_URL}/new?' + issueParams.toString();
+    }
     document.getElementById('brand-runtime').textContent = isLocalSurface ? ('Local runtime · :' + (location.port || '7979')) : ('Cloud runtime · ' + location.hostname);
     const surface = document.getElementById('sidebar-surface');
     if (surface) surface.innerHTML = '<span class="online">●</span><strong>' + esc(isLocalSurface ? 'Local admin' : 'Secure remote admin') + '</strong>';

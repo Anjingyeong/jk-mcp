@@ -757,13 +757,17 @@ internal sealed class LauncherForm : Form
         var settingsNav = NewNavigationButton("Settings", 302);
         settingsNav.Click += delegate { ShowSettings(); };
         sidebar.Controls.Add(settingsNav);
+        var feedbackNav = NewNavigationButton("Report issue", 346);
+        feedbackNav.Click += delegate { OpenUrl(IssueReportUrl()); };
+        sidebar.Controls.Add(feedbackNav);
         SetNavGlyph(dashboardNav, "\uE80F");
         SetNavGlyph(runsNav, "\uE768");
         SetNavGlyph(approvalsNav, "\uE73E");
         SetNavGlyph(controlCenterNav, "\uE8A7");
         SetNavGlyph(updatesNav, "\uE896");
         SetNavGlyph(settingsNav, "\uE713");
-        navButtons.AddRange(new Button[] { dashboardNav, runsNav, approvalsNav, controlCenterNav, updatesNav, settingsNav });
+        SetNavGlyph(feedbackNav, "\uED15");
+        navButtons.AddRange(new Button[] { dashboardNav, runsNav, approvalsNav, controlCenterNav, updatesNav, settingsNav, feedbackNav });
         SetActiveNav(dashboardNav);
 
         var sidebarDivider = new Panel();
@@ -783,6 +787,7 @@ internal sealed class LauncherForm : Form
         toggleTrayItem = new ToolStripMenuItem(L("startMCP"), null, delegate { ToggleServer(); });
         restartTrayItem = new ToolStripMenuItem(L("restartMCP"), null, delegate { RestartServer(); });
         settingsTrayItem = new ToolStripMenuItem(L("settingsMenu"), null, delegate { ShowSettings(); });
+        var feedbackTrayItem = new ToolStripMenuItem("Report issue...", null, delegate { OpenUrl(IssueReportUrl()); });
         quitTrayItem = new ToolStripMenuItem(L("quit"), null, delegate { ExitApplication(); });
         trayMenu.Items.Add(statusTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
@@ -792,6 +797,7 @@ internal sealed class LauncherForm : Form
         trayMenu.Items.Add(toggleTrayItem);
         trayMenu.Items.Add(restartTrayItem);
         trayMenu.Items.Add(settingsTrayItem);
+        trayMenu.Items.Add(feedbackTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(quitTrayItem);
 
@@ -1184,6 +1190,32 @@ internal sealed class LauncherForm : Form
         var connector = ConnectorUrl();
         if (string.IsNullOrEmpty(connector)) return null;
         return Regex.Replace(connector, @"/mcp/?$", "/healthz", RegexOptions.IgnoreCase);
+    }
+
+    private string InstalledVersion()
+    {
+        try
+        {
+            var packageJson = Path.Combine(root, "package.json");
+            if (!File.Exists(packageJson)) return "unknown";
+            var match = Regex.Match(File.ReadAllText(packageJson, Encoding.UTF8), @"""version""\s*:\s*""(?<version>[^""]+)""");
+            return match.Success ? match.Groups["version"].Value : "unknown";
+        }
+        catch
+        {
+            return "unknown";
+        }
+    }
+
+    /// <summary>GitHub issue form prefilled with version/OS only (never paths, logs, or tokens).</summary>
+    private string IssueReportUrl()
+    {
+        var repo = string.IsNullOrWhiteSpace(githubRepoUrl) ? "https://github.com/Anjingyeong/jk-mcp" : githubRepoUrl.TrimEnd('/');
+        var os = "Windows " + Environment.OSVersion.Version + (Environment.Is64BitOperatingSystem ? " x64" : " x86");
+        return repo + "/issues/new?template=bug_report.yml"
+            + "&version=" + Uri.EscapeDataString(InstalledVersion())
+            + "&os=" + Uri.EscapeDataString(os)
+            + "&surface=" + Uri.EscapeDataString("Windows app");
     }
 
     private string LocalHealthUrl()

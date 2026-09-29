@@ -1,0 +1,55 @@
+name: 문제 신고 / Bug report
+description: JK가 기대대로 동작하지 않을 때 / Something in JK didn't work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        신고해 주셔서 감사합니다. **Owner Token, 터널 토큰, API 키, 개인 경로는 절대 붙여넣지 마세요.**
+        Thanks for the report. **Never paste Owner Tokens, tunnel tokens, API keys, or personal paths.**
+        보안 취약점은 여기가 아니라 비공개로 알려주세요 / Report security issues privately: see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: JK 버전 / Version
+      placeholder: "0.2.10"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Windows 11 x64 / macOS 15 / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: 어디서 발생했나요? / Where
+      options:
+        - Windows app
+        - macOS app
+        - Terminal (npx jk-mcp / jk)
+        - Control Center
+        - ChatGPT connector / @jk
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 무슨 일이 있었나요? / What happened
+      description: 오류 메시지가 있으면 그대로 적어주세요 (토큰은 지우고). / Include the error message (with any token removed).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 방법 / Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대한 동작 / Expected behavior

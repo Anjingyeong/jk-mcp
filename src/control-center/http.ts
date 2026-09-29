@@ -41,6 +41,7 @@ import { getRuntimeSchemaHealth } from "../server/runtime-schema-health.js";
 import { assertExecutionTarget, bindExecutionLease, leaseTtlMs, resolveExecutionProject } from "../server/tools.js";
 import { clearKill } from "../control/queue.js";
 import { isSensitiveApp } from "../control/policy.js";
+import { RUNTIME_VERSION } from "../runtime-version.js";
 import {
   CONTROL_CENTER_LOGIN_HTML,
   canServeRemoteLogin,
@@ -809,6 +810,7 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
         ok: true,
         runtime: {
           name: "JK",
+          version: RUNTIME_VERSION,
           pid: process.pid,
           node: process.version,
           platform: `${process.platform}/${process.arch}`,

@@ -1,6 +1,6 @@
 {
   "name": "jk-mcp",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "JK local MCP coding runtime with persistent work sessions, guarded edits, orchestration, Git, E2E, and optional OMO delegation.",
   "author": "Anjingyeong",
   "license": "MIT",
