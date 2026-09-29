@@ -63,7 +63,7 @@ npx -y jk-mcp setup
 3. **토큰 자동 생성**을 누른 뒤 **소유자 토큰 복사**로 복사합니다. 비밀번호처럼 보관하세요.
 4. **ChatGPT 웹 커넥터 사용**을 켜고 **MCP 시작**을 누릅니다.
 5. **커넥터 URL 복사**를 누릅니다. 주소는 `/mcp`로 끝납니다.
-6. ChatGPT의 **Apps & Connectors / Connectors**에서 새 커넥터를 만들고 URL을 붙여넣습니다.
+6. ChatGPT의 **Apps & Connectors / Connectors**(플러그인 생성)에서 새 커넥터를 만들고 URL을 붙여넣습니다.
 7. JK 로그인 창이 뜨면 복사한 소유자 토큰(Owner Token)을 붙여넣습니다.
 8. 확인용으로 이렇게 요청해 보세요: `@jk 이 프로젝트 README 읽고 현재 상태 요약해줘.`
 
