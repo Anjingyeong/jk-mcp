@@ -109,7 +109,7 @@ npx -y jk-mcp setup
 ### 큰 작업도 정리해서
 - **JK 오케스트레이션**: `goal_intake`와 `goal_loop`가 Explorer, Oracle, Implementer, Reviewer, Verifier, Recovery 역할로 긴 코딩 작업을 돌립니다. 검증에 실패하면 같은 시도를 반복하지 않고 계획을 다시 세웁니다.
 - **MASS ULW 병렬 작업**: 한 ChatGPT 대화 안에서 작업을 의존관계가 있는 lane으로 나눠 구현·검증·수정·리뷰를 병렬로 진행합니다. [MASS ULW 워크플로우](docs/MASS_ULW_WEB.ko.md) 참고.
-- **OMO 위임 (선택)**: 로컬에 OMO / Oh My OpenAgent가 있으면 일부 작업을 넘길 수 있습니다. 상태·안전·검증 기준은 JK가 유지합니다.
+- **OmO 위임 (선택)**: 로컬에 [OmO / Oh My OpenAgent](https://github.com/code-yeongyu/oh-my-openagent)가 있으면 일부 작업을 넘길 수 있습니다. 상태·안전·검증 기준은 JK가 유지합니다.
 
 ### 무슨 일이 일어나는지 보이게
 - **Control Center**: 현재 작업, 승인, 실행 호스트, 활동을 보는 로컬 대시보드.
@@ -197,6 +197,8 @@ assets/           JK 공개 리소스
 JK는 **Anjingyeong**이 설계하고 만들고 유지보수합니다. 문제가 생기면 앱 사이드바나 트레이 메뉴의 **Report issue**, 또는 Control Center의 **문제 신고 · 피드백**을 누르세요. 버전과 OS가 미리 채워진 [issue](https://github.com/Anjingyeong/jk-mcp/issues) 작성 페이지가 열립니다. 보안 문제는 [SECURITY.md](SECURITY.md)를 참고해 비공개로 알려주세요. PR은 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
 
 JK는 **[ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex)**에서 시작했고, 원저작자의 허락을 받아 사용했습니다. 원본을 만들어 주신 ezBuilder님께 감사드립니다. [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)와 [Attribution and compliance notes](docs/ATTRIBUTION_AND_COMPLIANCE.md)를 참고하세요.
+
+또 하나의 큰 영감은 **[OmO / Oh My OpenAgent](https://github.com/code-yeongyu/oh-my-openagent)**입니다. `mass ulw`와 멀티 에이전트 오케스트레이션을 실제로 밀어붙여 보여준 OmO의 제작자 **[김연규 (@code-yeongyu)](https://github.com/code-yeongyu)**님께 감사드립니다. JK와 OmO는 서로 독립된 프로젝트이며, JK는 로컬에 설치된 OmO를 선택적으로 위임 실행 계층으로 연결할 수 있습니다.
 
 ## 라이선스
 
