@@ -23,10 +23,10 @@ export const WORKFLOW_PRESETS = [
   { id: "planning", name: "Planning", preference: "Inspect the current architecture, choose the smallest viable design, and order work by dependencies and verification risk." },
 ] as const;
 
-export type RoleTool = (typeof ROLE_TOOL_VALUES)[number];
-export type RolePermissionPreset = "inherit" | "read-only" | "tests-only" | "full-write" | "image-only";
+type RoleTool = (typeof ROLE_TOOL_VALUES)[number];
+type RolePermissionPreset = "inherit" | "read-only" | "tests-only" | "full-write" | "image-only";
 
-export interface JkRole {
+interface JkRole {
   id: string;
   name: string;
   description: string;
@@ -49,7 +49,7 @@ interface RoleState {
   defaultByProject: Record<string, string>;
 }
 
-export interface ActiveRoleContext {
+interface ActiveRoleContext {
   projectId: string;
   projectName: string;
   role: JkRole;
@@ -224,14 +224,14 @@ export async function listRoles(stateDir: string): Promise<JkRole[]> {
   return [...BUILT_IN_ROLES, ...state.customRoles];
 }
 
-export async function getRole(stateDir: string, roleId: string): Promise<JkRole | null> {
+async function getRole(stateDir: string, roleId: string): Promise<JkRole | null> {
   const builtIn = BUILT_IN_BY_ID.get(roleId);
   if (builtIn) return builtIn;
   const state = await readRoleState(stateDir);
   return state.customRoles.find((role) => role.id === roleId) ?? null;
 }
 
-export interface SaveRoleInput {
+interface SaveRoleInput {
   id?: string;
   name: string;
   description?: string;
@@ -290,7 +290,9 @@ function inferredBuiltInRoleId(mode: RoleTaskMode, goal?: string): string {
 
   const text = goal?.trim() ?? "";
   const qaIntent = /(^|\s)(qa|e2e)(\s|$)|(?:테스트|검증|재현)(?:해|해줘|만|부터|진행)/i.test(text);
-  const writeIntent = /구현|수정|고쳐|만들|추가|변경|패치|implement|build|fix|edit|change/i.test(text);
+  // UI/art creation and polish are implementation work even when QA is also requested.
+  // Otherwise "UI 고도화 ... 에셋 제작 ... 모바일 QA" is mistaken for tests-only.
+  const writeIntent = /구현|수정|고쳐|만들|제작|고도화|추가|변경|패치|implement|build|fix|edit|change/i.test(text);
   return qaIntent && !writeIntent ? "qa-engineer" : "builder";
 }
 
@@ -363,7 +365,7 @@ export async function deleteCustomRole(stateDir: string, roleId: string): Promis
   return true;
 }
 
-export interface RoleBundle {
+interface RoleBundle {
   format: "jk-roles";
   version: 1;
   exportedAt: number;

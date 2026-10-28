@@ -22,7 +22,7 @@ export interface TaskExecutionSafety {
   operationalDrift: string[];
 }
 
-export interface TaskSafetyGate {
+interface TaskSafetyGate {
   approvalReady: boolean;
   terminalReady: boolean;
   approvalBlockers: string[];

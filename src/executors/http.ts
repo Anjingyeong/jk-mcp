@@ -47,6 +47,23 @@ async function requireWorkerToken(
   return true;
 }
 
+/**
+ * Authenticate JSON executor results before parsing the larger, route-specific
+ * request body. Reuses the same worker-token check as the result handler.
+ */
+export function requireWorkerResultAuth(ctx: ToolContext) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const executorId = req.params.executorId;
+    if (typeof executorId !== "string" || !executorId.trim()) {
+      res.status(401).json({ error: "executor authentication required" });
+      return;
+    }
+    void requireWorkerToken(req, res, ctx, executorId)
+      .then((authorized) => { if (authorized) next(); })
+      .catch(next);
+  };
+}
+
 const EXECUTOR_BINARY_RESULT_LIMIT = "11mb";
 const EXECUTOR_BINARY_META_MAX_CHARS = 48_000;
 

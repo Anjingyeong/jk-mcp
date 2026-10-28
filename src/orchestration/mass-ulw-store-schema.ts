@@ -167,14 +167,14 @@ export const MassUlwDocumentSchema = z.object({
   }
 });
 
-export const LockFileSchema = z.object({
+const LockFileSchema = z.object({
   version: z.literal(1),
   pid: z.number().int().positive(),
   token: z.string().min(1),
   createdAt: z.number().int().nonnegative(),
 }).strict();
 
-export type LockFile = z.infer<typeof LockFileSchema>;
+type LockFile = z.infer<typeof LockFileSchema>;
 export type MassUlwDocument = z.infer<typeof MassUlwDocumentSchema>;
 export type MassUlwAttempt = z.infer<typeof AttemptSchema>;
 export type MassUlwLaneState = z.infer<typeof LaneStateSchema>;

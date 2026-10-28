@@ -10,14 +10,14 @@ interface ScreenshotShareRecord {
   expiresAt: number;
 }
 
-export interface ScreenshotShare {
+interface ScreenshotShare {
   token: string;
   url: string;
   markdown: string;
   expiresAt: string;
 }
 
-export interface ScreenshotShareRead {
+interface ScreenshotShareRead {
   path: string;
   bytes: number;
   expiresAt: number;

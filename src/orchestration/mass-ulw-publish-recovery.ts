@@ -52,7 +52,7 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-export class MassUlwRollbackConflictError extends Error {
+class MassUlwRollbackConflictError extends Error {
   readonly code = "MASS_ULW_ROLLBACK_CONFLICT";
 
   constructor(readonly relativePath: string, options?: ErrorOptions) {

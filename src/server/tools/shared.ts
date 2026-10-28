@@ -57,14 +57,14 @@ export interface MutationFileSummary {
   removed?: number;
 }
 
-export interface LastMutation {
+interface LastMutation {
   checkpointId: string;
   tool: "file_apply_patch" | "file_create";
   files: MutationFileSummary[];
   at: number;
 }
 
-export interface LastVerification {
+interface LastVerification {
   tool: "command_run" | "local_shell_run" | "e2e_run_command" | "e2e_test_and_show_screenshot";
   command: string;
   success: boolean;
@@ -116,7 +116,7 @@ export function isReleaseShellCommand(command: string): boolean {
   );
 }
 
-export interface WorkContext {
+interface WorkContext {
   projectId: string;
   workSessionId: string | null;
   activeArtifact: string | null;
@@ -128,7 +128,7 @@ export interface WorkContext {
   lastActivityAt: number;
 }
 
-export interface SessionState {
+interface SessionState {
   version?: number;
   updatedAt?: number;
   activeProjectId: string | null;
@@ -143,7 +143,7 @@ export function emptySession(): SessionState {
   return { activeProjectId: null, mode: "observe", lease: null, controlAllowlist: [], workContexts: {}, workSessions: {} };
 }
 
-export function coerceSessionState(raw: unknown): SessionState {
+function coerceSessionState(raw: unknown): SessionState {
   if (!raw || typeof raw !== "object") return emptySession();
   const s = raw as Partial<SessionState>;
   return {
@@ -162,7 +162,7 @@ export async function loadSession(ctx: ToolContext): Promise<SessionState> {
   return coerceSessionState(await ctx.store.getSession());
 }
 
-export async function saveSession(ctx: ToolContext, session: SessionState): Promise<void> {
+async function saveSession(ctx: ToolContext, session: SessionState): Promise<void> {
   await ctx.store.setSession(session);
 }
 
@@ -182,7 +182,7 @@ export async function updateSessionState(
   return next;
 }
 
-export function isMissingProjectFileError(error: unknown): boolean {
+function isMissingProjectFileError(error: unknown): boolean {
   if (error && typeof error === "object" && "code" in error
     && (error as NodeJS.ErrnoException).code === "ENOENT") return true;
   // Remote executor failures currently cross the broker as Error(message), so
@@ -203,7 +203,7 @@ export async function hashProjectFile(root: string, rel: string): Promise<string
 
 export type WorkContextSlice = Omit<Awaited<ReturnType<typeof readSlice>>, "fullFileHash"> & { fullFileHash?: string; workContextFileHash?: string };
 
-export async function hashWorkContextFile(
+async function hashWorkContextFile(
   ctx: ToolContext,
   entry: ProjectRegistryEntry,
   rel: string,
@@ -223,7 +223,7 @@ export async function hashWorkContextFile(
   }
 }
 
-export function makeEmptyWorkContext(projectId: string, now = Date.now(), workSessionId: string | null = null): WorkContext {
+function makeEmptyWorkContext(projectId: string, now = Date.now(), workSessionId: string | null = null): WorkContext {
   return {
     projectId,
     workSessionId,
@@ -382,7 +382,7 @@ export function findLoopContextById(
   return legacy?.taskState?.loopId === loopId ? { context: legacy } : null;
 }
 
-export function withWorkContext(
+function withWorkContext(
   session: SessionState,
   projectId: string,
   workSessionId: string | undefined,
@@ -422,14 +422,14 @@ export function withWorkContext(
   };
 }
 
-export function normalizeSessionMatchText(value: string): string {
+function normalizeSessionMatchText(value: string): string {
   return value
     .toLowerCase()
     .replace(/[^\p{L}\p{N}._-]+/gu, " ")
     .trim();
 }
 
-export function scoreWorkSessionMatch(
+function scoreWorkSessionMatch(
   context: WorkContext,
   hint: string | undefined,
   now: number,
@@ -478,7 +478,7 @@ export function scoreWorkSessionMatch(
   return { score, reasons };
 }
 
-export interface RankedWorkSession {
+interface RankedWorkSession {
   context: WorkContext;
   workSessionId: string | null;
   currentGoal: string | null;
@@ -516,7 +516,7 @@ export function rankWorkSessions(
     .slice(0, limit);
 }
 
-export function hasHintMatch(candidate: RankedWorkSession | undefined): boolean {
+function hasHintMatch(candidate: RankedWorkSession | undefined): boolean {
   return Boolean(
     candidate?.matchReasons.some(
       (reason) => reason === "full-hint-match" || reason.startsWith("hint-token-match:"),
@@ -540,7 +540,7 @@ export function chooseResumeCandidate(candidates: RankedWorkSession[]): {
   return { selected: first, ambiguous: false, reason: "confident-hint-match" };
 }
 
-export interface AhaMoment {
+interface AhaMoment {
   label: "✦ Aha moment!";
   kind: "known-fix" | "work-session";
   hint: string;
@@ -549,7 +549,7 @@ export interface AhaMoment {
   caveat: "historical-memory-not-current-state";
 }
 
-export function historicalWorkSessionHint(context: WorkContext): string | null {
+function historicalWorkSessionHint(context: WorkContext): string | null {
   const candidate =
     context.taskState.decisions.at(-1)?.summary ??
     context.taskState.lastProgressSummary ??
@@ -607,14 +607,14 @@ export async function buildAhaMoments(
     .slice(0, 3);
 }
 
-export interface ResumeFileState extends RecentWorkFile {
+interface ResumeFileState extends RecentWorkFile {
   validated: boolean;
   currentHash: string | null;
   exists: boolean | null;
   stale: boolean | null;
 }
 
-export interface ResumeActiveSlice {
+interface ResumeActiveSlice {
   path: string;
   start: number;
   end: number;
@@ -626,7 +626,7 @@ export interface ResumeActiveSlice {
   truncated: boolean;
 }
 
-export interface ResumeSnapshot {
+interface ResumeSnapshot {
   validationScope: "active" | "recent";
   validatedRecentFileCount: number;
   activeArtifact: string | null;
@@ -642,9 +642,9 @@ export interface ResumeSnapshot {
   lastActivityAt: number;
 }
 
-export const RESUME_HASH_CONCURRENCY = 4;
+const RESUME_HASH_CONCURRENCY = 4;
 
-export async function mapWithConcurrency<T, R>(
+async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
   mapper: (item: T, index: number) => Promise<R>,
@@ -780,7 +780,7 @@ export async function buildResumeSnapshot(
   };
 }
 
-export function makeEmptyTaskState(now = Date.now()): TaskState {
+function makeEmptyTaskState(now = Date.now()): TaskState {
   return {
     goalId: null,
     loopId: null,
@@ -801,7 +801,7 @@ export function cleanTaskText(value: string, maxLength: number): string | null {
   return cleaned.length > 0 ? cleaned : null;
 }
 
-export function mergeUniqueTaskItems(existing: string[], additions: string[], maxItems = 50): string[] {
+function mergeUniqueTaskItems(existing: string[], additions: string[], maxItems = 50): string[] {
   const merged: string[] = [];
   const seen = new Set<string>();
   for (const raw of [...existing, ...additions]) {
@@ -1077,7 +1077,7 @@ export async function resolveExecutionProject(
  * names (C:\Users\RUNNER~1) and long names refer to the same folder, and
  * drive-letter case differs between sources; canonicalize before comparing.
  */
-export function sameLocalRoot(a: string, b: string): boolean {
+function sameLocalRoot(a: string, b: string): boolean {
   const canonical = (value: string): string => {
     const resolved = path.resolve(value);
     try {
@@ -1092,7 +1092,7 @@ export function sameLocalRoot(a: string, b: string): boolean {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
-export function assertSelectedExecutionTarget(entry: ProjectRegistryEntry, lease: Lease): void {
+function assertSelectedExecutionTarget(entry: ProjectRegistryEntry, lease: Lease): void {
   const saved = lease.leaseId.match(/:target:([a-f0-9]{64})$/u)?.[1];
   const actual = ExecutionTargetSchema.parse(entry.executionTarget);
   const matches = saved ? `target:${saved}` === targetApprovalIdentity(actual)
@@ -1107,7 +1107,7 @@ export function bindExecutionLease(lease: Lease, entry: ProjectRegistryEntry): L
     leaseId: `${lease.leaseId.replace(/:target:[a-f0-9]{64}$/u, "")}:${targetApprovalIdentity(target)}` };
 }
 
-export function hasReconnectableWorkContext(session: SessionState, projectId: string): boolean {
+function hasReconnectableWorkContext(session: SessionState, projectId: string): boolean {
   const contexts = [
     session.workContexts[projectId],
     ...Object.values(session.workSessions[projectId] ?? {}),
@@ -1122,7 +1122,7 @@ export function hasReconnectableWorkContext(session: SessionState, projectId: st
   });
 }
 
-export async function recoverRemoteReconnectLease(ctx: ToolContext, projectId: string): Promise<boolean> {
+async function recoverRemoteReconnectLease(ctx: ToolContext, projectId: string): Promise<boolean> {
   if (!ctx.remote) return false;
   const snapshot = await loadSession(ctx);
   const expired = snapshot.lease;
@@ -1181,7 +1181,7 @@ export function leaseTtlMs(ctx: ToolContext): number {
 }
 
 /** Extend a lease that is in active use; see slideLease for the policy. */
-export async function slideActiveLease(ctx: ToolContext, projectId: string, lease: Lease): Promise<Lease> {
+async function slideActiveLease(ctx: ToolContext, projectId: string, lease: Lease): Promise<Lease> {
   const ttlMs = leaseTtlMs(ctx);
   if (!slideLease(lease, ttlMs)) return lease;
   let result = lease;
@@ -1239,7 +1239,7 @@ export function remotePayload(entry: ProjectRegistryEntry, payload: Record<strin
   };
 }
 
-export function remotePathApi(root: string): typeof path.win32 | typeof path.posix {
+function remotePathApi(root: string): typeof path.win32 | typeof path.posix {
   return /^[A-Za-z]:[\\/]/u.test(root) ? path.win32 : path.posix;
 }
 
@@ -1282,7 +1282,7 @@ export function parseRemoteJsonOutput<T>(stdoutSummary: string, label: string): 
  * git/exec error that happens to echo secret material from local state
  * rather than from the model's own input) reaches both the permanent ledger
  * `error` field and the untrusted-model-facing tool result unredacted. */
-export function mapError(err: unknown): ToolResult<{
+function mapError(err: unknown): ToolResult<{
   error: string;
   code: string;
   details?: unknown;
@@ -1392,16 +1392,16 @@ export const CONTROL_ANNOTATIONS = {
   openWorldHint: false,
 } as const;
 
-export const CHATGPT_SAFETY_HIDDEN_TOOL_NAMES = new Set(["code_context_pack"]);
+const CHATGPT_SAFETY_HIDDEN_TOOL_NAMES = new Set(["code_context_pack"]);
 
 export const JK_SECURITY_SCHEMES = [{ type: "oauth2", scopes: ["chatgpt2codex"] }] as const;
-export const EMPTY_OBJECT_JSON_SCHEMA = {
+const EMPTY_OBJECT_JSON_SCHEMA = {
   type: "object",
   properties: {},
   "$schema": "http://json-schema.org/draft-07/schema#",
 } as const;
 
-export interface RegisteredToolLike {
+interface RegisteredToolLike {
   title?: string;
   description?: string;
   inputSchema?: unknown;
@@ -1423,7 +1423,7 @@ export function chatGptToolMeta(invoking: string, invoked: string, extra?: Recor
   };
 }
 
-export function schemaToJsonSchema(schema: unknown, pipeStrategy: "input" | "output"): Record<string, unknown> {
+function schemaToJsonSchema(schema: unknown, pipeStrategy: "input" | "output"): Record<string, unknown> {
   const obj = normalizeObjectSchema(schema as never);
   return obj
     ? (toJsonSchemaCompat(obj, { strictUnions: true, pipeStrategy }) as Record<string, unknown>)
@@ -1479,7 +1479,7 @@ export function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): v
  * wire shape expected by `registerTool` callbacks (plain object + index
  * signature, rather than our narrower interface type).
  */
-export function toCallToolResult(toolName: string, result: ToolResult<Record<string, unknown>>): CallToolResultLike {
+function toCallToolResult(toolName: string, result: ToolResult<Record<string, unknown>>): CallToolResultLike {
   return {
     content: result.content,
     structuredContent: addToolCallProof(result.structuredContent, toolName, result.isError !== true),
@@ -1488,7 +1488,7 @@ export function toCallToolResult(toolName: string, result: ToolResult<Record<str
   };
 }
 
-export async function attachCompactActiveRoleContext<T extends Record<string, unknown>>(
+async function attachCompactActiveRoleContext<T extends Record<string, unknown>>(
   ctx: ToolContext,
   input: unknown,
   result: ToolResult<T>,
@@ -1529,7 +1529,7 @@ export async function attachCompactActiveRoleContext<T extends Record<string, un
   }
 }
 
-export function continuationProjectId(input: unknown, session: SessionState): string | null {
+function continuationProjectId(input: unknown, session: SessionState): string | null {
   if (input && typeof input === "object") {
     const candidate = (input as { projectId?: unknown }).projectId;
     if (typeof candidate === "string" && candidate.trim()) return candidate;
@@ -1537,7 +1537,7 @@ export function continuationProjectId(input: unknown, session: SessionState): st
   return session.activeProjectId ?? null;
 }
 
-export function isDeliverableContinuation(continuation: TaskContinuation | null | undefined): continuation is TaskContinuation {
+function isDeliverableContinuation(continuation: TaskContinuation | null | undefined): continuation is TaskContinuation {
   return Boolean(
     continuation &&
       !continuation.deliveredAt &&
@@ -1545,7 +1545,7 @@ export function isDeliverableContinuation(continuation: TaskContinuation | null 
   );
 }
 
-export function continuationStatusForJob(
+function continuationStatusForJob(
   job: Awaited<ReturnType<typeof readLocalShellJob>>,
   now = Date.now(),
 ): TaskContinuation["status"] | null {
@@ -1719,7 +1719,7 @@ export async function takeTaskContinuationNotice(
   return notice;
 }
 
-export async function attachTaskContinuationNotice<T extends Record<string, unknown>>(
+async function attachTaskContinuationNotice<T extends Record<string, unknown>>(
   ctx: ToolContext,
   input: unknown,
   result: ToolResult<T>,
@@ -1759,7 +1759,7 @@ export async function attachTaskContinuationNotice<T extends Record<string, unkn
   };
 }
 
-export function continuationExposureFromInput(input: unknown): "full" | "compact" {
+function continuationExposureFromInput(input: unknown): "full" | "compact" {
   if (!input || typeof input !== "object") return "compact";
   return (input as { continuationDetail?: unknown }).continuationDetail === "full" ? "full" : "compact";
 }
@@ -1879,7 +1879,7 @@ export async function withErrorMapping<T extends Record<string, unknown>>(
 }
 
 /** Best-effort redaction of tool input before it lands in the ledger. */
-export function redactUnknown(input: unknown): unknown {
+function redactUnknown(input: unknown): unknown {
   try {
     const json = JSON.stringify(input);
     return JSON.parse(redact(json));
@@ -1896,7 +1896,7 @@ export function redactUnknown(input: unknown): unknown {
 // capability table without importing this module (avoiding a cycle).
 
 /** Whether a destination is confined to canonical or legacy project images. */
-export function isWithinImagesDir(destRel: string | undefined): boolean {
+function isWithinImagesDir(destRel: string | undefined): boolean {
   return !destRel || isProjectImagePath(destRel);
 }
 
@@ -1910,17 +1910,17 @@ export function loopIdFor(goal: string): string {
   return `loop-${Date.now()}-${digest}`;
 }
 
-export type NativeOrchestrationPhase = "discover" | "plan" | "patch" | "verify" | "review" | "recovery" | "release";
-export type NativeVerificationStatus = "unknown" | "pass" | "fail" | "blocked";
-export type NativeReviewVerdict = "missing" | "approve" | "reject";
-export type WorkflowStage = "explorer" | "oracle" | "implementer" | "reviewer" | "verifier" | "recovery";
+type NativeOrchestrationPhase = "discover" | "plan" | "patch" | "verify" | "review" | "recovery" | "release";
+type NativeVerificationStatus = "unknown" | "pass" | "fail" | "blocked";
+type NativeReviewVerdict = "missing" | "approve" | "reject";
+type WorkflowStage = "explorer" | "oracle" | "implementer" | "reviewer" | "verifier" | "recovery";
 export type NativeExecutionProfile = "auto" | "fast" | "max";
 export type NativeCoordinationMode = "standard" | "dispatcher";
-export const GOAL_LOOP_TELEMETRY_MAX_BYTES = 5 * 1024 * 1024;
-export const GOAL_LOOP_TELEMETRY_KEEP_RECORDS = 5000;
-export const GOAL_LOOP_TELEMETRY_REPORT_WINDOW = 200;
+const GOAL_LOOP_TELEMETRY_MAX_BYTES = 5 * 1024 * 1024;
+const GOAL_LOOP_TELEMETRY_KEEP_RECORDS = 5000;
+const GOAL_LOOP_TELEMETRY_REPORT_WINDOW = 200;
 
-export type GoalLoopTelemetryRecord = {
+type GoalLoopTelemetryRecord = {
   schemaVersion: 1;
   at: string;
   coordinationMode: NativeCoordinationMode;
@@ -1932,7 +1932,7 @@ export type GoalLoopTelemetryRecord = {
   lifecycle: string;
 };
 
-export function summarizeGoalLoopTelemetry(records: GoalLoopTelemetryRecord[]) {
+function summarizeGoalLoopTelemetry(records: GoalLoopTelemetryRecord[]) {
   const summarize = (mode: NativeCoordinationMode) => {
     const rows = records.filter((record) => record.coordinationMode === mode);
     const samples = rows.length;
@@ -1966,9 +1966,9 @@ export function summarizeGoalLoopTelemetry(records: GoalLoopTelemetryRecord[]) {
     },
   };
 }
-export type GoalLoopTelemetrySummary = ReturnType<typeof summarizeGoalLoopTelemetry>;
+type GoalLoopTelemetrySummary = ReturnType<typeof summarizeGoalLoopTelemetry>;
 
-export function telemetrySuggestsStandardForBorderlineDispatcher(summary?: GoalLoopTelemetrySummary): boolean {
+function telemetrySuggestsStandardForBorderlineDispatcher(summary?: GoalLoopTelemetrySummary): boolean {
   if (!summary || summary.standard.samples < 20 || summary.dispatcher.samples < 20) return false;
   const standardFailure = summary.standard.failureRate ?? 0;
   const dispatcherFailure = summary.dispatcher.failureRate ?? 0;
@@ -2043,7 +2043,7 @@ export async function recordGoalLoopTelemetry(input: {
   }
 }
 
-export type NativeFanoutCandidate = {
+type NativeFanoutCandidate = {
   id: string;
   task: string;
   estimatedWeight?: number;
@@ -2054,18 +2054,18 @@ export type NativeFanoutCandidate = {
   latencyBound?: boolean;
 };
 
-export function normalizeFanoutScope(value: string): string {
+function normalizeFanoutScope(value: string): string {
   return value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").toLowerCase();
 }
 
-export function fanoutScopesOverlap(left: string, right: string): boolean {
+function fanoutScopesOverlap(left: string, right: string): boolean {
   const a = normalizeFanoutScope(left);
   const b = normalizeFanoutScope(right);
   if (!a || !b) return false;
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-export function inferExecutionProfile(input: {
+function inferExecutionProfile(input: {
   requested?: NativeExecutionProfile;
   complexity: "low" | "medium" | "high";
   mode: "implement" | "research" | "debug" | "review" | "plan";
@@ -2116,7 +2116,7 @@ export function inferExecutionProfile(input: {
   };
 }
 
-export function inferTaskComplexity(input: {
+function inferTaskComplexity(input: {
   text: string;
   pendingCount: number;
   mode: "implement" | "research" | "debug" | "review" | "plan";
@@ -2160,7 +2160,7 @@ export function inferCoordinationMode(input: {
   return "standard";
 }
 
-export function buildLegacyMassUlwDecision(input: {
+function buildLegacyMassUlwDecision(input: {
   complexity: "low" | "medium" | "high";
   mode: "implement" | "research" | "debug" | "review" | "plan";
   pendingCount: number;
@@ -2290,7 +2290,7 @@ export function buildLegacyMassUlwDecision(input: {
   };
 }
 
-export function buildMassUlwDecision(input: {
+function buildMassUlwDecision(input: {
   complexity: "low" | "medium" | "high";
   mode: "implement" | "research" | "debug" | "review" | "plan";
   pendingCount: number;
@@ -2451,7 +2451,7 @@ export function buildNativeOrchestration(input: {
   };
 }
 
-export const E2E_SCRIPT_CANDIDATES = [
+const E2E_SCRIPT_CANDIDATES = [
   "test:e2e",
   "e2e",
   "e2e:test",
@@ -2463,12 +2463,12 @@ export const E2E_SCRIPT_CANDIDATES = [
   "test",
 ] as const;
 
-export const BUILD_SCRIPT_CANDIDATES = ["build", "typecheck", "lint"] as const;
-export const DEV_SCRIPT_CANDIDATES = ["dev", "start", "serve", "preview"] as const;
+const BUILD_SCRIPT_CANDIDATES = ["build", "typecheck", "lint"] as const;
+const DEV_SCRIPT_CANDIDATES = ["dev", "start", "serve", "preview"] as const;
 
-export type E2eTargetKind = "web" | "desktop-app" | "generic";
+type E2eTargetKind = "web" | "desktop-app" | "generic";
 
-export interface E2eAutomation {
+interface E2eAutomation {
   command?: string;
   commandSource: string;
   devCommand?: string;
@@ -2497,7 +2497,7 @@ export interface E2eAutomation {
  */
 export const E2E_SCREENSHOT_WIDGET_URI = "ui://widget/e2e-screenshots.html";
 export const E2E_SCREENSHOT_WIDGET_MIME = "text/html+skybridge";
-export const E2E_SCREENSHOT_META_KEY = "chatgpt2codex/screenshots";
+const E2E_SCREENSHOT_META_KEY = "chatgpt2codex/screenshots";
 export const E2E_WIDGET_TOOL_META = { "openai/outputTemplate": E2E_SCREENSHOT_WIDGET_URI } as const;
 
 export const E2E_SCREENSHOT_WIDGET_HTML = `<!doctype html>
@@ -2611,7 +2611,7 @@ export async function attachE2eInlineShareSet<T extends { path: string }>(
   return Promise.all(shots.map((shot, index) => attachE2eInlineShare(ctx, shot, `E2E screenshot ${index + 1}`)));
 }
 
-export interface E2eDeliverableShot {
+interface E2eDeliverableShot {
   path: string;
   inlineUrl?: string;
   inlineExpiresAt?: string;
@@ -2642,9 +2642,9 @@ export async function materializeRemoteE2eScreenshot(
   return { ...remote, path: localPath, remotePath: remote.path };
 }
 
-export const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
 
-export async function e2eScreenshotPayload(shots: E2eDeliverableShot[]): Promise<{
+async function e2eScreenshotPayload(shots: E2eDeliverableShot[]): Promise<{
   images: Array<{ type: "image"; data: string; mimeType: "image/png" | "image/jpeg" }>;
   widgetShots: Array<Record<string, unknown>>;
 }> {
@@ -2692,7 +2692,7 @@ export async function withE2eImageContent<T extends Record<string, unknown>>(
   return next;
 }
 
-export async function getFreeLocalPort(): Promise<number> {
+async function getFreeLocalPort(): Promise<number> {
   const server = createNetServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -2720,7 +2720,7 @@ export function isLocalHttpUrl(value: string | undefined): value is string {
   return typeof value === "string" && /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(value);
 }
 
-export async function readPackageScripts(root: string, cwd?: string): Promise<{ scripts: Record<string, string>; source: string; commandCwd: string }> {
+async function readPackageScripts(root: string, cwd?: string): Promise<{ scripts: Record<string, string>; source: string; commandCwd: string }> {
   const baseRoot = await fs.realpath(root);
   const commandCwd = cwd ? await resolveInProject(baseRoot, cwd, { allowSymlink: false }) : baseRoot;
   const packageJsonPath = path.join(commandCwd, "package.json");
@@ -2733,7 +2733,7 @@ export async function readPackageScripts(root: string, cwd?: string): Promise<{ 
   return { scripts: parsed.scripts ?? {}, source: "package.json", commandCwd };
 }
 
-export async function detectTauriProject(commandCwd: string, scripts: Record<string, string>): Promise<{ appName?: string; devUrl?: string } | undefined> {
+async function detectTauriProject(commandCwd: string, scripts: Record<string, string>): Promise<{ appName?: string; devUrl?: string } | undefined> {
   const tauriConfigPath = path.join(commandCwd, "src-tauri", "tauri.conf.json");
   const hasTauriScript = typeof scripts.tauri === "string";
   let parsed:

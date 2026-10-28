@@ -189,6 +189,38 @@ describe("readTaskExecutionView", () => {
     expect(view.primaryStage).toBe("reviewer");
   });
 
+  it("projects a planned MASS ULW DAG before an execution document exists", async () => {
+    const dir = await stateDir();
+    const plan = buildMassUlwPlan({
+      executionProfile: "max",
+      candidates: [
+        { id: "inspect", task: "Inspect runtime", estimatedWeight: 2, readScopes: ["src/runtime"] },
+        { id: "patch", task: "Patch UI", estimatedWeight: 3, writeScopes: ["src/ui"], dependsOn: ["inspect"] },
+        { id: "verify", task: "Verify result", estimatedWeight: 2, readScopes: ["src/ui"], dependsOn: ["patch"] },
+      ],
+    });
+    await writeJson(dir, "loop-1.loop.json", {
+      mode: "implement",
+      turns: [{ orchestration: { phase: "plan", primaryStage: "oracle", massUlw: plan } }],
+    });
+
+    const view = await readTaskExecutionView(dir, snapshot({ updatedAt: 345 }));
+
+    expect(view.massUlw).toMatchObject({
+      source: "plan",
+      planState: plan.state,
+      recommended: plan.recommended,
+      createdAt: 345,
+      updatedAt: 345,
+      verification: "not-started",
+    });
+    expect(view.massUlw?.lanes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "inspect", status: "planned", dependsOn: [], wave: 0 }),
+      expect.objectContaining({ id: "patch", status: "planned", dependsOn: ["inspect"], wave: 1 }),
+      expect.objectContaining({ id: "verify", status: "planned", dependsOn: ["patch"], wave: 2 }),
+    ]));
+  });
+
   it("exposes persisted MASS ULW execution status", async () => {
     const dir = await stateDir();
     const candidate = (id: string, extra: Partial<MassUlwCandidate> = {}): MassUlwCandidate => ({
@@ -224,6 +256,7 @@ describe("readTaskExecutionView", () => {
     const view = await readTaskExecutionView(dir, snapshot());
 
     expect(view.massUlw).toMatchObject({
+      source: "execution",
       createdAt: 200,
       updatedAt: 200,
       currentWave: 0,

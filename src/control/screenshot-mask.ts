@@ -11,12 +11,12 @@ import { isSensitiveApp } from "./policy.js";
  * password-field frame) so screenshot delivery always goes through one
  * chokepoint even before that masking logic exists.
  */
-export interface MaskInput {
+interface MaskInput {
   pngPath: string;
   appName?: string;
 }
 
-export interface MaskResult {
+interface MaskResult {
   pngPath: string;
   masked: boolean;
 }

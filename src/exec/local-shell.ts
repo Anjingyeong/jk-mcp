@@ -196,7 +196,7 @@ const CURL_SAFE_FLAGS = new Set([
 
 const CURL_SAFE_VALUE_FLAGS = new Set(["--max-time", "--connect-timeout"]);
 
-export interface ReadOnlyNetworkApprovalScope {
+interface ReadOnlyNetworkApprovalScope {
   key: string;
   label: string;
   ttlMs: number;
@@ -449,6 +449,12 @@ function executesJkReloadScript(command: string): boolean {
     if ((executable === "bash" || executable === "sh") && tokens[1]) {
       return executableName(tokens[1]) === "reload-jk-runtime.sh" && !tokens.slice(2).includes("--check");
     }
+    if (["powershell", "powershell.exe", "pwsh", "pwsh.exe"].includes(executable)) {
+      const fileIndex = tokens.findIndex((token) => token.toLowerCase() === "-file");
+      const script = fileIndex >= 0 ? tokens[fileIndex + 1] : undefined;
+      return Boolean(script) && executableName(script!) === "reload-jk-runtime.ps1"
+        && !tokens.slice(fileIndex + 2).some((token) => token.toLowerCase() === "--check");
+    }
     return false;
   });
 }
@@ -622,7 +628,7 @@ function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
   };
 }
 
-export interface ShellCommandRisk {
+interface ShellCommandRisk {
   needsNetwork: boolean;
   destructive: boolean;
 }

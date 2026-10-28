@@ -13,14 +13,16 @@
  * `control` but are listed solely by their own opt-in gate
  * (CHATGPT2CODEX_CONTROL_CHATGPT / control lease), independent of profiles.
  * Tools not assigned to any profile are treated as `core` so a newly added
- * tool is never silently hidden. Public (jk-mcp) builds use
- * PUBLIC_DEFAULT_TOOL_PROFILES, which omits `impulse`.
+ * tool is never silently hidden. Optional image helpers are opt-in by default
+ * because they add a large amount of tools/list context to every coding turn.
+ * Public (jk-mcp) builds use PUBLIC_DEFAULT_TOOL_PROFILES, which also omits
+ * `impulse`.
  */
 
 import { isPublicDistribution } from "../distribution.js";
 
-export const TOOL_PROFILE_NAMES = ["core", "e2e", "image", "release", "control", "web", "impulse", "legacy", "debug"] as const;
-export type ToolProfileName = (typeof TOOL_PROFILE_NAMES)[number];
+const TOOL_PROFILE_NAMES = ["core", "e2e", "image", "release", "control", "web", "impulse", "legacy", "debug"] as const;
+type ToolProfileName = (typeof TOOL_PROFILE_NAMES)[number];
 
 const PROFILE_TOOLS: Record<Exclude<ToolProfileName, "core">, readonly string[]> = {
   e2e: [
@@ -63,13 +65,13 @@ const PROFILE_TOOLS: Record<Exclude<ToolProfileName, "core">, readonly string[]>
   debug: ["impulse_event_record", "impulse_scout_run"],
 };
 
-export const DEFAULT_TOOL_PROFILES: readonly ToolProfileName[] = ["core", "e2e", "image", "release", "control", "impulse"];
+export const DEFAULT_TOOL_PROFILES: readonly ToolProfileName[] = ["core", "e2e", "release", "control", "impulse"];
 /** Defaults for public (jk-mcp) builds: Impulse is opt-in via +impulse. */
-export const PUBLIC_DEFAULT_TOOL_PROFILES: readonly ToolProfileName[] = DEFAULT_TOOL_PROFILES.filter(
+const PUBLIC_DEFAULT_TOOL_PROFILES: readonly ToolProfileName[] = DEFAULT_TOOL_PROFILES.filter(
   (profile) => profile !== "impulse",
 );
 
-export function defaultToolProfiles(env: NodeJS.ProcessEnv = process.env): readonly ToolProfileName[] {
+function defaultToolProfiles(env: NodeJS.ProcessEnv = process.env): readonly ToolProfileName[] {
   return isPublicDistribution(env) ? PUBLIC_DEFAULT_TOOL_PROFILES : DEFAULT_TOOL_PROFILES;
 }
 

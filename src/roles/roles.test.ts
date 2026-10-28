@@ -167,6 +167,18 @@ describe("role persistence and active project selection", () => {
 
     await autoSelectRoleForTask(ctx, "alpha", { mode: "implement", goal: "기능 구현하고 QA까지 진행" });
     expect((await buildActiveRoleContext(ctx, "alpha", "full-write")).role.id).toBe("builder");
+
+    await autoSelectRoleForTask(ctx, "alpha", {
+      mode: "implement",
+      goal: "Mercenary Arena UI 고도화: 61종 에셋 제작, HTML 시안 반영, PC 모바일 QA",
+    });
+    expect((await buildActiveRoleContext(ctx, "alpha", "full-write")).role.id).toBe("builder");
+
+    await autoSelectRoleForTask(ctx, "alpha", {
+      mode: "implement",
+      goal: "디자인 에셋 제작, PC/모바일 QA",
+    });
+    expect((await buildActiveRoleContext(ctx, "alpha", "full-write")).role.id).toBe("builder");
   });
 
   it("exports/imports custom roles and cleans selections when deleting one", async () => {

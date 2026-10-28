@@ -29,7 +29,7 @@ export interface LocalShellTaskBundleRecord {
   expiresAt: number;
 }
 
-export interface LocalShellTaskBundleGrant {
+interface LocalShellTaskBundleGrant {
   approvalId: string;
   bundleFingerprint: string;
   workSessionId: string | null;
@@ -46,6 +46,7 @@ interface TaskBundleIdentity {
 
 interface ConsumeTaskBundleInput extends TaskBundleIdentity {
   commandKey: string;
+  compatibleCommandKeys?: string[];
   expected?: { approvalId: string; bundleFingerprint: string; approvalCreatedAt: number };
 }
 
@@ -196,6 +197,7 @@ export async function consumeLocalShellTaskBundle(
   input: ConsumeTaskBundleInput,
 ): Promise<LocalShellTaskBundleGrant | null> {
   const id = localShellTaskBundleId(input);
+  const compatibleCommandKeys = new Set([input.commandKey, ...(input.compatibleCommandKeys ?? [])]);
   // Keep the record visible while another command waits. Moving it away to
   // claim it made parallel consumers mistake lock contention for no approval.
   return withTaskBundleLock(stateDir, id, async () => {
@@ -204,7 +206,7 @@ export async function consumeLocalShellTaskBundle(
       if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
       const record = await readTaskBundle(stateDir, file.slice(0, -5));
       if (!record || localShellTaskBundleId(record) !== id || record.expiresAt <= Date.now()
-        || !record.remainingCommandKeys.includes(input.commandKey)) continue;
+        || !record.remainingCommandKeys.some((key) => compatibleCommandKeys.has(key))) continue;
       const expected = input.expected;
       if (expected && (record.approvalId !== expected.approvalId
         || record.bundleFingerprint !== expected.bundleFingerprint
@@ -213,7 +215,7 @@ export async function consumeLocalShellTaskBundle(
     }
     const record = candidates.sort((a, b) => a.expiresAt - b.expiresAt || a.createdAt - b.createdAt || a.id.localeCompare(b.id))[0];
     if (!record) return null;
-    const commandIndex = record.remainingCommandKeys.indexOf(input.commandKey);
+    const commandIndex = record.remainingCommandKeys.findIndex((key) => compatibleCommandKeys.has(key));
     const remainingCommandKeys = record.remainingCommandKeys.toSpliced(commandIndex, 1);
     await writeTaskBundle(stateDir, { ...record, remainingCommandKeys });
     return {

@@ -197,6 +197,22 @@ describe("JK Control Center", () => {
     expect(runView.execution).toMatchObject({ projectId: null, goal: null, task: null, massUlw: null });
   });
 
+  it("serves a pinned Control Center project even when it is not the active execution project", async () => {
+    await app!.stop();
+    const ctx = makeCtx(stateDir, projectRoot);
+    const session = await ctx.store.getSession();
+    session.activeProjectId = null;
+    await ctx.store.setSession(session);
+    app = await startApp(ctx);
+
+    const activeView = await (await fetch(`${app.baseUrl}/api/jk/control/execution`)).json() as any;
+    expect(activeView.execution).toMatchObject({ projectId: null, goal: null, task: null });
+
+    const pinnedView = await (await fetch(`${app.baseUrl}/api/jk/control/execution?projectId=proj`)).json() as any;
+    expect(pinnedView.viewProjectId).toBe("proj");
+    expect(pinnedView.execution).toMatchObject({ projectId: "proj", goal: "Finish dashboard", task: "QA" });
+  });
+
   it("keeps core HTTP health available when the optional management surface is headless", async () => {
     await app!.stop();
     app = await startApp(makeCtx(stateDir, projectRoot), false);

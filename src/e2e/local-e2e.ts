@@ -10,7 +10,7 @@ import { buildSafeChildEnv } from "../exec/command-runner.js";
 import { guardShellCommand } from "../exec/local-shell.js";
 import { CdpWebSocketClient } from "./cdp-websocket.js";
 
-export interface E2eScreenshotResult {
+interface E2eScreenshotResult {
   path: string;
   bytes: number;
   opened: boolean;
@@ -487,7 +487,7 @@ export async function openE2eTarget(input: { url?: string; appName?: string; app
   throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Provide url, appName, or appPath");
 }
 
-export interface E2eScreenshotPreview {
+interface E2eScreenshotPreview {
   path: string;
   bytes: number;
   mimeType: "image/jpeg";
@@ -1160,6 +1160,6 @@ export async function captureE2eAppScreenshotSet(
   return shots;
 }
 
-export function summarizeE2eError(error: unknown): string {
+function summarizeE2eError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));
 }

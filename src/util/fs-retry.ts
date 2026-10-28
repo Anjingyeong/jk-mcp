@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
  */
 const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
-export interface RenameRetryOptions {
+interface RenameRetryOptions {
   /** Total attempts including the first. Default 8 (~1.3s worst case). */
   attempts?: number;
   /** Base backoff in ms; grows linearly per attempt. Default 10ms. */

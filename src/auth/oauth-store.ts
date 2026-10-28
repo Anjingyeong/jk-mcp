@@ -30,21 +30,21 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const OAUTH_FILE = "oauth.json";
 
-export interface PersistedAccessTokenRecord {
+interface PersistedAccessTokenRecord {
   clientId: string;
   scopes: string[];
   expiresAt: number; // epoch seconds
   resource?: string;
 }
 
-export interface PersistedRefreshTokenRecord {
+interface PersistedRefreshTokenRecord {
   clientId: string;
   scopes: string[];
   expiresAt: number; // epoch seconds
   resource?: string;
 }
 
-export interface PersistedTokenPair {
+interface PersistedTokenPair {
   accessTokenHash: string;
   accessToken: PersistedAccessTokenRecord;
   refreshTokenHash: string;
@@ -99,6 +99,19 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
     return false;
   }
   if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
+  // Claude's cloud connector uses one fixed HTTPS callback. Keep this narrower
+  // than the legacy ChatGPT host allowlist to avoid redirecting codes to
+  // arbitrary paths, ports, or downgraded endpoints on the new hostnames.
+  if (parsed.hostname === "claude.ai" || parsed.hostname === "claude.com") {
+    return allowedHosts.includes(parsed.hostname)
+      && parsed.protocol === "https:"
+      && parsed.port === ""
+      && parsed.pathname === "/api/mcp/auth_callback"
+      && parsed.search === ""
+      && parsed.hash === ""
+      && parsed.username === ""
+      && parsed.password === "";
+  }
   return allowedHosts.includes(parsed.hostname);
 }
 

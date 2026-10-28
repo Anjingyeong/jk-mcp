@@ -11,9 +11,9 @@ const execFileAsync: ExecFileLike = async (file, args, options) => {
 
 export const CHATGPT_IMAGES_APP_URL = "https://chatgpt.com/images/";
 
-export type ImagesAppBrowser = "default" | "chrome";
+type ImagesAppBrowser = "default" | "chrome";
 
-export interface PrepareChatGptImagesAppInput {
+interface PrepareChatGptImagesAppInput {
   prompt?: string;
   browser?: ImagesAppBrowser;
   pastePrompt?: boolean;
@@ -21,7 +21,7 @@ export interface PrepareChatGptImagesAppInput {
   confirmSubmit?: boolean;
 }
 
-export interface PrepareChatGptImagesAppResult {
+interface PrepareChatGptImagesAppResult {
   openedUrl: string;
   browser: ImagesAppBrowser;
   promptCopied: boolean;
@@ -36,7 +36,7 @@ export type ExecFileLike = (
   options?: { timeout?: number; env?: NodeJS.ProcessEnv },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-export interface PrepareChatGptImagesAppOptions {
+interface PrepareChatGptImagesAppOptions {
   execFileImpl?: ExecFileLike;
   sleepMs?: (ms: number) => Promise<void>;
 }

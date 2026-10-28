@@ -8,18 +8,115 @@ import { classifyReadOnlyNetworkApprovalScope, inspectShellCommand, runLocalShel
 import { consumeLocalShellApprovalGrant, hasActiveTaskNetworkApproval, localShellApprovalId, requestLocalShellApproval, taskApprovalIdentity } from "../../policy/local-approvals.js";
 import { isAutonomousCloudInventoryRead, isSafeTaskFollowupNetworkRead } from "../../exec/local-shell.js";
 import { isTrustedOwnerRoutineNetworkCommand } from "../../exec/local-shell.js";
-import { findReusableLocalShellJob, localShellRunnerInstanceId, queueLocalShellJob, restartStableTargetApprovalIdentity, targetApprovalIdentity, readLocalShellJob, updateLocalShellJob, type LocalShellJobCompletionProof } from "../../policy/local-shell-jobs.js";
+import { findReusableLocalShellJob, findRunningRuntimeUpgradeJob, localShellJobFingerprint, localShellRunnerInstanceId, queueLocalShellJob, restartStableTargetApprovalIdentity, targetApprovalIdentity, readLocalShellJob, updateLocalShellJob, type LocalShellJobCompletionProof, type LocalShellJobRecord } from "../../policy/local-shell-jobs.js";
+import { withLocalShellExactApprovalLock } from "../../policy/local-approval-bundles.js";
 import { isJkMaintenanceCommand } from "../../exec/local-shell.js";
 import { runOmo } from "../../exec/omo-runner.js";
 import { getRuntimeSchemaHealth } from "../runtime-schema-health.js";
 import { redact } from "../../policy/secrets.js";
 import { dispatchExecutorJob, listExecutorStatus } from "../../executors/broker.js";
-import { createHash } from "node:crypto";
+import { gitRepositoryStatus, type GitRepositoryStatus } from "../../git/git.js";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { approvalPlanContains, buildTaskSafetyGate, inferCommandExecutionKind, makeDefaultTaskSafety, mergeTaskSafety, strongerExecutionKind } from "../task-safety.js";
 import { isReleaseShellCommand, loadSession, type WorkContextSlice, waitForExecutorReconnectCompletion, WorkSessionIdSchema, getWorkContext, recordTaskContinuation, recordVerification, requireProjectLease, resolveOrThrow, localExecutionRoot, isRemoteProject, remotePayload, READ_ONLY_ANNOTATIONS, COMMAND_RUN_ANNOTATIONS, chatGptToolMeta, withErrorMapping } from "./shared.js";
 import type { RegisterTool } from "./register.js";
+
+export const RUNTIME_MANIFEST_PREFLIGHT_MAX_LINES = 10_000;
+
+export function jkRepoCleanAligned(status: Partial<GitRepositoryStatus> | null | undefined): boolean {
+  return Boolean(status &&
+    (status.dirtyFiles?.length ?? 0) === 0 &&
+    (status.staged?.length ?? 0) === 0 &&
+    status.upstream &&
+    status.ahead === 0 &&
+    status.behind === 0);
+}
+
+export function jkReleaseCommit(status: Partial<GitRepositoryStatus> | null | undefined): string | null {
+  if (!status?.headCommit || !/^[a-f0-9]{40}$/u.test(status.headCommit)) return null;
+  if (!jkRepoCleanAligned(status) || status.syncState !== "up-to-date") return null;
+  return status.headCommit;
+}
+
+export function gitRefLineHashMatchesCommit(commit: string, lineHashes: string[] | undefined): boolean {
+  if (!/^[a-f0-9]{40}$/u.test(commit) || !lineHashes?.[0]) return false;
+  return lineHashes[0] === createHash("sha256").update(commit).digest("hex");
+}
+
+function unnumberedFirstLine(content: string): string {
+  return (content.split(/\r?\n/u)[0] ?? "").replace(/^\d+\t/u, "").trim();
+}
+
+function jkReleaseScope(commit: string) {
+  return {
+    key: `maintenance:jk:release:${commit}`,
+    label: "JK release runtime maintenance (OCI + registered Windows executor)",
+    ttlMs: 15 * 60 * 1000,
+  };
+}
+
+function reusedRuntimeUpgradeResult(job: LocalShellJobRecord) {
+  if (job.status === "pending") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This JK runtime upgrade is already waiting for owner approval in the authoritative JK Control Center; reuse the existing job.", {
+      approvalId: job.approvalId ?? job.id, jobId: job.id, expiresAt: job.expiresAt, approvalReused: "existing-job",
+    });
+  }
+  if (job.status === "running") {
+    return makeResult({ jobId: job.id, status: job.status, reusedJob: true }, "The approved JK runtime upgrade is already running.");
+  }
+  if (job.status === "succeeded") {
+    return makeResult({
+      jobId: job.id, exitCode: job.exitCode ?? 0, stdoutSummary: job.stdoutSummary ?? "",
+      stderrSummary: job.stderrSummary ?? "", durationMs: job.durationMs ?? 0, reusedJob: true,
+    }, "Reused the completed JK runtime upgrade job result.");
+  }
+  throw new DomainError(ErrorCode.COMMAND_FAILED, "The previous JK runtime upgrade job failed. Inspect that job result instead of requesting another approval.", {
+    jobId: job.id, exitCode: job.exitCode ?? null, stdoutSummary: job.stdoutSummary ?? "",
+    stderrSummary: job.stderrSummary ?? "", error: job.error ?? null,
+  });
+}
+
+const RuntimeUpgradeManifestSchema = z.object({
+  sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+  buildFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+});
+
+export function runtimeUpgradeManifestFingerprint(content: string, lineHashes?: string[]): string {
+  const lines = content.replace(/\r?\n$/u, "").split(/\r?\n/u);
+  const unnumberedLines = lines.map((line) => line.replace(/^\d+\t/u, ""));
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(unnumberedLines.join("\n"));
+  } catch {
+    // A redacted remote slice may still be structurally useful below.
+  }
+  const manifest = RuntimeUpgradeManifestSchema.safeParse(parsed);
+  if (manifest.success) {
+    return createHash("sha256")
+      .update(JSON.stringify([manifest.data.sourceFingerprint, manifest.data.buildFingerprint]))
+      .digest("hex");
+  }
+
+  // Remote Windows slices redact fingerprint values before they reach the
+  // hub, but preserve per-line hashes of the original bytes. Hash only the
+  // two fingerprint lines so generatedAt changes do not create a new job.
+  if (lineHashes?.length === lines.length) {
+    const sourceIndex = unnumberedLines.findIndex((line) => /"sourceFingerprint"\s*:/u.test(line));
+    const buildIndex = unnumberedLines.findIndex((line) => /"buildFingerprint"\s*:/u.test(line));
+    const sourceLineHash = sourceIndex >= 0 ? lineHashes[sourceIndex] : undefined;
+    const buildLineHash = buildIndex >= 0 ? lineHashes[buildIndex] : undefined;
+    if (sourceLineHash && buildLineHash && /^[a-f0-9]{64}$/u.test(sourceLineHash) && /^[a-f0-9]{64}$/u.test(buildLineHash)) {
+      return createHash("sha256")
+        .update(JSON.stringify([sourceLineHash, buildLineHash]))
+        .digest("hex");
+    }
+  }
+
+  RuntimeUpgradeManifestSchema.parse(parsed);
+  throw new Error("unreachable");
+}
 
 export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContext): void {
   // -------------------------------------------------------------------
@@ -358,7 +455,15 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
                   return { command, needsNetwork: approvalNeedsNetwork, destructive: approvalDestructive };
                 }
                 const risk = inspectShellCommand(command);
-                return { command, needsNetwork: risk.needsNetwork, destructive: risk.destructive };
+                // Follow-up bundle commands inherit the current approval risk
+                // as a conservative ceiling. Consumption may later use the
+                // exact same command at a lower risk without another prompt,
+                // but never at a higher risk than the owner approved.
+                return {
+                  command,
+                  needsNetwork: approvalNeedsNetwork || risk.needsNetwork,
+                  destructive: risk.destructive,
+                };
               }),
             }
           : undefined;
@@ -765,7 +870,14 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
         let command: string;
         let runtimeManifestFingerprint = "";
         let completionProof: LocalShellJobCompletionProof | null = null;
+        let releaseCommit: string | null = null;
+        let releaseScopeProjectId = input.projectId;
         if (isRemoteProject(entry)) {
+          command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root . -ExecutorOnly";
+          const runningUpgrade = await findRunningRuntimeUpgradeJob(ctx.stateDir, {
+            projectId: input.projectId, executionTarget: ExecutionTargetSchema.parse(entry.executionTarget), command,
+          });
+          if (runningUpgrade) return reusedRuntimeUpgradeResult(runningUpgrade);
           const executor = (await listExecutorStatus(ctx.stateDir)).find((candidate) => candidate.executorId === entry.executorId);
           if (!executor?.online) {
             throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `Executor is offline: ${entry.executorId}`, { executorId: entry.executorId });
@@ -785,7 +897,54 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
             timeoutMs: 60_000,
             requiredCapabilities: ["git_sync_start"],
           };
-          command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root . -ExecutorOnly";
+          const remoteRepoStatus = (executor.capabilities ?? []).includes("repo_status")
+            ? await dispatchExecutorJob<GitRepositoryStatus>(
+                ctx.stateDir,
+                entry.executorId,
+                "repo_status",
+                remotePayload(entry, {}),
+                10_000,
+              ).catch(() => null)
+            : null;
+          releaseCommit = jkReleaseCommit(remoteRepoStatus);
+          releaseScopeProjectId = ExecutionTargetSchema.parse(entry.executionTarget).sourceProjectId;
+          if (!releaseCommit && jkRepoCleanAligned(remoteRepoStatus)) {
+            try {
+              const sourceEntry = await resolveOrThrow(ctx, { projectId: releaseScopeProjectId });
+              if (!isRemoteProject(sourceEntry)) {
+                const sourceCommit = jkReleaseCommit(await gitRepositoryStatus(sourceEntry.root));
+                if (sourceCommit) {
+                  const headSlice = await dispatchExecutorJob<WorkContextSlice>(
+                    ctx.stateDir,
+                    entry.executorId,
+                    "file_read_slice",
+                    remotePayload(entry, { path: ".git/HEAD", start: 1, end: 2 }),
+                    10_000,
+                  );
+                  const headLine = unnumberedFirstLine(headSlice.content);
+                  if (/^[a-f0-9]{40}$/u.test(headLine)) {
+                    if (gitRefLineHashMatchesCommit(sourceCommit, headSlice.lineHashes)) releaseCommit = sourceCommit;
+                  } else {
+                    const match = /^ref:\s+(refs\/heads\/[A-Za-z0-9._/-]+)$/u.exec(headLine);
+                    const refPath = match?.[1];
+                    if (refPath && !refPath.includes("..")) {
+                      const refSlice = await dispatchExecutorJob<WorkContextSlice>(
+                        ctx.stateDir,
+                        entry.executorId,
+                        "file_read_slice",
+                        remotePayload(entry, { path: ".git/" + refPath, start: 1, end: 2 }),
+                        10_000,
+                      ).catch(() => null);
+                      if (refSlice && gitRefLineHashMatchesCommit(sourceCommit, refSlice.lineHashes)) releaseCommit = sourceCommit;
+                    }
+                  }
+                }
+              }
+            } catch {
+              // Old-executor proof is opportunistic. Any uncertainty falls
+              // back to the existing target-specific owner approval.
+            }
+          }
 
           // A repeated runtime_upgrade call may arrive while the already-approved
           // worker is executing the reload or reconnecting. Reuse that exact
@@ -820,7 +979,7 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
               replayJob.needsNetwork === false && replayJob.destructive === true && replayJob.writesWorkspace === false &&
               replayJob.completionProof?.kind === "executor-reconnect" && replayJob.completionProof.executorId === entry.executorId
             ) {
-              if (replayJob.status === "pending") {
+              if (replayJob.status === "pending" && replayJob.expiresAt > Date.now()) {
                 throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This JK runtime upgrade is already waiting for owner approval in the authoritative JK Control Center; reuse the existing job.", {
                   approvalId: replayJob.id,
                   jobId: replayJob.id,
@@ -838,7 +997,7 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
               ctx.stateDir,
               entry.executorId,
               "file_read_slice",
-              remotePayload(entry, { path: rel, start: 1, end: rel === "dist/runtime-schema-manifest.json" ? 200 : 1 }),
+              remotePayload(entry, { path: rel, start: 1, end: rel === "dist/runtime-schema-manifest.json" ? RUNTIME_MANIFEST_PREFLIGHT_MAX_LINES : 1 }),
             ).catch(() => {
               throw new DomainError(
                 ErrorCode.COMMAND_NOT_ALLOWED,
@@ -846,7 +1005,9 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
                 { projectId: input.projectId, executorId: entry.executorId, unverified: rel },
               );
             });
-            if (rel === "dist/runtime-schema-manifest.json") runtimeManifestFingerprint = slice.fileHash;
+            if (rel === "dist/runtime-schema-manifest.json") {
+              runtimeManifestFingerprint = runtimeUpgradeManifestFingerprint(slice.content, slice.lineHashes);
+            }
           }
         } else {
           const windowsScript = path.join(entry.root, "scripts", "reload-jk-runtime.ps1");
@@ -860,7 +1021,8 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
           await fs.access(script).catch(() => {
             throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "The fixed JK runtime reload script is missing", { script });
           });
-          runtimeManifestFingerprint = createHash("sha256").update(await fs.readFile(runtimeManifest)).digest("hex");
+          runtimeManifestFingerprint = runtimeUpgradeManifestFingerprint(await fs.readFile(runtimeManifest, "utf8"));
+          releaseCommit = jkReleaseCommit(await gitRepositoryStatus(entry.root));
           command = process.platform === "win32"
             ? "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root ."
             : "bash scripts/reload-jk-runtime.sh";
@@ -899,45 +1061,30 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
           destructive: true,
           writesWorkspace: false,
           manifestFingerprint: runtimeManifestFingerprint,
+          releaseCommit: releaseCommit ?? undefined,
           completionProof,
         };
         const reusable = await findReusableLocalShellJob(ctx.stateDir, jobInput);
-        if (reusable) {
-          if (reusable.status === "pending") {
-            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This JK runtime upgrade is already waiting for owner approval in the authoritative JK Control Center; reuse the existing job.", {
-              approvalId: reusable.id,
-              jobId: reusable.id,
-              expiresAt: reusable.expiresAt,
-              approvalReused: "existing-job",
-            });
-          }
-          if (reusable.status === "running") {
-            return makeResult({ jobId: reusable.id, status: reusable.status, reusedJob: true }, "The approved JK runtime upgrade is already running.");
-          }
-          if (reusable.status === "succeeded") {
-            return makeResult({
-              jobId: reusable.id,
-              exitCode: reusable.exitCode ?? 0,
-              stdoutSummary: reusable.stdoutSummary ?? "",
-              stderrSummary: reusable.stderrSummary ?? "",
-              durationMs: reusable.durationMs ?? 0,
-              reusedJob: true,
-            }, "Reused the completed JK runtime upgrade job result.");
-          }
-          throw new DomainError(ErrorCode.COMMAND_FAILED, "The previous JK runtime upgrade job failed. Inspect that job result instead of requesting another approval.", {
-            jobId: reusable.id,
-            exitCode: reusable.exitCode ?? null,
-            stdoutSummary: reusable.stdoutSummary ?? "",
-            stderrSummary: reusable.stderrSummary ?? "",
-            error: reusable.error ?? null,
-          });
-        }
-        const maintenanceScope = {
+        if (reusable) return reusedRuntimeUpgradeResult(reusable);
+        const targetMaintenanceScope = {
           key: `maintenance:jk:runtime-reload:${restartStableTargetApprovalIdentity(ExecutionTargetSchema.parse(entry.executionTarget))}:${runtimeManifestFingerprint}`,
           label: "JK runtime maintenance",
           ttlMs: 15 * 60 * 1000,
         };
-        const scopedGrant = await consumeLocalShellApprovalGrant(ctx.stateDir, {
+        const releaseMaintenanceScope = releaseCommit ? jkReleaseScope(releaseCommit) : null;
+        const sharedReleaseGrant = isRemoteProject(entry) && releaseMaintenanceScope
+          ? await consumeLocalShellApprovalGrant(ctx.stateDir, {
+              projectId: releaseScopeProjectId,
+              command,
+              needsNetwork: false,
+              destructive: true,
+              scope: releaseMaintenanceScope,
+            })
+          : null;
+        const maintenanceScope = !isRemoteProject(entry) && releaseMaintenanceScope
+          ? releaseMaintenanceScope
+          : targetMaintenanceScope;
+        const scopedGrant = sharedReleaseGrant ?? await consumeLocalShellApprovalGrant(ctx.stateDir, {
           projectId: input.projectId,
           command,
           needsNetwork: false,
@@ -945,8 +1092,44 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
           scope: maintenanceScope,
         });
         if (scopedGrant?.source === "scope") {
-          const result = isRemoteProject(entry)
-            ? await dispatchExecutorJob<Awaited<ReturnType<typeof runLocalShell>>>(
+          // Serialize only lookup + durable running publication. Release the
+          // lock before reload/reconnect so concurrent calls can return running.
+          const claimed = await withLocalShellExactApprovalLock(ctx.stateDir, `runtime-${localShellJobFingerprint(jobInput)}`, async () => {
+            const existing = await findReusableLocalShellJob(ctx.stateDir, jobInput);
+            if (existing) return { job: existing, started: false };
+            if (scopedGrant.expiresAt <= Date.now()) {
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "JK runtime maintenance scope expired before execution; request fresh owner approval.");
+            }
+            const queued = await queueLocalShellJob(ctx.stateDir, {
+              id: createHash("sha256").update(randomUUID()).digest("hex"),
+              projectId: input.projectId,
+              createdAt: scopedGrant.createdAt,
+              expiresAt: scopedGrant.expiresAt,
+            }, {
+              ...jobInput, approvalId: scopedGrant.scopeId, timeoutSec: 120, continuation,
+            });
+            const running = await updateLocalShellJob(ctx.stateDir, queued.id, (current) => ({
+              ...current, status: "running", runnerInstanceId: localShellRunnerInstanceId(),
+              interruptedByRestart: false, startedAt: Date.now(),
+            }));
+            if (!running) throw new DomainError(ErrorCode.APPROVAL_RESUME_FAILED, "Scoped runtime upgrade job disappeared before execution");
+            return { job: running, started: true };
+          });
+          if (!claimed.started) return reusedRuntimeUpgradeResult(claimed.job);
+          const job = claimed.job;
+          const recordContinuation = async (status: "running" | "ready-to-resume" | "blocked") => {
+            if (!job.continuation) return;
+            const currentTask = getWorkContext(await loadSession(ctx), input.projectId, job.continuation.workSessionId ?? undefined)?.taskState;
+            if (currentTask?.goalId !== job.continuation.goalId || currentTask?.loopId !== job.continuation.loopId) return;
+            await recordTaskContinuation(ctx, input.projectId, job.continuation.workSessionId ?? undefined, {
+              jobId: job.id, status, updatedAt: Date.now(),
+            });
+          };
+          let result: Awaited<ReturnType<typeof runLocalShell>> | undefined;
+          try {
+            await recordContinuation("running");
+            result = isRemoteProject(entry)
+              ? await dispatchExecutorJob<Awaited<ReturnType<typeof runLocalShell>>>(
                 ctx.stateDir,
                 entry.executorId,
                 "local_shell_run",
@@ -958,29 +1141,48 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
                 }),
                 130_000,
               )
-            : await runLocalShell(await localExecutionRoot(ctx, entry), command, undefined, 120, { needsNetwork: false, destructive: true });
-          if (result.exitCode !== 0) {
-            throw new DomainError(ErrorCode.COMMAND_FAILED, "Scoped JK runtime upgrade failed", {
-              exitCode: result.exitCode,
-              stdoutSummary: redact(result.stdoutSummary),
-              stderrSummary: redact(result.stderrSummary),
-            });
+              : await runLocalShell(await localExecutionRoot(ctx, entry), command, undefined, 120, { needsNetwork: false, destructive: true });
+            if (result.exitCode !== 0) {
+              throw new DomainError(ErrorCode.COMMAND_FAILED, "Scoped JK runtime upgrade failed", {
+                jobId: job.id, exitCode: result.exitCode,
+                stdoutSummary: redact(result.stdoutSummary), stderrSummary: redact(result.stderrSummary),
+              });
+            }
+            await waitForExecutorReconnectCompletion(ctx, completionProof);
+          } catch (error) {
+            await updateLocalShellJob(ctx.stateDir, job.id, (current) => ({
+              ...current, status: "failed", finishedAt: Date.now(),
+              exitCode: result?.exitCode, stdoutSummary: result ? redact(result.stdoutSummary) : undefined,
+              stderrSummary: result ? redact(result.stderrSummary) : undefined, durationMs: result?.durationMs,
+              error: redact(error instanceof Error ? error.message : "Scoped JK runtime upgrade failed"),
+            }));
+            await recordContinuation("blocked");
+            throw error;
           }
-          await waitForExecutorReconnectCompletion(ctx, completionProof);
+          await updateLocalShellJob(ctx.stateDir, job.id, (current) => ({
+            ...current, status: "succeeded", finishedAt: Date.now(), exitCode: result.exitCode,
+            stdoutSummary: redact(result.stdoutSummary), stderrSummary: redact(result.stderrSummary), durationMs: result.durationMs,
+          }));
+          await recordContinuation("ready-to-resume");
           return makeResult({
+            jobId: job.id,
             exitCode: result.exitCode,
             stdoutSummary: result.stdoutSummary,
             stderrSummary: result.stderrSummary,
             durationMs: result.durationMs,
             approvalReused: "maintenance-scope",
-            scopeKey: maintenanceScope.key,
-          }, "Reused the bounded JK runtime maintenance approval scope.");
+            scopeKey: sharedReleaseGrant?.source === "scope" ? releaseMaintenanceScope?.key : maintenanceScope.key,
+          }, sharedReleaseGrant?.source === "scope"
+            ? "Reused the approved JK Release scope from the clean source commit."
+            : "Reused the bounded JK runtime maintenance approval scope.");
         }
         const approvalInput = {
           projectId: input.projectId,
           command,
           cwd: undefined,
-          reason: jobInput.reason,
+          reason: !isRemoteProject(entry) && releaseMaintenanceScope
+            ? "Authorize JK Release runtime maintenance for this clean commit on OCI and its registered Windows executor"
+            : jobInput.reason,
           taskIdentity,
           workSessionId: approvalWorkSessionId,
           needsNetwork: false,
@@ -1002,6 +1204,7 @@ export function registerCommandTools(registerTool: RegisterTool, ctx: ToolContex
           timeoutSec: 120,
           writesWorkspace: false,
           manifestFingerprint: jobInput.manifestFingerprint,
+          releaseCommit: jobInput.releaseCommit,
           continuation,
           completionProof,
         });

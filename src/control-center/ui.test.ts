@@ -114,16 +114,33 @@ describe("Control Center dashboard links and mobile layout", () => {
     expect(CONTROL_CENTER_HTML).toContain('Computer Control');
   });
 
-  it("renders core dashboard data before deferred approval and log signals", () => {
-    expect(CONTROL_CENTER_HTML).toContain("const [projects, status, execution, goals] = await Promise.all([");
+  it("renders immediately and hydrates core dashboard data independently before deferred signals", () => {
+    expect(CONTROL_CENTER_HTML).toContain("if (!state.status && state.projects.length === 0) render();");
+    expect(CONTROL_CENTER_HTML).toContain("const applyProjects = api('/api/jk/projects').then(projects => {");
+    expect(CONTROL_CENTER_HTML).toContain("const applyStatus = api('/api/jk/control/status').then(status => {");
+    expect(CONTROL_CENTER_HTML).toContain("const applyExecution = api(executionApiPath()).then(execution => {");
+    expect(CONTROL_CENTER_HTML).toContain("const applyGoals = api('/api/jk/control/goals').then(goals => {");
+    expect(CONTROL_CENTER_HTML).toContain("await Promise.allSettled([applyProjects, applyStatus, applyExecution, applyGoals]);");
+    expect(CONTROL_CENTER_HTML).toContain("loadProjectContextDeferred(state.selectedProjectId);");
     expect(CONTROL_CENTER_HTML).toContain("async function loadSecondarySignals()");
     expect(CONTROL_CENTER_HTML).toContain("setTimeout(() => { void loadSecondarySignals(); }, 0);");
     const coreLoad = CONTROL_CENTER_HTML.slice(
       CONTROL_CENTER_HTML.indexOf("async function loadAll"),
       CONTROL_CENTER_HTML.indexOf("function updateChrome"),
     );
+    expect(coreLoad).not.toContain("await loadProjectContext(");
     expect(coreLoad).not.toContain("api('/api/jk/control/approvals')");
     expect(coreLoad).not.toContain("api('/api/jk/control/logs?limit=80')");
+  });
+
+  it("keeps the viewed project separate from the globally active JK execution project", () => {
+    expect(CONTROL_CENTER_HTML).toContain("const projectViewStorageKey = 'jk.controlCenter.viewProjectId'");
+    expect(CONTROL_CENTER_HTML).toContain("localStorage.getItem(projectViewStorageKey)");
+    expect(CONTROL_CENTER_HTML).toContain("localStorage.setItem(projectViewStorageKey, state.selectedProjectId)");
+    expect(CONTROL_CENTER_HTML).toContain("const executionApiPath = () => '/api/jk/control/execution' + (state.selectedProjectId ? '?projectId='");
+    expect(CONTROL_CENTER_HTML).toContain("const nextExecution = await api(executionApiPath());");
+    expect(CONTROL_CENTER_HTML).toContain("const viewedProjectId = state.selectedProjectId;");
+    expect(CONTROL_CENTER_HTML).toContain("const activeProject = state.projects.find(p => p.projectId === state.selectedProjectId);");
   });
 
   it("visualizes MASS ULW lanes, dependencies, elapsed time, blockers, and recent events", () => {
@@ -138,6 +155,8 @@ describe("Control Center dashboard links and mobile layout", () => {
     expect(CONTROL_CENTER_HTML).toContain('data-run-started-at=');
     expect(CONTROL_CENTER_HTML).toContain("RECENT EVENTS");
     expect(CONTROL_CENTER_HTML).toContain("병렬 작업 ");
+    expect(CONTROL_CENTER_HTML).toContain("PARALLEL PLAN");
+    expect(CONTROL_CENTER_HTML).toContain("실행 전 계획 DAG");
     expect(CONTROL_CENTER_HTML).toContain(".run-event { grid-template-columns: 1fr auto; }");
     expect(CONTROL_CENTER_HTML).toContain(".run-dag-scroll { margin-inline:");
   });

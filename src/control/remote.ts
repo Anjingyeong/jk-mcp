@@ -3,7 +3,7 @@ import { ExecutionTargetSchema } from "../executors/target-protocol.js";
 import type { ProjectRegistryEntry, ToolContext } from "../types.js";
 import type { ControlActionRecord } from "./queue.js";
 
-export interface RemoteComputerScreenshotResult {
+interface RemoteComputerScreenshotResult {
   path: string;
   bytes: number;
   imageBase64: string;
@@ -11,7 +11,7 @@ export interface RemoteComputerScreenshotResult {
   frontmostProcess: string;
 }
 
-export interface RemoteComputerActionResult {
+interface RemoteComputerActionResult {
   ok: true;
   frontmostProcess: string;
   point?: { x: number; y: number };

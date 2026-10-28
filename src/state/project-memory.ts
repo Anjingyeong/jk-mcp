@@ -72,8 +72,8 @@ const MemoryFileSchema = z.object({
 
 type ContextPackEntry = z.infer<typeof ContextPackEntrySchema>;
 type ResultCacheEntry = z.infer<typeof ResultCacheEntrySchema>;
-export type KnownFix = z.infer<typeof KnownFixSchema>;
-export type ProjectFeedback = z.infer<typeof ProjectFeedbackSchema>;
+type KnownFix = z.infer<typeof KnownFixSchema>;
+type ProjectFeedback = z.infer<typeof ProjectFeedbackSchema>;
 type MemoryFile = z.infer<typeof MemoryFileSchema>;
 
 const writeQueues = new Map<string, Promise<void>>();
@@ -117,8 +117,8 @@ export async function fingerprintFiles(root: string, files: string[]): Promise<s
       continue;
     }
     try {
-      const info = await stat(abs);
-      parts.push(`${rel}:${info.size}:${Math.trunc(info.mtimeMs)}`);
+      const bytes = await readFile(abs);
+      parts.push(`${rel}:${bytes.length}:${createHash("sha256").update(bytes).digest("hex")}`);
     } catch {
       parts.push(`${rel}:missing`);
     }

@@ -12,10 +12,10 @@ const FETCH_TIMEOUT_MS = 10_000;
 const MAX_REDIRECTS = 4;
 const AUDIT_USER_AGENT = "Mozilla/5.0 (compatible; JK-SEO-GEO-Audit/0.1)";
 
-export type SeoGeoArea = "seo" | "crawlability" | "structuredData" | "geoCitability";
-export type SeoGeoSeverity = "high" | "medium" | "low" | "info";
+type SeoGeoArea = "seo" | "crawlability" | "structuredData" | "geoCitability";
+type SeoGeoSeverity = "high" | "medium" | "low" | "info";
 
-export interface SeoGeoIssue {
+interface SeoGeoIssue {
   severity: SeoGeoSeverity;
   area: SeoGeoArea;
   check: string;
@@ -40,7 +40,7 @@ export interface SeoGeoAuditResources {
   llmsTxt: SeoGeoResourceProbe;
 }
 
-export interface SeoGeoAuditResult {
+interface SeoGeoAuditResult {
   url: string;
   finalUrl: string;
   fetchedAt: string;
@@ -83,7 +83,7 @@ export interface SeoGeoAuditResult {
   caveat: string;
 }
 
-export interface SeoGeoAuditOptions {
+interface SeoGeoAuditOptions {
   fetchImpl?: FetchLike;
   lookupImpl?: LookupFn;
   maxBytes?: number;

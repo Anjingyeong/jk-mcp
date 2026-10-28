@@ -63,7 +63,7 @@ export interface ExecutorHeartbeat extends RuntimeIdentity {
   startedAtMs?: number;
 }
 
-export interface ExecutorStatus extends StoredExecutor {
+interface ExecutorStatus extends StoredExecutor {
   lastSeenAtMs: number;
   online: boolean;
   compatible: boolean;
@@ -509,7 +509,7 @@ export interface PreparedExecutorJobDelivery {
   readonly job: ExecutorJob;
   readonly claim: JobDeliveryClaim;
 }
-export interface ExecutorJobDeliveryLink {
+interface ExecutorJobDeliveryLink {
   approvedJobId: string;
   brokerJobId: string;
   bindingDigest: string;

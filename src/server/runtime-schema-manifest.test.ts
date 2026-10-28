@@ -17,6 +17,7 @@ const modules = [
   "orchestration/mass-ulw-lock", "executors/target-protocol", "executors/broker",
   "executors/worker", "executors/windows-bootstrap", "executors/http", "control-center/http", "policy/local-shell-jobs",
   "server/tool-profiles",
+  "orchestration/impulse-director", "orchestration/impulse-scout", "state/agent-bridge-store", "state/project-memory",
   ...["shared", "register", "workspace", "guide", "goal", "image", "project", "code",
     "file", "command", "mass-ulw", "e2e", "git", "checkpoint", "control", "impulse"].map((name) => `server/tools/${name}`),
 ];
@@ -55,7 +56,24 @@ describe("runtime manifest generator", () => {
     const manifest = await disk.generate();
     expect(manifest.sourceFiles).toEqual(expect.arrayContaining(["src/policy/local-approvals.ts", "src/policy/approvals.ts"]));
     expect(manifest.buildFiles).toEqual(expect.arrayContaining(["policy/local-approvals.js", "policy/approvals.js"]));
+    expect(manifest.sourceFiles).toEqual(expect.arrayContaining([
+      "src/orchestration/impulse-director.ts", "src/orchestration/impulse-scout.ts",
+      "src/state/agent-bridge-store.ts", "src/state/project-memory.ts",
+    ]));
+    expect(manifest.buildFiles).toEqual(expect.arrayContaining([
+      "orchestration/impulse-director.js", "orchestration/impulse-scout.js",
+      "state/agent-bridge-store.js", "state/project-memory.js",
+    ]));
     expect(manifest.requiredGoalLoopInputFields).toEqual(["safety", "executionProfile", "fanoutCandidates", "reviewVerdict"]);
+  });
+
+  it("fingerprints runtime modules outside the old fixed manifest list", async () => {
+    const disk = await fixture();
+    const before = await disk.generate();
+    await appendFile(path.join(disk.root, "src/orchestration/impulse-director.ts"), "// changed director bytes\n");
+    const after = await disk.generate();
+    expect(after.sourceFingerprint).not.toBe(before.sourceFingerprint);
+    expect(after.buildFingerprint).toBe(before.buildFingerprint);
   });
 
   it.each(["src/policy/local-approvals.ts", "dist/policy/local-approvals.js", "src/policy/approvals.ts", "dist/policy/approvals.js"])(

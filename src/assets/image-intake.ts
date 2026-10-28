@@ -19,7 +19,7 @@ const MAX_LOCAL_IMAGE_BYTES = 50 * 1024 * 1024;
 const DEFAULT_IMAGE_DIR = path.join(".jk", "images");
 const DOWNLOAD_IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif)$/i;
 
-export interface IntakeResult {
+interface IntakeResult {
   filePath: string;
   sha256: string;
   bytes: number;
@@ -268,7 +268,7 @@ export async function intakeFromPath(
 // doctor() support
 // ---------------------------------------------------------------------------
 
-export interface IntakeAvailability {
+interface IntakeAvailability {
   pngpasteAvailable: boolean;
   downloadsDirExists: boolean;
 }

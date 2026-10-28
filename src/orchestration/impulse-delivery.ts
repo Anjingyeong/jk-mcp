@@ -27,7 +27,7 @@ import {
  * affects pending, nextActions for approved tasks, lifecycle, or terminal checks.
  */
 
-export const DELIVERY_FILE = "impulse_delivery.json";
+const DELIVERY_FILE = "impulse_delivery.json";
 const MAX_LOOPS = 200;
 const MAX_IDS_PER_KIND = 1000;
 const MAX_LISTED = 3;
@@ -57,7 +57,7 @@ function parseDelivery(raw: string): DeliveryFile {
   }
 }
 
-export interface ImpulseDelta {
+interface ImpulseDelta {
   /** Newly surfaced, still-undecided proposals (compact; details via impulse_wake_queue proposalId). */
   newProposals?: CompactProposal[];
   moreNewProposals?: number;
@@ -70,7 +70,7 @@ export interface ImpulseDelta {
   open: { tasks: number } & Record<WakePriority, number>;
 }
 
-export interface PreparedImpulseDelta {
+interface PreparedImpulseDelta {
   delta: ImpulseDelta | null;
   newUndecidedP0: number;
   /** Persist that this delta was delivered. Call only after the response is built. */

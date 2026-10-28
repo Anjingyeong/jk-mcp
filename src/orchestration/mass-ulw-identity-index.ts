@@ -14,8 +14,8 @@ const MassUlwIdentityIndexSchema = z.object({
   executionId: z.string().regex(/^mass-[a-f0-9]{64}$/u),
 }).strict();
 
-export type MassUlwIdentityIndex = z.infer<typeof MassUlwIdentityIndexSchema>;
-export type MassUlwIdentitySelector = Pick<MassUlwIdentityIndex, "projectId" | "externalLoopId">;
+type MassUlwIdentityIndex = z.infer<typeof MassUlwIdentityIndexSchema>;
+type MassUlwIdentitySelector = Pick<MassUlwIdentityIndex, "projectId" | "externalLoopId">;
 
 function indexRoot(stateDir: string): string {
   return path.join(stateDir, "orchestration", "mass-ulw-index");

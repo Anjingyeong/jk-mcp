@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { DomainError, ErrorCode } from "../types.js";
+import { isJkMaintenanceCommand } from "../exec/local-shell.js";
 import { sendJkPush } from "../notifications/ntfy.js";
 import {
   consumeLocalShellTaskBundle,
@@ -63,7 +64,7 @@ export interface LocalShellApprovalScope {
   ttlMs?: number;
 }
 
-export interface LocalShellApprovalBundleEntry {
+interface LocalShellApprovalBundleEntry {
   command: string;
   needsNetwork: boolean;
   destructive: boolean;
@@ -194,6 +195,7 @@ export function localShellApprovalId(input: LocalShellApprovalInput): string {
         workSessionId: input.workSessionId?.trim() || null,
         needsNetwork: input.needsNetwork,
         destructive: input.destructive,
+        scopeKey: reusableScopeAllowed(input) ? input.scope.key : null,
       }),
     )
     .digest("hex");
@@ -218,7 +220,7 @@ function reusableScopeAllowed(
 ): input is LocalShellApprovalInput & { scope: LocalShellApprovalScope } {
   if (!input.scope) return false;
   if (!input.destructive && input.needsNetwork) return true;
-  return input.destructive && input.scope.key.startsWith("maintenance:jk:");
+  return input.destructive && input.scope.key.startsWith("maintenance:jk:") && isJkMaintenanceCommand(input.command);
 }
 
 function normalizedTaskReason(reason: string | undefined | null): string | null {
@@ -253,6 +255,17 @@ function commandGrantKey(input: Pick<LocalShellApprovalInput, "command" | "needs
   return createHash("sha256")
     .update(JSON.stringify({ command: input.command, needsNetwork: input.needsNetwork, destructive: input.destructive }))
     .digest("hex");
+}
+
+function compatibleCommandGrantKeys(
+  input: Pick<LocalShellApprovalInput, "command" | "needsNetwork" | "destructive">,
+): string[] {
+  // A network-approved grant may satisfy the exact same command when a later
+  // detector under-classifies it as local-only. Destructive authority remains
+  // exact: never widen or downgrade that boundary through bundle reuse.
+  const networkValues = input.needsNetwork ? [true] : [false, true];
+  return networkValues.map((needsNetwork) =>
+    commandGrantKey({ command: input.command, needsNetwork, destructive: input.destructive }));
 }
 
 const supervisedRecordSchema = z.object({
@@ -308,11 +321,13 @@ export function taskApprovalIdentity(input: {
   leaseId?: string | null;
 }): string | undefined {
   const workSessionId = input.workSessionId?.trim() || null;
-  const leaseId = input.leaseId?.trim() || null;
   if (input.goalId?.trim()) return `goal:${input.goalId.trim()}${workSessionId ? `:work-session:${workSessionId}` : ""}`;
   if (input.loopId?.trim()) return `loop:${input.loopId.trim()}${workSessionId ? `:work-session:${workSessionId}` : ""}`;
   if (workSessionId) return `work-session:${workSessionId}`;
-  return leaseId ? `lease:${leaseId}` : undefined;
+  // Project leases are renewable capability tokens, not durable task owners.
+  // Binding approval identity to a lease makes the same approved job look new
+  // after project_select rotates or renews the lease.
+  return undefined;
 }
 
 export async function hasActiveTaskNetworkApproval(
@@ -364,16 +379,16 @@ async function writeScopeRecord(stateDir: string, record: LocalShellApprovalScop
   await fs.rename(temp, target);
 }
 
-async function hasActiveScope(stateDir: string, input: LocalShellApprovalInput): Promise<boolean> {
-  if (!reusableScopeAllowed(input)) return false;
+async function readActiveScope(stateDir: string, input: LocalShellApprovalInput): Promise<LocalShellApprovalScopeRecord | null> {
+  if (!reusableScopeAllowed(input)) return null;
   const id = scopeId({ projectId: input.projectId, cwd: input.cwd, scope: input.scope });
   const record = await readScopeRecord(stateDir, id);
-  if (!record) return false;
+  if (!record) return null;
   if (!Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) {
     await fs.unlink(scopeRecordPath(stateDir, id)).catch(() => undefined);
-    return false;
+    return null;
   }
-  return record.projectId === input.projectId && record.scopeKey === input.scope.key && record.cwd === (input.cwd ?? null);
+  return record.projectId === input.projectId && record.scopeKey === input.scope.key && record.cwd === (input.cwd ?? null) ? record : null;
 }
 
 const approvalRecordSchema = z.object({
@@ -470,7 +485,7 @@ async function requestLocked(stateDir: string, input: LocalShellApprovalInput): 
   if (current) await archiveExpiredApprovalRecord(stateDir, current);
 
   if (taskKey) {
-    const commandKey = commandGrantKey(input);
+    const commandKeys = compatibleCommandGrantKeys(input);
     const pending = await listPendingLocalShellApprovals(stateDir);
     const bundled = pending.find((record) => (
       record.projectId === input.projectId &&
@@ -478,7 +493,7 @@ async function requestLocked(stateDir: string, input: LocalShellApprovalInput): 
       supervisedTaskKey(record) === taskKey &&
       (record.workSessionId ?? null) === workSessionId &&
       (!bundleFingerprint || record.bundleFingerprint === bundleFingerprint) &&
-      Boolean(record.bundleCommandKeys?.includes(commandKey))
+      Boolean(record.bundleCommandKeys?.some((key) => commandKeys.includes(key)))
     ));
     if (bundled) return bundled;
   }
@@ -523,7 +538,7 @@ async function requestLocked(stateDir: string, input: LocalShellApprovalInput): 
   return record;
 }
 
-export type LocalShellApprovalGrant =
+type LocalShellApprovalGrant =
   | {
       source: "exact" | "task-bundle";
       approvalId: string;
@@ -532,7 +547,8 @@ export type LocalShellApprovalGrant =
       createdAt: number;
       expiresAt: number;
     }
-  | { source: "supervised" | "scope" };
+  | { source: "supervised" }
+  | { source: "scope"; scopeId: string; createdAt: number; expiresAt: number };
 
 export async function consumeLocalShellApprovalGrant(
   stateDir: string,
@@ -563,6 +579,7 @@ async function consumeLocked(stateDir: string, input: LocalShellApprovalInput): 
           taskKey,
           workSessionId: input.workSessionId?.trim() || null,
           commandKey: commandGrantKey(input),
+          compatibleCommandKeys: compatibleCommandGrantKeys(input),
           expected: { approvalId: record.id, bundleFingerprint: record.bundleFingerprint, approvalCreatedAt: record.createdAt },
         });
         return grant ? { source: "exact", ...grant } : null;
@@ -591,11 +608,13 @@ async function consumeLocked(stateDir: string, input: LocalShellApprovalInput): 
       taskKey,
       workSessionId: input.workSessionId?.trim() || null,
       commandKey: commandGrantKey(input),
+      compatibleCommandKeys: compatibleCommandGrantKeys(input),
     });
     if (bundleGrant) return { source: "task-bundle", ...bundleGrant };
   }
   if (await hasActiveSupervisedGrant(stateDir, input)) return { source: "supervised" };
-  if (await hasActiveScope(stateDir, input)) return { source: "scope" };
+  const scope = await readActiveScope(stateDir, input);
+  if (scope) return { source: "scope", scopeId: scope.id, createdAt: scope.createdAt, expiresAt: scope.expiresAt };
   return null;
 }
 

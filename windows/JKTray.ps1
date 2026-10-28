@@ -160,7 +160,12 @@ foreach ($entry in @{
 }
 
 function Get-Port {
-    if ($script:Settings.Port) { return [int]$script:Settings.Port }
+    foreach ($candidate in @($env:JK_PORT, $env:CHATGPT2CODEX_PORT, $env:PORT)) {
+        $parsed = 0
+        if ($candidate -and [int]::TryParse("$candidate", [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+    }
+    $saved = 0
+    if ($script:Settings.Port -and [int]::TryParse("$($script:Settings.Port)", [ref]$saved) -and $saved -gt 0) { return $saved }
     return 7979
 }
 

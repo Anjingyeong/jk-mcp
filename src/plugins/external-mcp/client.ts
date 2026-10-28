@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-export type ExternalMcpServerSpec = {
+type ExternalMcpServerSpec = {
   id: string;
   command: string;
   args?: string[];
@@ -140,4 +140,4 @@ export class ExternalMcpClientManager {
   }
 }
 
-export const externalMcpClients = new ExternalMcpClientManager();
+const externalMcpClients = new ExternalMcpClientManager();

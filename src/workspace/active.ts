@@ -12,9 +12,9 @@ import { findProject } from "./registry.js";
 
 /** Literal value meaning "use whatever project is currently active", i.e.
  * the same as omitting an explicit project id entirely. */
-export const ACTIVE_PROJECT_SENTINEL = "@active";
+const ACTIVE_PROJECT_SENTINEL = "@active";
 
-export interface ActiveProject {
+interface ActiveProject {
   projectId: string;
   root: string;
   lease: Lease | null;

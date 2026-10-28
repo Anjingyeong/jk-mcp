@@ -16,7 +16,7 @@ import { z } from "zod";
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const OWNER_TOKEN_FILE = "owner-token.json";
-export const MIN_OWNER_TOKEN_LENGTH = 20;
+const MIN_OWNER_TOKEN_LENGTH = 20;
 
 const OwnerTokenFileSchema = z.object({
   version: z.number().int().nonnegative(),
@@ -73,7 +73,7 @@ export async function storeOwnerToken(stateDir: string, token: string): Promise<
 }
 
 /** Load the stored owner-token hash record, or undefined if none exists yet. */
-export async function loadOwnerTokenRecord(stateDir: string): Promise<OwnerTokenFile | undefined> {
+async function loadOwnerTokenRecord(stateDir: string): Promise<OwnerTokenFile | undefined> {
   const target = join(stateDir, OWNER_TOKEN_FILE);
   try {
     const raw = await readFile(target, "utf8");

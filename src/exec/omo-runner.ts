@@ -24,14 +24,14 @@ const REQUIRED_NATIVE_FLAGS = [
 const NATIVE_ULTRAWORK_TRIGGER = /(?:ultrawork|ulw(?!-))/iu;
 const INJECTED_ULTRAWORK_MARKER = /<ultrawork-mode>/iu;
 
-export type OmoCliContract = "legacy-run" | "native-print";
-export type UltraworkTransport =
+type OmoCliContract = "legacy-run" | "native-print";
+type UltraworkTransport =
   | "none"
   | "native-hook-disabled"
   | "native-hook-trigger"
   | "legacy-keyword-trigger";
 
-export interface OmoRunOptions {
+interface OmoRunOptions {
   message: string;
   agent?: string;
   model?: string;
@@ -47,7 +47,7 @@ interface OmoCandidate {
   mtimeMs: number;
 }
 
-export interface OmoInvocation {
+interface OmoInvocation {
   command: string;
   argsPrefix: string[];
   source: "env-bin" | "env-node-cli" | "codex-cache" | "native-global" | "path";

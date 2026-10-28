@@ -71,6 +71,34 @@ const fingerprintInput = {
 };
 
 describe("native-evolution R9 durable job records", () => {
+  it("persists an expired pending approval job as expired instead of leaving a ghost pending job", async () => {
+    const dir = await stateDir();
+    const now = Date.now();
+    const expiredApproval: LocalShellApprovalRecord = {
+      ...approval(),
+      createdAt: now - 10_000,
+      expiresAt: now - 1_000,
+    };
+    const queued = await queueLocalShellJob(dir, expiredApproval, jobInput);
+
+    expect(await findReusableLocalShellJob(dir, fingerprintInput, now)).toBeNull();
+    expect(await readLocalShellJob(dir, queued.id)).toMatchObject({
+      status: "expired",
+      error: expect.stringContaining("approval expired"),
+    });
+
+    const freshApproval: LocalShellApprovalRecord = {
+      ...expiredApproval,
+      createdAt: now + 1,
+      expiresAt: now + 5 * 60_000,
+    };
+    expect(await queueLocalShellJob(dir, freshApproval, jobInput)).toMatchObject({
+      id: queued.id,
+      status: "pending",
+      expiresAt: freshApproval.expiresAt,
+    });
+  });
+
   it("does not re-read a large unchanged job history on repeated recent-list calls", async () => {
     const dir = await stateDir();
     const queued = await queueLocalShellJob(dir, approval(), jobInput);
@@ -94,6 +122,24 @@ describe("native-evolution R9 durable job records", () => {
     expect(second).toHaveLength(20);
     expect(readsAfterFirst).toBeGreaterThanOrEqual(1500);
     expect(readsAfterSecond).toBe(readsAfterFirst);
+  });
+
+  it("expires a cached pending job when time advances without any directory change", async () => {
+    const dir = await stateDir();
+    const queued = await queueLocalShellJob(dir, approval(), jobInput);
+    expect(await listRecentLocalShellJobs(dir)).toEqual([
+      expect.objectContaining({ id: queued.id, status: "pending" }),
+    ]);
+
+    const clock = vi.spyOn(Date, "now").mockReturnValue(queued.expiresAt + 1);
+    try {
+      expect(await listRecentLocalShellJobs(dir)).toEqual([
+        expect.objectContaining({ id: queued.id, status: "expired" }),
+      ]);
+      expect(await readLocalShellJob(dir, queued.id)).toMatchObject({ status: "expired" });
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   const invalidRecords = [
@@ -283,6 +329,44 @@ describe("local shell job restart recovery", () => {
     expect(await findReusableLocalShellJob(dir, { projectId: "proj", ...input,
       taskIdentity: taskApprovalIdentity({ ...owner, leaseId: "new" }), reason: "changed wording" })).toMatchObject({ id: queued.id });
     expect(await findReusableLocalShellJob(dir, { projectId: "proj", ...input, workSessionId: "ws_other" })).toBeNull();
+  });
+
+  it("reuses executor-reconnect maintenance without a work session across lease and instance rotation", async () => {
+    const dir = await stateDir();
+    const executionTarget = await deriveLocalExecutionTarget(dir, { projectId: "proj", root: dir });
+    const completionProof = { kind: "executor-reconnect" as const, executorId: "worker",
+      previousInstanceId: executionTarget.instanceId, requiredHeartbeats: 2, timeoutMs: 1000, requiredCapabilities: ["command_run"] };
+    const input = { ...jobInput, executionTarget, completionProof, manifestFingerprint: "build-a",
+      taskIdentity: targetApprovalIdentity(executionTarget, "lease:old"), workSessionId: null };
+    const queued = await queueLocalShellJob(dir, approval(), input);
+    await updateLocalShellJob(dir, queued.id, (current) => ({ ...current, status: "succeeded", finishedAt: Date.now() }));
+    const replacement = { ...executionTarget, instanceId: "replacement" };
+    expect(await findReusableLocalShellJob(dir, { projectId: "proj", ...input, executionTarget: replacement,
+      completionProof: { ...completionProof, previousInstanceId: executionTarget.instanceId },
+      taskIdentity: targetApprovalIdentity(replacement, "lease:new") })).toMatchObject({ id: queued.id, status: "succeeded" });
+  });
+
+  it("reuses local JK runtime maintenance across local instance and lease rotation", async () => {
+    const dir = await stateDir();
+    const executionTarget = await deriveLocalExecutionTarget(dir, { projectId: "proj", root: dir });
+    const input = {
+      ...jobInput,
+      executionTarget,
+      command: "bash scripts/reload-jk-runtime.sh",
+      manifestFingerprint: "build-a",
+      destructive: true,
+      taskIdentity: targetApprovalIdentity(executionTarget, "lease:old"),
+      workSessionId: null,
+    };
+    const queued = await queueLocalShellJob(dir, approval(), input);
+    await updateLocalShellJob(dir, queued.id, (current) => ({ ...current, status: "succeeded", finishedAt: Date.now() }));
+    const replacement = { ...executionTarget, instanceId: "replacement" };
+    expect(await findReusableLocalShellJob(dir, {
+      projectId: "proj",
+      ...input,
+      executionTarget: replacement,
+      taskIdentity: targetApprovalIdentity(replacement, "lease:new"),
+    })).toMatchObject({ id: queued.id, status: "succeeded" });
   });
 
   it("rejects ambiguous legacy job ownership", async () => {

@@ -78,8 +78,8 @@ export type WakeCategory = (typeof WAKE_CATEGORIES)[number];
 export const SEMANTIC_WAKE_CATEGORIES = ["product-quality", "ux-flow", "preference-mismatch", "goal-fit", "quality-gap", "scope-gap"] as const;
 export type SemanticWakeCategory = (typeof SEMANTIC_WAKE_CATEGORIES)[number];
 /** Who produced a proposal: deterministic rules (V1) or the connected reasoning host (V2.1 Semantic Scout). */
-export const PROPOSAL_BACKENDS = ["native", "semantic"] as const;
-export type ProposalBackend = (typeof PROPOSAL_BACKENDS)[number];
+const PROPOSAL_BACKENDS = ["native", "semantic"] as const;
+type ProposalBackend = (typeof PROPOSAL_BACKENDS)[number];
 /** Decision vocabulary reserved for the V2 Director; V1 only annotates what is allowed. */
 export const DIRECTOR_DECISIONS = ["REJECT", "BACKLOG", "NEXT_PHASE", "INTERRUPT_P0"] as const;
 export type DirectorDecision = (typeof DIRECTOR_DECISIONS)[number];
@@ -94,8 +94,7 @@ const LOCK_FILE = ".lock";
 
 const MAX_EVENTS = 2000;
 const KEEP_EVENTS = 1500;
-const MAX_PROPOSALS = 1000;
-const KEEP_PROPOSALS = 750;
+const MAX_PROPOSAL_QUERY = 1000;
 const MAX_RUNS = 500;
 const KEEP_RUNS = 375;
 export const MAX_PROCESSED_EVENT_IDS = 2000;
@@ -224,7 +223,7 @@ const SuppressedEntrySchema = z.object({
   existingProposalId: z.string().nullable(),
 });
 
-export const ScoutStateSchema = z.object({
+const ScoutStateSchema = z.object({
   schemaVersion: z.literal(1),
   processedEventIds: z.array(z.string()).max(MAX_PROCESSED_EVENT_IDS).default([]),
   suppressed: z.record(z.string(), SuppressedEntrySchema).default({}),
@@ -234,7 +233,7 @@ export const ScoutStateSchema = z.object({
 });
 export type ScoutState = z.infer<typeof ScoutStateSchema>;
 
-export function emptyScoutState(): ScoutState {
+function emptyScoutState(): ScoutState {
   return { schemaVersion: 1, processedEventIds: [], suppressed: {}, runs: 0, lastRunAt: null, lastRunId: null };
 }
 
@@ -301,7 +300,7 @@ function cleanList(values: string[] | undefined, maxItems: number, maxLength: nu
   return Array.from(new Set(out)).slice(0, maxItems);
 }
 
-export function sanitizeEvidence(evidence: ImpulseEvidence | undefined): ImpulseEvidence {
+function sanitizeEvidence(evidence: ImpulseEvidence | undefined): ImpulseEvidence {
   if (!evidence) return {};
   const out: ImpulseEvidence = {
     gitCommit: evidence.gitCommit ? cleanText(evidence.gitCommit, 80) : undefined,
@@ -332,6 +331,8 @@ export interface AgentBridgeTx {
   /** Generic helpers for other agent-bridge layers (V2 Director). Names must be plain file names. */
   readJsonl<T>(name: string, schema: z.ZodType<T, z.ZodTypeDef, unknown>): Promise<T[]>;
   appendJsonl(name: string, records: unknown[], max: number, keep: number): Promise<void>;
+  /** Append-only authority log. Never truncate records that are needed to rebuild durable state. */
+  appendAuthorityJsonl(name: string, records: unknown[]): Promise<void>;
   readText(name: string): Promise<string>;
   writeText(name: string, contents: string): Promise<void>;
 }
@@ -342,7 +343,7 @@ function assertPlainName(name: string): string {
   return name;
 }
 
-export interface WakeQueueQuery {
+interface WakeQueueQuery {
   goalId?: string;
   loopId?: string;
   workSessionId?: string;
@@ -407,11 +408,14 @@ export class AgentBridgeStore {
       readEvents: () => this.readEvents(),
       readProposals: () => this.readProposals(),
       readScoutState: () => this.readScoutState(),
-      appendProposals: (proposals) => this.appendRecords(QUEUE_FILE, proposals.map((p) => WakeProposalSchema.parse(p)), MAX_PROPOSALS, KEEP_PROPOSALS),
+      // wake_queue is the Scout's durable fingerprint authority. Truncating it
+      // can resurrect old proposals after scout_state recovery, so it is append-only.
+      appendProposals: (proposals) => this.appendRecords(QUEUE_FILE, proposals.map((p) => WakeProposalSchema.parse(p))),
       appendRun: (run) => this.appendRecords(RUNS_FILE, [ScoutRunSchema.parse(run)], MAX_RUNS, KEEP_RUNS),
       writeScoutState: (state) => this.atomicWrite(STATE_FILE, JSON.stringify(ScoutStateSchema.parse(state), null, 2)),
       readJsonl: (name, schema) => this.readJsonl(name, schema),
       appendJsonl: (name, records, max, keep) => this.appendRecords(assertPlainName(name), records, max, keep),
+      appendAuthorityJsonl: (name, records) => this.appendRecords(assertPlainName(name), records),
       readText: (name) => this.readText(name),
       writeText: (name, contents) => this.atomicWrite(assertPlainName(name), contents),
     };
@@ -496,7 +500,7 @@ export class AgentBridgeStore {
     const counts: Record<WakePriority, number> = { P0: 0, P1: 0, P2: 0 };
     for (const proposal of matching) counts[proposal.priority] += 1;
     const processed = new Set(state.processedEventIds);
-    const limit = Math.max(1, Math.min(query.limit ?? 20, MAX_PROPOSALS));
+    const limit = Math.max(1, Math.min(query.limit ?? 20, MAX_PROPOSAL_QUERY));
     return {
       proposals: matching.slice().reverse().slice(0, limit),
       total: matching.length,
@@ -506,14 +510,14 @@ export class AgentBridgeStore {
     };
   }
 
-  private async appendRecords(name: string, records: unknown[], max: number, keep: number): Promise<void> {
+  private async appendRecords(name: string, records: unknown[], max?: number, keep?: number): Promise<void> {
     if (records.length === 0) return;
     await mkdir(this.dir, { recursive: true, mode: DIR_MODE });
     const target = this.file(name);
     const existing = await readTextOrEmpty(target);
     const lines = records.map((record) => JSON.stringify(record));
     const existingLines = existing.split("\n").filter((line) => line.trim());
-    if (existingLines.length + lines.length > max) {
+    if (max !== undefined && keep !== undefined && existingLines.length + lines.length > max) {
       // Compact: keep the newest `keep` lines atomically.
       const next = [...existingLines, ...lines].slice(-keep);
       await this.atomicWrite(name, `${next.join("\n")}\n`);

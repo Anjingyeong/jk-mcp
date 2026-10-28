@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -49,6 +49,19 @@ describe("ProjectMemoryStore", () => {
     const changedFingerprint = await fingerprintFiles(projectRoot, files);
     expect(changedFingerprint).not.toBe(fingerprint);
     expect(await store.getContextPack("alpha", key, changedFingerprint)).toBeNull();
+  });
+
+  it("fingerprints file contents even when size and mtime are preserved", async () => {
+    const file = join(projectRoot, "same-size.ts");
+    await writeFile(file, "export const value = 1;\n", "utf8");
+    const before = await stat(file);
+    const first = await fingerprintFiles(projectRoot, ["same-size.ts"]);
+
+    await writeFile(file, "export const value = 2;\n", "utf8");
+    await utimes(file, before.atime, before.mtime);
+    const second = await fingerprintFiles(projectRoot, ["same-size.ts"]);
+
+    expect(second).not.toBe(first);
   });
 
   it("round-trips analysis results by task/role/fingerprint key", async () => {

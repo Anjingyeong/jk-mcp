@@ -79,6 +79,7 @@ describe("gitStatus / gitDiffSummary — non-git directory", () => {
     const status = await gitRepositoryStatus(dir);
     expect(status).toEqual({
       branch: "",
+      headCommit: null,
       dirtyFiles: [],
       staged: [],
       remotes: [],

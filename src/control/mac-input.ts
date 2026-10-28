@@ -76,7 +76,7 @@ export async function resolveFrontmostApp(): Promise<string | undefined> {
   }
 }
 
-export interface AppWindowRegion {
+interface AppWindowRegion {
   x: number;
   y: number;
   width: number;
@@ -154,7 +154,7 @@ export async function clickAtPoint(appName: string, x: number, y: number): Promi
   ]);
 }
 
-export interface AxClickTarget {
+interface AxClickTarget {
   role: string;
   title?: string;
   label?: string;
@@ -251,7 +251,7 @@ export async function pressKey(appName: string, keyCode: number): Promise<void> 
   ]);
 }
 
-export interface AxResolveTarget {
+interface AxResolveTarget {
   role: string;
   title?: string;
   description?: string;
@@ -473,7 +473,7 @@ export async function setAxValue(appName: string, target: AxResolveTarget, text:
 // `source: "unavailable"` rather than guessing.
 // ---------------------------------------------------------------------------
 
-export interface PermissionPreflightResult {
+interface PermissionPreflightResult {
   accessibilityTrusted: boolean;
   screenRecordingAllowed: boolean;
   source: "ax-helper" | "unavailable";
