@@ -167,7 +167,7 @@ const SessionSchema = z.object({
   workSessions: z.record(z.string(), z.record(z.string(), WorkContextSchema)).default({}),
 });
 
-export type SessionDocument = z.infer<typeof SessionSchema>;
+type SessionDocument = z.infer<typeof SessionSchema>;
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;

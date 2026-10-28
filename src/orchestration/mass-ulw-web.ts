@@ -46,7 +46,7 @@ const Document = z.object({
     verificationStatus: z.enum(["unknown", "passed", "failed", "permission-paused"]).default("unknown"),
   }).nullable(),
 });
-export type WebMassDocument = z.infer<typeof Document>;
+type WebMassDocument = z.infer<typeof Document>;
 export type WebMassSubmission = { laneId: string; contextToken: string; submissionId: string; patch: string; hypothesis?: string };
 export type WebMassInput = {
   action: "start" | "next" | "context" | "submit" | "review" | "revise" | "integrate" | "finish" | "status";
@@ -60,8 +60,8 @@ function fail(message: string): never { throw new DomainError(ErrorCode.WORKSPAC
 const permissionPause = (error: unknown): error is DomainError => error instanceof DomainError && (error.code === ErrorCode.LEASE_REQUIRED || error.code === ErrorCode.PERMISSION_DENIED);
 const normalize = (text: string) => text.trim().toLowerCase().replace(/\s+/gu, " ");
 const failedAttempts = (lane: z.infer<typeof Lane>) => lane.attempts.filter((attempt) => attempt.strategyGeneration === lane.strategyGeneration && attempt.status === "failed").length;
-export type WebMassAuthorization = { readonly write: () => Promise<void>; readonly verify: () => Promise<void> };
-export type WebMassSnapshot =
+type WebMassAuthorization = { readonly write: () => Promise<void>; readonly verify: () => Promise<void> };
+type WebMassSnapshot =
   | { readonly kind: "available"; readonly document: WebMassDocument; readonly task: TaskWorkspace }
   | { readonly kind: "absent" }
   | { readonly kind: "invalid"; readonly reason: string };

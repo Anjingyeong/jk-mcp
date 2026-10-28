@@ -38,9 +38,9 @@ import { ProjectMemoryStore } from "../state/project-memory.js";
  */
 
 export const PHASE_WAKE_BUDGET = 2;
-export const EVENT_PROPOSAL_CAP = 3;
-export const DEFAULT_CONFIDENCE_THRESHOLD = 0.5;
-export const DEFAULT_MAX_EVENTS_PER_RUN = 20;
+const EVENT_PROPOSAL_CAP = 3;
+const DEFAULT_CONFIDENCE_THRESHOLD = 0.5;
+const DEFAULT_MAX_EVENTS_PER_RUN = 20;
 const KNOWN_FIX_MIN_SCORE = 9;
 
 /** Read-only context the Scout may consult. Implementations must not mutate anything. */
@@ -49,7 +49,7 @@ export interface ScoutContextProvider {
   searchKnownFixes?(query: string): Promise<Array<{ id: string; title: string; score: number }>>;
 }
 
-export function projectMemoryScoutContext(stateDir: string, projectId: string): ScoutContextProvider {
+function projectMemoryScoutContext(stateDir: string, projectId: string): ScoutContextProvider {
   const memory = new ProjectMemoryStore(stateDir);
   return {
     sources: ["project-memory.knownFixes"],
@@ -288,7 +288,7 @@ const recurringFeedback: Rule = ({ event, projectHistory }) => {
   };
 };
 
-export const SCOUT_RULES: ReadonlyArray<{ id: string; rule: Rule }> = [
+const SCOUT_RULES: ReadonlyArray<{ id: string; rule: Rule }> = [
   { id: "regression-detected", rule: regressionDetected },
   { id: "repeated-verification-failure", rule: repeatedVerificationFailure },
   { id: "phase-completed-without-qa", rule: phaseCompletedWithoutQa },
@@ -316,7 +316,7 @@ function budgetKey(scopeKey: string, phaseId: string | null): string {
   return `${scopeKey}|${phaseId ?? ""}`;
 }
 
-export interface ScoutRunOptions {
+interface ScoutRunOptions {
   stateDir: string;
   projectId: string;
   context?: ScoutContextProvider;
@@ -325,7 +325,7 @@ export interface ScoutRunOptions {
   now?: () => Date;
 }
 
-export interface ScoutRunResult {
+interface ScoutRunResult {
   runId: string;
   evaluatedEvents: number;
   deferredEvents: number;

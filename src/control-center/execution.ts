@@ -3,10 +3,10 @@ import path from "node:path";
 import { resolveMassUlwExecutionId } from "../orchestration/mass-ulw-identity-index.js";
 import { MassUlwDocumentSchema } from "../orchestration/mass-ulw-store.js";
 
-export type TaskExecutionMode = "implement" | "debug" | "research" | "review" | "plan";
-export type WorkflowPhase = "discover" | "plan" | "patch" | "verify" | "review" | "recovery" | "release";
-export type WorkflowStage = "explorer" | "oracle" | "implementer" | "reviewer" | "verifier" | "recovery";
-export type WorkflowVerificationStatus = "unknown" | "pass" | "fail" | "blocked";
+type TaskExecutionMode = "implement" | "debug" | "research" | "review" | "plan";
+type WorkflowPhase = "discover" | "plan" | "patch" | "verify" | "review" | "recovery" | "release";
+type WorkflowStage = "explorer" | "oracle" | "implementer" | "reviewer" | "verifier" | "recovery";
+type WorkflowVerificationStatus = "unknown" | "pass" | "fail" | "blocked";
 
 export interface TaskExecutionSnapshot {
   projectId: string | null;
@@ -23,7 +23,12 @@ export interface TaskExecutionSnapshot {
   lastVerification: { success?: boolean; at?: number; tool?: string } | null;
 }
 
-export interface MassUlwExecutionStatus {
+interface MassUlwExecutionStatus {
+  source: "execution" | "plan";
+  planState: "fanout" | "sequential" | null;
+  recommended: boolean | null;
+  rationale: string | null;
+  hardBlocks: string[];
   createdAt: number;
   updatedAt: number;
   currentWave: number | null;
@@ -49,7 +54,7 @@ export interface MassUlwExecutionStatus {
   verification: "not-started" | "in-flight" | "passed" | "failed" | "unknown-after-interruption";
 }
 
-export interface TaskExecutionView {
+interface TaskExecutionView {
   projectId: string | null;
   projectName: string | null;
   goal: string | null;
@@ -131,6 +136,11 @@ async function readMassUlwExecutionStatus(
   if (!parsed.success || parsed.data.loopId !== executionId) return null;
   const document = parsed.data;
   return {
+    source: "execution",
+    planState: document.plan.state,
+    recommended: document.plan.recommended,
+    rationale: document.plan.rationale,
+    hardBlocks: [...document.plan.hardBlocks],
     createdAt: document.createdAt,
     updatedAt: document.updatedAt,
     currentWave: document.currentWave,
@@ -172,6 +182,63 @@ async function readMassUlwExecutionStatus(
         : [];
     }))],
     verification: document.integrationVerification.status,
+  };
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+}
+
+function projectMassUlwPlan(orchestration: Record<string, unknown>, updatedAt: number): MassUlwExecutionStatus | null {
+  const plan = asRecord(orchestration.massUlw);
+  const planState = plan.state === "fanout" || plan.state === "sequential" ? plan.state : null;
+  const rawLanes = Array.isArray(plan.lanes) ? plan.lanes : [];
+  const rawWaves = Array.isArray(plan.waves) ? plan.waves : [];
+  if (!planState || rawLanes.length === 0 || rawWaves.length === 0) return null;
+
+  const waves = rawWaves.map((rawWave, index) => ({
+    index,
+    laneIds: stringList(rawWave),
+    status: "planned" as const,
+    completedAt: null,
+  })).filter((wave) => wave.laneIds.length > 0);
+  if (waves.length === 0) return null;
+
+  const waveByLane = new Map<string, number>();
+  for (const wave of waves) for (const laneId of wave.laneIds) waveByLane.set(laneId, wave.index);
+  const lanes = rawLanes.map((rawLane) => {
+    const lane = asRecord(rawLane);
+    if (typeof lane.id !== "string" || lane.id.length === 0 || typeof lane.task !== "string" || lane.task.length === 0) return null;
+    return {
+      id: lane.id,
+      task: lane.task,
+      status: "planned" as const,
+      dependsOn: stringList(lane.dependsOn),
+      attempts: 0,
+      wave: waveByLane.get(lane.id) ?? null,
+      completedAt: null,
+    };
+  }).filter((lane): lane is NonNullable<typeof lane> => lane !== null);
+  if (lanes.length === 0) return null;
+
+  return {
+    source: "plan",
+    planState,
+    recommended: typeof plan.recommended === "boolean" ? plan.recommended : null,
+    rationale: typeof plan.rationale === "string" ? plan.rationale : null,
+    hardBlocks: stringList(plan.hardBlocks),
+    createdAt: updatedAt,
+    updatedAt,
+    currentWave: waves[0]?.index ?? null,
+    waves,
+    lanes,
+    runningLanes: [],
+    failedLanes: [],
+    blockedLanes: [],
+    blockedDependencies: [],
+    verification: "not-started",
   };
 }
 
@@ -246,6 +313,7 @@ export async function readTaskExecutionView(
       if (mode) modeSource = "loop";
       const orchestration = latestOrchestration(loop);
       if (orchestration) {
+        massUlw ??= projectMassUlwPlan(orchestration, snapshot.updatedAt);
         phase = asPhase(orchestration.phase);
         primaryStage = asStage(orchestration.primaryStage) ?? asStage(orchestration.primaryRole);
         supportingStages = normalizeSupportingStages(orchestration);

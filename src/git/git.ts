@@ -100,6 +100,7 @@ export async function gitStatus(
 
 export interface GitRepositoryStatus {
   branch: string;
+  headCommit: string | null;
   dirtyFiles: string[];
   staged: string[];
   remotes: Array<{ name: string; url: string }>;
@@ -129,19 +130,32 @@ export interface GitSyncFinishResult {
 /** Read-only repository state plus already-known upstream relation; never fetches. */
 export async function gitRepositoryStatus(root: string): Promise<GitRepositoryStatus> {
   const status = await gitStatus(root);
-  const [remotes, upstream, counts] = await Promise.all([
+  const [headCommit, remotes, upstream, counts] = await Promise.all([
+    readGitHeadCommit(root),
     listGitRemotes(root),
     readGitUpstream(root),
     readGitAheadBehind(root),
   ]);
   return {
     ...status,
+    headCommit,
     remotes,
     upstream,
     ahead: counts.ahead,
     behind: counts.behind,
     syncState: syncState(upstream, counts.ahead, counts.behind),
   };
+}
+
+async function readGitHeadCommit(root: string): Promise<string | null> {
+  try {
+    const { stdout } = await runGit(root, ["rev-parse", "HEAD"]);
+    const commit = stdout.trim().toLowerCase();
+    return /^[a-f0-9]{40}$/u.test(commit) ? commit : null;
+  } catch (err) {
+    if (isNonGitError(err)) return null;
+    return null;
+  }
 }
 
 function upstreamRemote(upstream: string): string {

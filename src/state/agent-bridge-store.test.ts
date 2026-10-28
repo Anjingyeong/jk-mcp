@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { AgentBridgeStore, WakeProposalSchema, agentBridgeProjectKey, impulseScopeKey } from "./agent-bridge-store.js";
 
 const dirs: string[] = [];
@@ -141,5 +142,33 @@ describe("AgentBridgeStore", () => {
     expect(WakeProposalSchema.parse(validProposal()).reviewId).toBeNull();
     expect(WakeProposalSchema.safeParse(validProposal({ backend: "semantic", reviewId: "srv_1", category: "product-quality" })).success).toBe(true);
     expect(WakeProposalSchema.safeParse(validProposal({ backend: "llm" })).success).toBe(false);
+  });
+
+  it("keeps the wake queue append-only beyond the old compaction threshold", async () => {
+    const stateDir = await tempState();
+    const store = new AgentBridgeStore(stateDir, "p");
+    const proposals = Array.from({ length: 1100 }, (_, i) => WakeProposalSchema.parse(validProposal({
+      proposalId: `wake_${i}`,
+      fingerprint: i.toString(16).padStart(64, "0"),
+      triggerEventId: `evt_${i}`,
+    })));
+    await store.transaction(async (tx) => tx.appendProposals(proposals));
+
+    const persisted = await store.readProposals();
+    expect(persisted).toHaveLength(1100);
+    expect(persisted[0]?.proposalId).toBe("wake_0");
+    expect(persisted.at(-1)?.proposalId).toBe("wake_1099");
+  });
+
+  it("keeps authority JSONL append-only beyond the Director's old 5000-record threshold", async () => {
+    const stateDir = await tempState();
+    const store = new AgentBridgeStore(stateDir, "p");
+    const records = Array.from({ length: 5101 }, (_, i) => ({ i }));
+    await store.transaction(async (tx) => tx.appendAuthorityJsonl("decisions.jsonl", records));
+
+    const persisted = await store.readJsonl("decisions.jsonl", z.object({ i: z.number().int() }));
+    expect(persisted).toHaveLength(5101);
+    expect(persisted[0]?.i).toBe(0);
+    expect(persisted.at(-1)?.i).toBe(5100);
   });
 });

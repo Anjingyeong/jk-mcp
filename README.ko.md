@@ -122,6 +122,8 @@ npx -y jk-mcp setup
 ### 코딩에 필요한 건 다
 프로젝트 선택, 코드 검색, 좁은 범위 읽기, 보호된 패치, 허용된 명령과 shell job, Git status/diff/commit/명시적 push, 개발 서버, 스크린샷을 포함한 브라우저 E2E, 이미지 intake, 외부 MCP 라우팅, 런타임 상태 점검.
 
+도구 70개 전체를 묶음별로 정리한 표: [docs/FEATURES.ko.md](docs/FEATURES.ko.md)
+
 ## 안전 모델
 
 JK는 신뢰할 수 있는 개발 환경에서 쓰는 것을 전제로 합니다.

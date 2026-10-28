@@ -569,7 +569,10 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
   const primaryPages = ['dashboard','projects','approvals','logs','system'];
   const pageLabels = {dashboard:'Dashboard',projects:'Projects',roles:'Roles',skills:'Skills',guide:'Guide',goals:'Goals',approvals:'Approvals',logs:'Activity',system:'Settings'};
   const requestedPage = location.pathname === '/approvals' ? 'approvals' : new URLSearchParams(location.search).get('page');
-  const state = { page: allowedPages.includes(requestedPage) ? requestedPage : 'dashboard', projects: [], roles: [], roleContext: null, status: null, execution: null, goals: [], approvals: [], jobs: [], approvalRevision: null, logs: [], notifications: null, selectedProjectId: null, editingRole: null, workflowPresets: [], activationPreset: null, controlApps: '', runtimeSampleAt: 0, reconnectTimer: null };
+  const projectViewStorageKey = 'jk.controlCenter.viewProjectId';
+  let storedProjectId = null;
+  try { storedProjectId = localStorage.getItem(projectViewStorageKey); } catch {}
+  const state = { page: allowedPages.includes(requestedPage) ? requestedPage : 'dashboard', projects: [], roles: [], roleContext: null, status: null, execution: null, goals: [], approvals: [], jobs: [], approvalRevision: null, logs: [], notifications: null, selectedProjectId: storedProjectId || null, editingRole: null, workflowPresets: [], activationPreset: null, controlApps: '', runtimeSampleAt: 0, reconnectTimer: null };
   const content = document.getElementById('content');
   const nav = document.getElementById('nav');
   const mobileNav = document.getElementById('mobile-nav');
@@ -587,6 +590,14 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
   const permissionLabel = (p) => ({'full-write':'Full Write','read-only':'Read Only','tests-only':'Tests Only','image-only':'Image Only','control':'Computer Control','inherit':'Project Default'})[p] || (p || '—');
   const permissionClass = (p) => p === 'full-write' ? 'ok' : p === 'read-only' ? 'warn' : p === 'tests-only' ? 'default' : '';
   const modeLabel = (mode) => ({implement:'Implement',debug:'Debug',research:'Research',review:'Review',plan:'Plan'})[mode] || 'Ready';
+  const executionApiPath = () => '/api/jk/control/execution' + (state.selectedProjectId ? '?projectId=' + encodeURIComponent(state.selectedProjectId) : '');
+  function setViewedProject(projectId) {
+    state.selectedProjectId = projectId || null;
+    try {
+      if (state.selectedProjectId) localStorage.setItem(projectViewStorageKey, state.selectedProjectId);
+      else localStorage.removeItem(projectViewStorageKey);
+    } catch {}
+  }
   function toast(message) { toastEl.textContent = message; toastEl.classList.add('show'); clearTimeout(toastEl._t); toastEl._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
   async function api(path, options) { const res = await fetch(path, { cache:'no-store', headers: {'Content-Type':'application/json', ...(options && options.headers || {})}, ...options }); const text = await res.text(); const contentType = (res.headers.get('content-type') || '').toLowerCase(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch { body = {}; } if (res.status === 401 && body.code === 'OWNER_LOGIN_REQUIRED') { const current = location.pathname + location.search; location.href = '/login?return=' + encodeURIComponent(current); throw new Error('관리자 로그인이 필요합니다.'); } if (!res.ok) { const transient = res.status >= 500 || contentType.includes('text/html'); const err = new Error(transient ? 'JK 서버가 재시작 중입니다. 자동으로 다시 연결합니다.' : (body.error || ('HTTP ' + res.status))); err.transient = transient; err.status = res.status; throw err; } return body; }
   function scheduleReconnect() { if (state.reconnectTimer) return; state.reconnectTimer = setTimeout(() => { state.reconnectTimer = null; loadAll({quiet:true}); }, 1500); }
@@ -595,6 +606,15 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     state.roles = roles.roles || [];
     state.roleContext = roles.activeRoleContext || null;
     state.workflowPresets = roles.workflowPresets || [];
+  }
+  function loadProjectContextDeferred(projectId) {
+    if (!projectId) return;
+    void loadProjectContext(projectId).then(() => {
+      updateChrome();
+      if (state.page === 'dashboard' || state.page === 'projects' || state.page === 'roles' || state.page === 'skills') render();
+    }).catch(err => {
+      if (err && err.transient) scheduleReconnect();
+    });
   }
   async function loadSecondarySignals() {
     try {
@@ -618,32 +638,59 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     }
   }
   async function loadAll({quiet=false}={}) {
-    try {
-      const previousDashboard = dashboardSnapshot();
-      const [projects, status, execution, goals] = await Promise.all([
-        api('/api/jk/projects'), api('/api/jk/control/status'), api('/api/jk/control/execution'), api('/api/jk/control/goals')
-      ]);
+    const previousDashboard = dashboardSnapshot();
+    if (!state.status && state.projects.length === 0) render();
+    let selectedContextQueued = false;
+    const applyProjects = api('/api/jk/projects').then(projects => {
       state.projects = projects.projects || [];
+      const previousProjectId = state.selectedProjectId;
+      const desired = state.selectedProjectId || projects.activeProjectId || (state.projects[0] && state.projects[0].projectId) || null;
+      setViewedProject(state.projects.some(p => p.projectId === desired) ? desired : ((state.projects[0] && state.projects[0].projectId) || null));
+      render();
+      if (state.selectedProjectId) {
+        selectedContextQueued = true;
+        loadProjectContextDeferred(state.selectedProjectId);
+      }
+      if (state.selectedProjectId !== previousProjectId) void refreshExecution();
+    });
+    const applyStatus = api('/api/jk/control/status').then(status => {
       state.status = status;
       state.runtimeSampleAt = Date.now();
-      state.execution = execution;
-      state.goals = goals.goals || [];
-      if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
       state.activationPreset = state.activationPreset || status.session.leasePreset || 'read-only';
       if (!state.controlApps) state.controlApps = (status.session.controlAllowlist || []).join(', ');
-      const desired = state.selectedProjectId || projects.activeProjectId || (state.projects[0] && state.projects[0].projectId) || null;
-      state.selectedProjectId = state.projects.some(p => p.projectId === desired) ? desired : ((state.projects[0] && state.projects[0].projectId) || null);
-      if (state.selectedProjectId) await loadProjectContext(state.selectedProjectId);
-      updateChrome(); render();
+      render();
+    });
+    const applyExecution = api(executionApiPath()).then(execution => {
+      state.execution = execution;
+      if (state.page === 'dashboard' || state.page === 'goals') render();
+    });
+    const applyGoals = api('/api/jk/control/goals').then(goals => {
+      state.goals = goals.goals || [];
+      if (state.page === 'dashboard' || state.page === 'goals') render();
+    });
+    const results = await Promise.allSettled([applyProjects, applyStatus, applyExecution, applyGoals]);
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (failures.length < results.length) {
+      if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+      if (!selectedContextQueued && state.selectedProjectId) loadProjectContextDeferred(state.selectedProjectId);
       requestAnimationFrame(() => animateDashboardChanges(previousDashboard, dashboardSnapshot()));
       setTimeout(() => { void loadSecondarySignals(); }, 0);
       if (!quiet) toast('Refreshed');
-    } catch (err) { if (err && err.transient) { if (!state.status) content.innerHTML = '<div class="empty">JK 서버 재연결 중…</div>'; scheduleReconnect(); return; } content.innerHTML = '<div class="empty" role="alert">Control Center API error: ' + esc(err.message) + '</div>'; }
+      if (failures.some(err => err && err.transient)) scheduleReconnect();
+      return;
+    }
+    const err = failures[0] || new Error('Control Center API unavailable');
+    if (err && err.transient) {
+      content.innerHTML = '<div class="empty">JK 서버 재연결 중…</div>';
+      scheduleReconnect();
+      return;
+    }
+    content.innerHTML = '<div class="empty" role="alert">Control Center API error: ' + esc(err.message) + '</div>';
   }
   function updateChrome() {
     const project = state.projects.find(p => p.projectId === state.selectedProjectId);
     const execution = state.execution && state.execution.execution || {};
-    const runtimeCtx = state.status && state.status.roleContext || state.roleContext || {};
+    const runtimeCtx = state.roleContext || state.status && state.status.roleContext || {};
     const role = runtimeCtx.role || {};
     const manualOverride = runtimeCtx.selectionSource === 'last-used';
     document.getElementById('top-title').textContent = pageLabels[state.page] || 'JK';
@@ -762,11 +809,15 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
   }
   function dashboard() {
     const e = state.execution && state.execution.execution || {};
-    const ctx = state.status && state.status.roleContext || {};
+    const ctx = state.roleContext || state.status && state.status.roleContext || {};
     const task = e.task || e.goal;
-    const history = [...state.goals, ...state.jobs.filter(j => j.finishedAt && !j.interruptedByRestart)].sort((a,b) => (b.updatedAt || b.finishedAt || 0) - (a.updatedAt || a.finishedAt || 0))[0];
+    const viewedProjectId = state.selectedProjectId;
+    const history = [
+      ...state.goals.filter(g => !viewedProjectId || g.projectId === viewedProjectId),
+      ...state.jobs.filter(j => j.finishedAt && !j.interruptedByRestart && (!viewedProjectId || j.projectId === viewedProjectId))
+    ].sort((a,b) => (b.updatedAt || b.finishedAt || 0) - (a.updatedAt || a.finishedAt || 0))[0];
     const workState = task ? 'active' : history || e.lastProgressSummary ? 'history' : 'idle';
-    const projectId = task ? e.projectId : history && history.projectId || state.status && state.status.session.activeProjectId;
+    const projectId = task ? e.projectId : history && history.projectId || viewedProjectId || state.status && state.status.session.activeProjectId;
     const project = state.projects.find(p => p.projectId === projectId);
     const title = task || history && (history.currentTask || history.currentGoal || history.commandPreview) || (e.lastProgressSummary ? '최근 작업 결과' : '현재 실행 중인 작업이 없습니다.');
     const note = task ? e.lastProgressSummary : history && (history.lastProgressSummary || history.stdoutSummary || history.stderrSummary || history.error) || e.lastProgressSummary;
@@ -821,8 +872,8 @@ export const CONTROL_CENTER_HTML = String.raw`<!doctype html>
     if (state.status) document.getElementById('sidebar-runtime').textContent = 'PID ' + state.status.runtime.pid + ' · ' + Math.floor(Number(state.status.runtime.uptimeSec || 0) + Math.max(0, (Date.now() - state.runtimeSampleAt) / 1000)) + 's';
   }
   function dashboardSnapshot() {
-    const runtimeCtx = state.status && state.status.roleContext || {};
-    const activeProject = state.projects.find(p => p.projectId === (state.status && state.status.session.activeProjectId));
+    const runtimeCtx = state.roleContext || state.status && state.status.roleContext || {};
+    const activeProject = state.projects.find(p => p.projectId === state.selectedProjectId);
     const execution = state.execution && state.execution.execution || {};
     return {
       project: activeProject && activeProject.projectId || null,
@@ -901,7 +952,7 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
   async function refreshExecution() {
     if (document.hidden) return;
     try {
-      const nextExecution = await api('/api/jk/control/execution');
+      const nextExecution = await api(executionApiPath());
       if (JSON.stringify(nextExecution) === JSON.stringify(state.execution)) return;
       state.execution = nextExecution;
       updateChrome();
@@ -1034,8 +1085,14 @@ ${MASS_ULW_DASHBOARD_SCRIPT}
     bindPage(); updateChrome();
     if (focusAttributes) { const next = content.querySelector(focused.tagName + focusAttributes); if (next) next.focus({preventScroll:true}); }
   }
-  async function selectContext(projectId) { state.selectedProjectId = projectId; await loadProjectContext(projectId); updateChrome(); render(); }
-  async function activateProject(projectId) { const preset = state.activationPreset || 'read-only'; const controlApps = (state.controlApps || '').split(',').map(v => v.trim()).filter(Boolean); await api('/api/jk/control/projects/' + encodeURIComponent(projectId) + '/activate', {method:'POST', body: JSON.stringify({ preset, ...(preset === 'control' ? { controlApps } : {}) })}); state.selectedProjectId = projectId; await loadAll({quiet:true}); toast(preset === 'control' ? 'Computer Control armed' : 'Active project changed'); }
+  async function selectContext(projectId) {
+    setViewedProject(projectId);
+    const [execution] = await Promise.all([api(executionApiPath()), loadProjectContext(projectId)]);
+    state.execution = execution;
+    updateChrome();
+    render();
+  }
+  async function activateProject(projectId) { const preset = state.activationPreset || 'read-only'; const controlApps = (state.controlApps || '').split(',').map(v => v.trim()).filter(Boolean); await api('/api/jk/control/projects/' + encodeURIComponent(projectId) + '/activate', {method:'POST', body: JSON.stringify({ preset, ...(preset === 'control' ? { controlApps } : {}) })}); setViewedProject(projectId); await loadAll({quiet:true}); toast(preset === 'control' ? 'Computer Control armed' : 'Active project changed'); }
   async function applyRole(roleId) { await api('/api/jk/projects/' + encodeURIComponent(state.selectedProjectId) + '/role', {method:'POST', body:JSON.stringify({roleId})}); await loadProjectContext(state.selectedProjectId); render(); toast('Role applied'); }
   async function setDefault(roleId) { await api('/api/jk/projects/' + encodeURIComponent(state.selectedProjectId) + '/default-role', {method:'POST', body:JSON.stringify({roleId})}); await loadProjectContext(state.selectedProjectId); render(); toast('Project default updated'); }
   async function deleteRole(roleId) { if (!confirm('Delete this custom Role?')) return; await api('/api/jk/roles/' + encodeURIComponent(roleId), {method:'DELETE'}); await loadProjectContext(state.selectedProjectId); render(); toast('Role deleted'); }

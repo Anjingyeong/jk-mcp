@@ -164,7 +164,7 @@ export function isAppAllowed(appName: string, allowlist: readonly string[]): boo
   return allowlist.some((entry) => entry.trim().toLowerCase() === norm);
 }
 
-export interface AssertTargetInput {
+interface AssertTargetInput {
   appName: string;
   frontmostAppName?: string;
   allowlist: readonly string[];

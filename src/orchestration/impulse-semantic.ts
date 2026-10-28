@@ -40,18 +40,18 @@ import { markProposalsDelivered } from "./impulse-delivery.js";
  */
 
 export const SEMANTIC_REVIEWS_FILE = "semantic_reviews.json";
-export const MAX_SEMANTIC_REVIEWS_PER_LOOP = 4;
+const MAX_SEMANTIC_REVIEWS_PER_LOOP = 4;
 export const MAX_OBSERVATIONS_PER_SUBMISSION = 3;
-export const MAX_ACCEPTED_PER_REVIEW = 2;
-export const SEMANTIC_MIN_CONFIDENCE = 0.6;
+const MAX_ACCEPTED_PER_REVIEW = 2;
+const SEMANTIC_MIN_CONFIDENCE = 0.6;
 /** Skip new review requests while the loop already has this many undecided proposals. */
-export const MAX_OPEN_PROPOSALS_FOR_REVIEW = 3;
+const MAX_OPEN_PROPOSALS_FOR_REVIEW = 3;
 const REVIEW_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_REVIEW_RECORDS = 300;
 /** Semantic review is about finished work: only newly completed items trigger it. */
 const SEMANTIC_TRIGGERS = new Set<ImpulseEvent["type"]>(["phase_completed"]);
 
-export function semanticScoutEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+function semanticScoutEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   if (!impulseScoutEnabled(env)) return false;
   const raw = env.JK_SEMANTIC_SCOUT?.trim().toLowerCase();
   return !(raw === "0" || raw === "false" || raw === "off");
@@ -103,7 +103,7 @@ function subjectKey(value: string): string {
  * workflow enum, so the product-level checkpoint is the set of newly
  * completed items; a QA-only pass is keyed by the current task.
  */
-export function semanticCheckpointKey(triggers: ImpulseEvent[], currentTask: string | null): string {
+function semanticCheckpointKey(triggers: ImpulseEvent[], currentTask: string | null): string {
   // Unlike observation subjects, digits are significant here ("pass 1" vs "pass 2").
   const exact = (value: string) => value.toLowerCase().normalize("NFKC").replace(/\s+/g, " ").trim();
   const completed = triggers.flatMap((event) => event.evidence.completed ?? []).map(exact).filter(Boolean).sort();
@@ -111,7 +111,7 @@ export function semanticCheckpointKey(triggers: ImpulseEvent[], currentTask: str
   return basis.length <= 80 ? basis : `${basis.slice(0, 3)}${createHash("sha256").update(basis).digest("hex").slice(0, 40)}`;
 }
 
-export interface SemanticReviewInput {
+interface SemanticReviewInput {
   stateDir: string;
   projectId: string;
   loopId: string;
@@ -127,7 +127,7 @@ export interface SemanticReviewInput {
   now?: () => Date;
 }
 
-export interface SemanticReviewRequest {
+interface SemanticReviewRequest {
   reviewId: string;
   reason: string;
   /** goal_loop workflow stage (discover…release). */
@@ -147,7 +147,7 @@ export interface SemanticReviewRequest {
   submit: string;
 }
 
-export const SEMANTIC_QUESTION =
+const SEMANTIC_QUESTION =
   "Against the goal and the listed project feedback, is there an important quality gap in this result that the deterministic checks cannot see (product polish, real usage flow, goal fit, repeated user feedback)? If not, do nothing.";
 
 /**
@@ -235,9 +235,9 @@ export const SemanticObservationSchema = z.object({
   subject: z.string().trim().min(2).max(80).optional(),
   scope: z.array(z.string().trim().min(1).max(300)).max(5).optional(),
 }).strict();
-export type SemanticObservation = z.infer<typeof SemanticObservationSchema>;
+type SemanticObservation = z.infer<typeof SemanticObservationSchema>;
 
-export interface SemanticSubmissionResult {
+interface SemanticSubmissionResult {
   reviewId: string;
   duplicate: boolean;
   accepted: Array<{ proposalId: string; priority: string; category: string; recommendedDecision: string | null }>;

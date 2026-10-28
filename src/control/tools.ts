@@ -112,7 +112,7 @@ async function requireControlLease(ctx: ToolContext): Promise<{ projectId: strin
   return { projectId: active.projectId, root: active.root };
 }
 
-export interface ComputerScreenshotInput {
+interface ComputerScreenshotInput {
   appName?: string;
   label?: string;
   waitMs?: number;
@@ -212,7 +212,7 @@ export async function handleComputerScreenshot(ctx: ToolContext, input: Computer
   });
 }
 
-export interface ComputerRequestActionInput {
+interface ComputerRequestActionInput {
   appName: string;
   kind: ControlActionKind;
   target: ControlActionTarget;
@@ -374,7 +374,7 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
   });
 }
 
-export interface ComputerActionStatusInput {
+interface ComputerActionStatusInput {
   actionId?: string;
 }
 
@@ -402,7 +402,7 @@ export async function handleComputerActionStatus(ctx: ToolContext, input: Comput
   });
 }
 
-export interface ComputerKillSwitchInput {
+interface ComputerKillSwitchInput {
   reason?: string;
 }
 

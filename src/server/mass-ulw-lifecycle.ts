@@ -10,7 +10,7 @@ import type { MassUlwExecutionIdentity } from "./mass-ulw-identity.js";
 
 type MassUlwLifecycleState = "approved" | "preserved" | "revoked" | "read-only" | "inactive";
 
-export type MassUlwLifecycleResult = {
+type MassUlwLifecycleResult = {
   readonly state: MassUlwLifecycleState;
   readonly executable: boolean;
   readonly reasonCode: "PLAN_APPROVED" | "CONTINUATION_RESUME" | "EXPLICIT_REVOCATION" | "READ_ONLY_GOAL_MODE" | "NO_APPROVED_PLAN";

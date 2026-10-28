@@ -2,21 +2,21 @@ import { promises as fs } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 
-export type JkPushKind = "approval" | "success" | "failure";
+type JkPushKind = "approval" | "success" | "failure";
 
-export interface JkPushEvent {
+interface JkPushEvent {
   kind: JkPushKind;
   projectId: string;
   reason?: string | null;
 }
 
-export interface NtfyConfig {
+interface NtfyConfig {
   baseUrl: string;
   topic: string;
   clickBaseUrl?: string;
 }
 
-export interface NtfySettingsView {
+interface NtfySettingsView {
   enabled: boolean;
   baseUrl: string;
   topic: string;
@@ -53,7 +53,7 @@ export function readNtfyConfig(env: NodeJS.ProcessEnv = process.env): NtfyConfig
   return { baseUrl, topic, clickBaseUrl };
 }
 
-export async function readNtfyConfigForState(
+async function readNtfyConfigForState(
   stateDir: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<NtfyConfig | null> {
@@ -203,7 +203,7 @@ export async function sendJkPush(
   return false;
 }
 
-export type JkPushOnceResult = "delivered" | "duplicate" | "failed";
+type JkPushOnceResult = "delivered" | "duplicate" | "failed";
 
 const NTFY_ATTEMPT_TIMEOUT_MS = 3_000;
 const NTFY_RETRY_DELAY_MS = 250;

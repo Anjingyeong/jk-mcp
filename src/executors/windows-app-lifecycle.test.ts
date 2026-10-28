@@ -13,6 +13,7 @@ describe("Windows executor app lifecycle", () => {
     const reloader = await readFile(new URL("../../scripts/reload-jk-runtime.ps1", import.meta.url), "utf8");
     const offlineBuilder = await readFile(new URL("../../scripts/build-windows-app-offline.ps1", import.meta.url), "utf8");
     const windowsApp = await readFile(new URL("../../windows/JKLauncher.cs", import.meta.url), "utf8");
+    const tray = await readFile(new URL("../../windows/JKTray.ps1", import.meta.url), "utf8");
 
     expect(windowsApp).toContain("var brandLogo = new PictureBox();");
     expect(windowsApp).toContain("brandLogo.Image = BuildSidebarBrandImage();");
@@ -25,6 +26,10 @@ describe("Windows executor app lifecycle", () => {
     expect(launcher).toContain("executor failed 3 times within 20 seconds; supervision paused");
     expect(launcher).toContain("$executorQuickFailureCount");
     expect(launcher).toContain("$ExecutorOnly");
+    const executorOnlyRetryLoop = launcher.slice(launcher.indexOf("if ($ExecutorOnly)"), launcher.indexOf("Write-Host \"[JK] Local mode owns only its local runtime"));
+    expect(executorOnlyRetryLoop).not.toContain('throw "executor failed 3 times within 20 seconds');
+    expect(executorOnlyRetryLoop).toContain("hub may be restarting. Keeping JK alive and retrying");
+    expect(executorOnlyRetryLoop).toContain("$restartDelaySeconds = 15");
     expect(launcher).toContain("Start-LoggedProcess $Node $serverArgs $srvOut $srvErr");
     expect(launcher).not.toContain("$serverOut");
     expect(launcher).not.toContain("$serverErr");
@@ -56,7 +61,12 @@ describe("Windows executor app lifecycle", () => {
     expect(reloader).toContain("20 consecutive seconds");
     expect(reloader).toContain('GetEnvironmentVariable("JK_EXECUTOR_ONLY", "User")');
     expect(reloader).toContain('$env:JK_EXECUTOR_ONLY = "1"');
-    expect(reloader).toContain("executor-only runtime unexpectedly exposed 127.0.0.1:7979");
+    expect(reloader).toContain("function Resolve-LocalPort");
+    expect(reloader).toContain('Join-Path $env:LOCALAPPDATA "JK\\settings.ini"');
+    expect(reloader).toContain("[Convert]::FromBase64String($encoded)");
+    expect(reloader).toContain("Get-NetTCPConnection -LocalPort $LocalPort");
+    expect(reloader).toContain("executor-only runtime unexpectedly exposed 127.0.0.1:$LocalPort");
+    expect(reloader).toContain('& node $verifySchema "http://127.0.0.1:$LocalPort" $Live');
     expect(reloader).toContain("swap-success mode=executor-only local-port=disabled executor=stable");
     expect(offlineBuilder).toContain('Join-Path $Root "node_modules"');
     expect(offlineBuilder).toContain(String.raw`"windows\JKLauncher.cs"`);
@@ -73,6 +83,11 @@ describe("Windows executor app lifecycle", () => {
     expect(windowsApp).toContain("launchAtStartup = true;");
     expect(windowsApp).toContain("startMcpOnOpen = true;");
     expect(windowsApp).toContain("disableTunnelForLaunch");
+    expect(windowsApp).toContain("var explicitPort = ResolveExplicitPort();");
+    expect(windowsApp).toContain("if (explicitPort.HasValue) port = explicitPort.Value;");
+    expect(windowsApp).toContain("private int? ResolveExplicitPort()");
+    expect(tray).toContain('foreach ($candidate in @($env:JK_PORT, $env:CHATGPT2CODEX_PORT, $env:PORT))');
+    expect(tray).toContain("[int]::TryParse");
     expect(windowsApp).toContain("IsPublicTunnelEnabledForLaunch()");
     expect(windowsApp).toContain("tunnelCheck.Checked || !string.IsNullOrWhiteSpace(configuredPublicHost)");
     expect(windowsApp).toContain("NormalizePublicHost(hostBox.Text)");

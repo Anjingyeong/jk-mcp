@@ -525,9 +525,13 @@ if ($ExecutorOnly) {
                 $executorUptimeSeconds = if ($executorStartedAt) { ((Get-Date) - $executorStartedAt).TotalSeconds } else { 0 }
                 if ($executorUptimeSeconds -lt 20) { $executorQuickFailureCount += 1 } else { $executorQuickFailureCount = 0 }
                 if ($executorQuickFailureCount -ge 3) {
-                    throw "executor failed 3 times within 20 seconds. See $executorErr"
+                    $restartDelaySeconds = 15
+                    Write-Warning "[JK] executor failed $executorQuickFailureCount times quickly; hub may be restarting. Keeping JK alive and retrying in $restartDelaySeconds second(s). See $executorErr if this persists."
+                } elseif ($executorQuickFailureCount -le 0) {
+                    $restartDelaySeconds = 1
+                } else {
+                    $restartDelaySeconds = @(1, 3, 8)[$executorQuickFailureCount - 1]
                 }
-                $restartDelaySeconds = @(1, 3, 8)[$executorQuickFailureCount - 1]
                 Write-Host "[JK] executor exited with code $executorExitCode; restarting in $restartDelaySeconds second(s)..."
                 Start-Sleep -Seconds $restartDelaySeconds
                 $executorProc = Start-LoggedProcess "node" $workerArgs $executorOut $executorErr

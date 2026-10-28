@@ -16,7 +16,7 @@ const execFileAsync = promisify(execFile);
 export const LOOP_ID = "loop-mass-tool";
 export const WORK_SESSION_ID = "ws_mass_tool";
 
-export type MassUlwToolMocks = {
+type MassUlwToolMocks = {
   runCommand: Mock;
   listCommands: Mock;
 };

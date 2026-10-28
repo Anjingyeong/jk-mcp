@@ -42,6 +42,7 @@ export interface LocalShellJobRecord {
   commandId?: string;
   args?: string[];
   manifestFingerprint?: string;
+  releaseCommit?: string;
   cwd: string | null;
   reason: string | null;
   taskIdentity?: string | null;
@@ -80,6 +81,7 @@ const LocalShellJobRecordSchema = z.object({
   commandId: z.string().optional(),
   args: z.array(z.string()).optional(),
   manifestFingerprint: z.string().optional(),
+  releaseCommit: z.string().regex(/^[a-f0-9]{40}$/u).optional(),
   cwd: z.string().nullable(),
   reason: z.string().nullable(),
   taskIdentity: z.string().nullable().optional(),
@@ -127,7 +129,7 @@ export class LocalShellJobReadError extends DomainError {
   }
 }
 
-export interface LocalShellJobFingerprintInput {
+interface LocalShellJobFingerprintInput {
   projectId: string;
   executionTarget?: ExecutionTarget;
   command: string;
@@ -137,6 +139,7 @@ export interface LocalShellJobFingerprintInput {
   taskIdentity?: string | null;
   workSessionId?: string | null;
   manifestFingerprint?: string | null;
+  releaseCommit?: string;
   needsNetwork: boolean;
   destructive: boolean;
   writesWorkspace?: boolean;
@@ -149,10 +152,27 @@ function restartStableExecutionTarget(target: ExecutionTarget): Omit<ExecutionTa
   return stable;
 }
 
+function isJkRuntimeMaintenanceJob(input: LocalShellJobFingerprintInput): boolean {
+  if (!input.manifestFingerprint?.trim()) return false;
+  return input.command === "bash scripts/reload-jk-runtime.sh" ||
+    input.command === "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root ." ||
+    input.command === "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root . -ExecutorOnly";
+}
+
 function jobOwner(input: LocalShellJobFingerprintInput): { taskIdentity: string | null; workSessionId: string | null } {
+  // A verified clean release is owned by its stable target, even when a later
+  // call comes from another task/session. This is result reuse, not authority.
+  if (input.releaseCommit && isJkRuntimeMaintenanceJob(input) && input.executionTarget) {
+    return { taskIdentity: restartStableTargetApprovalIdentity(input.executionTarget), workSessionId: null };
+  }
   const workSessionId = input.workSessionId?.trim() || null;
   let taskIdentity = input.taskIdentity?.trim() || null;
   const continuation = input.continuation;
+  if ((input.completionProof?.kind === "executor-reconnect" || isJkRuntimeMaintenanceJob(input)) && input.executionTarget && !workSessionId) {
+    taskIdentity = `target:${createHash("sha256").update(JSON.stringify([
+      restartStableExecutionTarget(input.executionTarget), null,
+    ])).digest("hex")}`;
+  }
   // Pre-port maintenance identities included the replaced instance. Convert only
   // when the stored target and continuation prove that exact historical owner.
   if (input.completionProof?.kind === "executor-reconnect" && input.executionTarget && continuation &&
@@ -174,7 +194,7 @@ type LocalShellJobAuthorization = Pick<
 export function localShellJobFingerprint(input: LocalShellJobFingerprintInput): string {
   const commandRun = input.executionKind === "command-run";
   const executionTarget = input.executionTarget ? ExecutionTargetSchema.parse(input.executionTarget) : null;
-  const fingerprintTarget = executionTarget && input.completionProof?.kind === "executor-reconnect"
+  const fingerprintTarget = executionTarget && (input.completionProof?.kind === "executor-reconnect" || isJkRuntimeMaintenanceJob(input))
     ? restartStableExecutionTarget(executionTarget)
     : executionTarget;
   const fingerprintCompletionProof = input.completionProof?.kind === "executor-reconnect"
@@ -189,6 +209,7 @@ export function localShellJobFingerprint(input: LocalShellJobFingerprintInput): 
       // Reason is human-facing audit metadata, not execution identity.
       // A wording-only change must not create a second approval/job.
       ...jobOwner(input),
+      ...(input.releaseCommit ? { releaseCommit: input.releaseCommit } : {}),
       ...(commandRun
         ? { executionKind: "command-run" }
         : {
@@ -220,7 +241,7 @@ export function restartStableTargetApprovalIdentity(target: ExecutionTarget, tas
   ])).digest("hex")}`;
 }
 
-export interface PublicLocalShellJobRecord extends Omit<LocalShellJobRecord, "command" | "args" | "runnerInstanceId"> {
+interface PublicLocalShellJobRecord extends Omit<LocalShellJobRecord, "command" | "args" | "runnerInstanceId"> {
   commandPreview: string;
 }
 
@@ -332,6 +353,22 @@ async function reconcileInterruptedRunningJob(
   return interrupted;
 }
 
+async function reconcileExpiredPendingJob(
+  stateDir: string,
+  record: LocalShellJobRecord,
+  now = Date.now(),
+): Promise<LocalShellJobRecord> {
+  if (record.status !== "pending" || record.expiresAt > now) return record;
+  const expired: LocalShellJobRecord = {
+    ...record,
+    status: "expired",
+    finishedAt: record.finishedAt ?? now,
+    error: record.error ?? "Owner approval expired before this queued job could start. Request a fresh approval to retry.",
+  };
+  await writeJob(stateDir, expired);
+  return expired;
+}
+
 export async function readLocalShellJob(stateDir: string, id: string): Promise<LocalShellJobRecord | null> {
   if (!APPROVAL_ID_RE.test(id)) throw new LocalShellJobReadError(id, "invalid-id");
   let bytes: string;
@@ -378,6 +415,7 @@ async function readAllJobRecords(stateDir: string, now = Date.now()): Promise<Lo
       await quarantineInvalidLocalShellJob(stateDir, error);
       record = null;
     }
+    if (record) record = await reconcileExpiredPendingJob(stateDir, record, now);
     if (record) record = await reconcileInterruptedRunningJob(stateDir, record, now);
     if (record) records.push(record);
   }
@@ -396,6 +434,7 @@ export async function queueLocalShellJob(
     commandId?: string;
     args?: string[];
     manifestFingerprint?: string;
+    releaseCommit?: string;
     cwd?: string;
     reason?: string;
     taskIdentity?: string;
@@ -422,6 +461,7 @@ export async function queueLocalShellJob(
     existing &&
     recordFingerprint(existing) === fingerprint &&
     existing.status !== "denied" &&
+    existing.status !== "expired" &&
     (existing.status !== "pending" || existing.expiresAt > Date.now())
   ) {
     if (!existing.continuation && input.continuation) {
@@ -441,6 +481,7 @@ export async function queueLocalShellJob(
     commandId: input.commandId,
     args: input.args,
     manifestFingerprint: input.manifestFingerprint,
+    releaseCommit: input.releaseCommit,
     cwd: input.cwd ?? null,
     reason: input.reason ?? null,
     taskIdentity: input.taskIdentity?.trim() || null,
@@ -473,6 +514,7 @@ export async function findReusableLocalShellJob(
   for (const file of files) {
     if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
     let record = await readLocalShellJobWithInvalidQuarantine(stateDir, file.slice(0, -5));
+    if (record) record = await reconcileExpiredPendingJob(stateDir, record, now);
     if (record) record = await reconcileInterruptedRunningJob(stateDir, record, now);
     if (!record || recordFingerprint(record) !== fingerprint) continue;
     const owner = jobOwner(input);
@@ -490,6 +532,27 @@ export async function findReusableLocalShellJob(
   return candidates.sort(
     (a, b) => (b.finishedAt ?? b.startedAt ?? b.createdAt) - (a.finishedAt ?? a.startedAt ?? a.createdAt),
   )[0] ?? null;
+}
+
+// During remote reload the executor may be unable to answer manifest preflight
+// reads. Only return in-flight status here; completed results still require the
+// full commit/manifest fingerprint through findReusableLocalShellJob.
+export async function findRunningRuntimeUpgradeJob(
+  stateDir: string,
+  input: { projectId: string; executionTarget: ExecutionTarget; command: string },
+): Promise<LocalShellJobRecord | null> {
+  const targetIdentity = restartStableTargetApprovalIdentity(input.executionTarget);
+  for (const file of await readJobFiles(stateDir)) {
+    if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
+    let record = await readLocalShellJobWithInvalidQuarantine(stateDir, file.slice(0, -5));
+    if (!record || record.projectId !== input.projectId || record.command !== input.command ||
+        !isJkRuntimeMaintenanceJob(record) || !record.executionTarget ||
+        !record.destructive || record.needsNetwork || record.writesWorkspace ||
+        restartStableTargetApprovalIdentity(record.executionTarget) !== targetIdentity) continue;
+    record = await reconcileInterruptedRunningJob(stateDir, record);
+    if (record.status === "running") return record;
+  }
+  return null;
 }
 
 export async function updateLocalShellJob(
@@ -522,7 +585,8 @@ export async function markLocalShellJobDenied(stateDir: string, id: string): Pro
 export async function listRecentLocalShellJobs(stateDir: string, limit = 20): Promise<PublicLocalShellJobRecord[]> {
   const revision = await jobDirectoryRevision(stateDir);
   const cached = jobListCache.get(stateDir);
-  if (cached?.revision === revision) {
+  const now = Date.now();
+  if (cached?.revision === revision && !cached.records.some((record) => record.status === "pending" && record.expiresAt <= now)) {
     return [...cached.records]
       .sort((a, b) => {
         const aAt = a.interruptedByRestart ? (a.startedAt ?? a.createdAt) : (a.finishedAt ?? a.startedAt ?? a.createdAt);
@@ -532,12 +596,13 @@ export async function listRecentLocalShellJobs(stateDir: string, limit = 20): Pr
       .slice(0, Math.max(1, Math.min(100, limit)))
       .map(publicLocalShellJob);
   }
+  if (cached?.revision === revision) invalidateJobListCache(stateDir);
   const files = await readJobFiles(stateDir);
   const jobs: LocalShellJobRecord[] = [];
-  const now = Date.now();
   for (const file of files) {
     if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
     let record = await readLocalShellJobWithInvalidQuarantine(stateDir, file.slice(0, -5));
+    if (record) record = await reconcileExpiredPendingJob(stateDir, record, now);
     if (record) record = await reconcileInterruptedRunningJob(stateDir, record, now);
     if (record) jobs.push(record);
   }

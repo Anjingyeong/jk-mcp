@@ -320,9 +320,10 @@ export function findProject(
     const candidates = [e.projectId, e.name, ...e.aliases];
     return candidates.some((c) => normalize(c) === norm);
   });
+  const uniqueExact = [...new Map(exact.map((entry) => [entry.projectId, entry])).values()];
 
-  if (exact.length === 1) return { ok: true, entry: exact[0] as ProjectRegistryEntry };
-  if (exact.length > 1) return { ok: false, reason: "ambiguous", candidates: exact };
+  if (uniqueExact.length === 1) return { ok: true, entry: uniqueExact[0] as ProjectRegistryEntry };
+  if (uniqueExact.length > 1) return { ok: false, reason: "ambiguous", candidates: uniqueExact };
 
   if (entries.length === 0) return { ok: false, reason: "not_found" };
 

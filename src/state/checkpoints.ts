@@ -9,7 +9,7 @@ import { redact } from "../policy/secrets.js";
 const execFileAsync = promisify(execFile);
 const MAX_DIFF_BYTES = 2 * 1024 * 1024;
 
-export interface CheckpointRecord {
+interface CheckpointRecord {
   checkpointId: string;
   projectId: string;
   createdAt: number;

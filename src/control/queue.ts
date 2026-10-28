@@ -88,7 +88,7 @@ export interface ControlActionRecord {
 
 /** Redacted shape safe to return to a model/API caller: `text` is replaced
  * by a length + sha8 summary, never the original characters. */
-export type ControlActionSummary = Omit<ControlActionRecord, "text"> & {
+type ControlActionSummary = Omit<ControlActionRecord, "text"> & {
   textSummary?: { length: number; sha8: string };
 };
 
@@ -214,7 +214,7 @@ export async function clearKill(stateDir: string): Promise<void> {
   await fs.unlink(killFlagPath(stateDir)).catch(() => undefined);
 }
 
-export interface EnqueueInput {
+interface EnqueueInput {
   projectId?: string;
   appName: string;
   kind: ControlActionKind;

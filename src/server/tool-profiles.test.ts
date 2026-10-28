@@ -104,12 +104,28 @@ describe("tool profiles", () => {
     expect(listed).toContain("goal_loop");
     expect(listed).toContain("runtime_upgrade");
     expect(listed).toContain("e2e_test_and_show_screenshot");
+    expect(listed).not.toContain("save_image_from_url");
     expect(registered).toContain("git_status");
     expect(registered).toContain("git_diff_summary");
+    expect(registered).toContain("save_image_from_url");
     expect(listed).not.toContain("impulse_event_record");
     expect(listed).not.toContain("impulse_scout_run");
     expect(listed).toEqual(expect.arrayContaining(["impulse_wake_queue", "impulse_director_decide", "impulse_director_policy"]));
     expect(registered).toEqual(expect.arrayContaining(["impulse_event_record", "impulse_scout_run"]));
+  });
+
+  it("keeps image helpers opt-in without unregistering them", async () => {
+    const defaults = await listNames();
+    expect(defaults.listed).not.toContain("save_image_from_url");
+    expect(defaults.registered).toContain("save_image_from_url");
+
+    process.env.JK_TOOL_PROFILES = "+image";
+    const enabled = await listNames();
+    expect(enabled.listed).toEqual(expect.arrayContaining([
+      "save_image_from_url",
+      "save_image_from_clipboard",
+      "retrieve_image",
+    ]));
   });
 
   it("JK_TOOL_PROFILES=+debug lists the Impulse Scout plumbing tools", async () => {

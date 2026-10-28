@@ -28,10 +28,10 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const LEDGER_FILE = "audit.jsonl";
 const ROTATED_RE = /^audit\.(\d{13})(?:-(\d+))?\.jsonl$/;
-export const DEFAULT_AUDIT_MAX_BYTES = 20 * 1024 * 1024;
-export const DEFAULT_AUDIT_KEEP = 5;
+const DEFAULT_AUDIT_MAX_BYTES = 20 * 1024 * 1024;
+const DEFAULT_AUDIT_KEEP = 5;
 
-export interface LedgerOptions {
+interface LedgerOptions {
   /** Rotate when the active file reaches this many bytes. 0 disables. */
   maxBytes?: number;
   /** Rotated files to keep (oldest pruned first). */

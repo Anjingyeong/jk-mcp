@@ -122,6 +122,8 @@ You describe the goal in plain language; you don't need to know any tool names.
 ### Everything a coding session needs
 Project selection, code search, narrow file reads, guarded patches, allowlisted commands and shell jobs, Git status/diff/commit/explicit push, dev servers, browser E2E with screenshots, image intake, external MCP routing, and runtime health checks.
 
+Full list of all 70 tools, grouped: [docs/FEATURES.md](docs/FEATURES.md).
+
 ## Safety model
 
 JK is intended for trusted development environments.

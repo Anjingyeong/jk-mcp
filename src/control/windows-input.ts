@@ -5,9 +5,9 @@ import { buildSafeChildEnv } from "../exec/command-runner.js";
 import { DomainError, ErrorCode } from "../types.js";
 import { SENSITIVE_APP_DENYLIST } from "./policy.js";
 
-export type WindowsComputerActionKind = "click" | "type" | "key" | "scroll";
+type WindowsComputerActionKind = "click" | "type" | "key" | "scroll";
 
-export interface WindowsComputerActionInput {
+interface WindowsComputerActionInput {
   appName: string;
   kind: WindowsComputerActionKind;
   windowPoint?: { xRel: number; yRel: number };
@@ -16,13 +16,13 @@ export interface WindowsComputerActionInput {
   scrollDelta?: number;
 }
 
-export interface WindowsComputerActionResult {
+interface WindowsComputerActionResult {
   ok: true;
   frontmostProcess: string;
   point?: { x: number; y: number };
 }
 
-export interface WindowsComputerScreenshotResult {
+interface WindowsComputerScreenshotResult {
   path: string;
   bytes: number;
   imageBase64: string;

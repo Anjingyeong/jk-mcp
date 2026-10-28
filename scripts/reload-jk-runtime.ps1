@@ -33,6 +33,51 @@ function Normalize-ProcessCommandLine([string]$Value) {
   return $Value.Replace("\\", "\")
 }
 
+function Convert-ToValidPort($Value) {
+  $parsed = 0
+  if ($null -ne $Value -and [int]::TryParse("$Value", [ref]$parsed) -and $parsed -gt 0 -and $parsed -le 65535) {
+    return $parsed
+  }
+  return $null
+}
+
+function Resolve-LocalPort {
+  foreach ($name in @("JK_PORT", "CHATGPT2CODEX_PORT", "PORT")) {
+    $candidate = Convert-ToValidPort ([Environment]::GetEnvironmentVariable($name, "Process"))
+    if ($null -ne $candidate) { return $candidate }
+    if ($name -ne "PORT") {
+      $candidate = Convert-ToValidPort ([Environment]::GetEnvironmentVariable($name, "User"))
+      if ($null -ne $candidate) { return $candidate }
+    }
+  }
+
+  $settingsPath = Join-Path $env:LOCALAPPDATA "JK\settings.ini"
+  if (Test-Path -LiteralPath $settingsPath) {
+    try {
+      $portLine = Get-Content -LiteralPath $settingsPath -ErrorAction Stop | Where-Object { $_ -like "Port=*" } | Select-Object -First 1
+      if ($portLine) {
+        $encoded = $portLine.Substring(5)
+        $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+        $candidate = Convert-ToValidPort $decoded
+        if ($null -ne $candidate) { return $candidate }
+      }
+    } catch {}
+  }
+
+  $legacySettingsPath = Join-Path $env:APPDATA "JK\settings.json"
+  if (Test-Path -LiteralPath $legacySettingsPath) {
+    try {
+      $legacy = Get-Content -Raw -LiteralPath $legacySettingsPath -ErrorAction Stop | ConvertFrom-Json
+      $candidate = Convert-ToValidPort $legacy.Port
+      if ($null -ne $candidate) { return $candidate }
+    } catch {}
+  }
+
+  return 7979
+}
+
+$LocalPort = Resolve-LocalPort
+
 function Test-RuntimePackage([string]$RuntimeRoot) {
   return (Test-Path -LiteralPath (Join-Path $RuntimeRoot "JK.exe")) -and
     ((Test-Path -LiteralPath (Join-Path $RuntimeRoot "start-jk.ps1")) -or
@@ -112,7 +157,7 @@ function Remove-SuccessfulSwapArtifacts {
 function Wait-Listen([int]$Seconds) {
   for ($i = 0; $i -lt $Seconds; $i++) {
     try {
-      $listener = Get-NetTCPConnection -LocalPort 7979 -State Listen -ErrorAction Stop
+      $listener = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction Stop
       if ($listener) { return $true }
     } catch {}
     Start-Sleep -Seconds 1
@@ -146,7 +191,7 @@ function Wait-Executor([int]$Seconds, [int]$StableSeconds = 0) {
 
 function Test-LocalListener {
   try {
-    $listener = Get-NetTCPConnection -LocalPort 7979 -State Listen -ErrorAction Stop
+    $listener = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction Stop
     return [bool]$listener
   } catch {
     return $false
@@ -246,17 +291,17 @@ try {
       throw "new JK runtime did not keep the outbound executor and launcher alive for 20 consecutive seconds"
     }
     if (Test-LocalListener) {
-      throw "executor-only runtime unexpectedly exposed 127.0.0.1:7979"
+      throw "executor-only runtime unexpectedly exposed 127.0.0.1:$LocalPort"
     }
   } else {
     if (-not (Wait-Listen 20)) {
-      throw "new JK runtime did not listen on 127.0.0.1:7979 within 20 seconds"
+      throw "new JK runtime did not listen on 127.0.0.1:$LocalPort within 20 seconds"
     }
     $verifySchema = Join-Path $Root "scripts\verify-live-runtime-schema.mjs"
     if (-not (Test-Path -LiteralPath $verifySchema)) {
       throw "runtime schema verifier is missing: $verifySchema"
     }
-    & node $verifySchema "http://127.0.0.1:7979" $Live
+    & node $verifySchema "http://127.0.0.1:$LocalPort" $Live
     if ($LASTEXITCODE -ne 0) {
       throw "new JK runtime failed registered tools/list schema verification"
     }
@@ -271,7 +316,7 @@ try {
   if ($ExecutorOnly) {
     Write-Log "swap-success mode=executor-only local-port=disabled executor=stable"
   } else {
-    Write-Log "swap-success mode=local port=7979 schema=verified"
+    Write-Log "swap-success mode=local port=$LocalPort schema=verified"
   }
   Remove-SuccessfulSwapArtifacts
   exit 0

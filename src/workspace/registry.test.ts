@@ -254,6 +254,13 @@ describe("findProject", () => {
     if (result.ok) expect(result.entry.projectId).toBe("alpha-app");
   });
 
+  it("treats duplicate registry rows for one canonical project as one exact match", () => {
+    const duplicateBeta = { ...beta, root: "/workspace/reconnected/beta-app" };
+    const result = findProject([alpha, beta, duplicateBeta, gamma], { name: "beta" });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.entry.projectId).toBe("beta-app");
+  });
+
   it("returns ambiguous with candidates when multiple entries share a normalized name", () => {
     const dupA: ProjectRegistryEntry = {
       projectId: "shop-a",

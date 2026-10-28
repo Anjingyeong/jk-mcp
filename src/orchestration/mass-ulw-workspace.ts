@@ -256,7 +256,7 @@ export async function createMassUlwWorkspace(options: MassUlwWorkspaceOptions): 
 }
 
 /** Execute lane callbacks concurrently, then integrate and publish; private workspaces are always removed. */
-export async function runMassUlwWorkspace(
+async function runMassUlwWorkspace(
   options: MassUlwWorkspaceOptions,
   executeLane: (lane: MassUlwLaneCheckout) => void | Promise<void>,
 ): Promise<MassUlwPublishResult> {

@@ -1,5 +1,5 @@
-export const JK_APP_NAME = "jk";
-export const JK_TOOL_NAMESPACE = "ChatGPT_To_Codex";
+const JK_APP_NAME = "jk";
+const JK_TOOL_NAMESPACE = "ChatGPT_To_Codex";
 
 export const TOOL_AVAILABILITY_GATE = {
   namespace: JK_TOOL_NAMESPACE,

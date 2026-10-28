@@ -5,9 +5,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   consumeLocalShellApproval,
+  consumeLocalShellApprovalGrant,
   listPendingLocalShellApprovals,
   requestLocalShellApproval,
   resolveLocalShellApproval,
+  taskApprovalIdentity,
   type LocalShellApprovalInput,
 } from "./local-approvals.js";
 
@@ -36,6 +38,66 @@ function input(overrides: Partial<LocalShellApprovalInput> = {}): LocalShellAppr
 }
 
 describe("local shell approvals", () => {
+  it("does not use a renewable lease as durable approval ownership", () => {
+    expect(taskApprovalIdentity({ leaseId: "lease-a" })).toBeUndefined();
+    expect(taskApprovalIdentity({ leaseId: "lease-b" })).toBeUndefined();
+    expect(taskApprovalIdentity({ workSessionId: "ws_a", leaseId: "lease-a" })).toBe("work-session:ws_a");
+  });
+
+  it("reuses an approved risk ceiling for the same command but never escalates risk", async () => {
+    const dir = await stateDir();
+    const taskIdentity = "target:cloudflare-health";
+    const firstCommand = "cloudflared tunnel list";
+    const followUp = "cloudflared tunnel info jk-cloud";
+    const bundled = await requestLocalShellApproval(dir, input({
+      command: firstCommand,
+      taskIdentity,
+      needsNetwork: true,
+      destructive: false,
+      bundle: {
+        label: "Cloudflare health",
+        entries: [
+          { command: firstCommand, needsNetwork: true, destructive: false },
+          { command: followUp, needsNetwork: true, destructive: false },
+        ],
+      },
+    }));
+
+    const lowerRiskPending = await requestLocalShellApproval(dir, input({
+      command: followUp,
+      taskIdentity,
+      needsNetwork: false,
+      destructive: false,
+    }));
+    expect(lowerRiskPending.id).toBe(bundled.id);
+    await resolveLocalShellApproval(dir, bundled.id, "approve");
+    expect(await consumeLocalShellApproval(dir, input({
+      command: followUp,
+      taskIdentity,
+      needsNetwork: false,
+      destructive: false,
+    }))).toBe(true);
+
+    const secondDir = await stateDir();
+    const low = await requestLocalShellApproval(secondDir, input({
+      command: firstCommand,
+      taskIdentity,
+      needsNetwork: false,
+      destructive: false,
+      bundle: {
+        label: "Local-only health",
+        entries: [{ command: followUp, needsNetwork: false, destructive: false }],
+      },
+    }));
+    await resolveLocalShellApproval(secondDir, low.id, "approve");
+    expect(await consumeLocalShellApproval(secondDir, input({
+      command: followUp,
+      taskIdentity,
+      needsNetwork: true,
+      destructive: false,
+    }))).toBe(false);
+  });
+
   it("consumes distinct approved bundle commands concurrently without losing a grant", async () => {
     const dir = await stateDir();
     const commands = Array.from({ length: 8 }, (_, i) => `release-part-${i}`);
@@ -640,5 +702,87 @@ describe("local shell approvals", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it("shares a clean-commit JK release scope across fixed OCI and Windows reload commands only", async () => {
+    const dir = await stateDir();
+    const scope = {
+      key: `maintenance:jk:release:${"a".repeat(40)}`,
+      label: "JK release runtime maintenance (OCI + registered Windows executor)",
+      ttlMs: 15 * 60 * 1000,
+    };
+    const local = input({
+      projectId: "chatgpt2codex",
+      command: "bash scripts/reload-jk-runtime.sh",
+      needsNetwork: false,
+      destructive: true,
+      scope,
+    });
+    const requested = await requestLocalShellApproval(dir, local);
+    await resolveLocalShellApproval(dir, requested.id, "approve");
+
+    expect(await consumeLocalShellApproval(dir, input({
+      projectId: "chatgpt2codex",
+      command: "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\reload-jk-runtime.ps1 -Root . -ExecutorOnly",
+      needsNetwork: false,
+      destructive: true,
+      scope,
+    }))).toBe(true);
+    expect(await consumeLocalShellApproval(dir, input({
+      projectId: "chatgpt2codex",
+      command: "rm -rf build/other",
+      needsNetwork: false,
+      destructive: true,
+      scope,
+    }))).toBe(false);
+  });
+
+  it("does not reuse a pending approval card across different JK release commit scopes", async () => {
+    const dir = await stateDir();
+    const base = {
+      projectId: "chatgpt2codex",
+      command: "bash scripts/reload-jk-runtime.sh",
+      reason: "Authorize JK Release",
+      needsNetwork: false,
+      destructive: true,
+    };
+    const releaseA = input({
+      ...base,
+      scope: { key: `maintenance:jk:release:${"a".repeat(40)}`, label: "JK Release A" },
+    });
+    const releaseB = input({
+      ...base,
+      scope: { key: `maintenance:jk:release:${"b".repeat(40)}`, label: "JK Release B" },
+    });
+
+    const first = await requestLocalShellApproval(dir, releaseA);
+    const second = await requestLocalShellApproval(dir, releaseB);
+    expect(second.id).not.toBe(first.id);
+    expect(first.scopeKey).toBe(releaseA.scope?.key);
+    expect(second.scopeKey).toBe(releaseB.scope?.key);
+    expect(await listPendingLocalShellApprovals(dir)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: first.id, scopeKey: releaseA.scope?.key }),
+        expect.objectContaining({ id: second.id, scopeKey: releaseB.scope?.key }),
+      ]),
+    );
+  });
+
+  it("returns the actual bounded scope lifetime and never grants arbitrary destructive shell or expired release authority", async () => {
+    const dir = await stateDir();
+    const local = input({ command: "bash scripts/reload-jk-runtime.sh", needsNetwork: false, destructive: true,
+      scope: { key: `maintenance:jk:release:${"a".repeat(40)}`, label: "JK Release", ttlMs: 60_000 } });
+    const requested = await requestLocalShellApproval(dir, local);
+    const approved = await resolveLocalShellApproval(dir, requested.id, "approve");
+    expect((await consumeLocalShellApprovalGrant(dir, local))?.source).toBe("exact");
+    const grant = await consumeLocalShellApprovalGrant(dir, local);
+    expect(grant).toMatchObject({ source: "scope", scopeId: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      createdAt: approved.resolvedAt, expiresAt: approved.resolvedAt! + 60_000 });
+    for (const command of ["rm -rf build/other", "Remove-Item .\\build -Recurse -Force", "bash scripts/reload-jk-runtime.sh; rm -rf other"]) {
+      expect(await consumeLocalShellApprovalGrant(dir, { ...local, command })).toBeNull();
+    }
+    const clock = vi.spyOn(Date, "now").mockReturnValue(approved.resolvedAt! + 60_000);
+    try { expect(await consumeLocalShellApprovalGrant(dir, local)).toBeNull(); }
+    finally { clock.mockRestore(); }
   });
 });

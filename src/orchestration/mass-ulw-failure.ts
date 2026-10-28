@@ -49,7 +49,7 @@ export const MassUlwFailureDiagnosticSchema = z.object({
   message: boundedDiagnosticString(MAX_FAILURE_MESSAGE_CHARS).pipe(z.string().min(1)),
 }).strict();
 
-export type MassUlwFailureStage = z.infer<typeof MassUlwFailureStageSchema>;
+type MassUlwFailureStage = z.infer<typeof MassUlwFailureStageSchema>;
 export type MassUlwFailureDiagnostic = z.infer<typeof MassUlwFailureDiagnosticSchema>;
 
 export class MassUlwStageError extends Error {

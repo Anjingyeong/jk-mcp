@@ -35,7 +35,7 @@ export function impulseResumeLine(summary: DirectorResumeSummary | null): string
   return ` Impulse Director: ${summary.pendingDirectorTasks} pending Director task(s), ${summary.unresolvedP0} undecided P0 proposal(s) — ${summary.hint}`;
 }
 
-export interface GoalLoopCheckpointInput {
+interface GoalLoopCheckpointInput {
   loopId: string;
   goalId: string | null;
   workSessionId: string | null;
@@ -117,7 +117,7 @@ export function goalLoopCheckpointEvents(input: GoalLoopCheckpointInput): Impuls
   return events;
 }
 
-export interface ImpulseCheckpointSummary {
+interface ImpulseCheckpointSummary {
   recordedEvents: number;
   newProposals: number;
   top: ReturnType<typeof summarizeProposals>;

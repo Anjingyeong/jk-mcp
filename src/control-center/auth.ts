@@ -44,7 +44,7 @@ function rawPeerIsLoopback(req: Request): boolean {
   return raw === "127.0.0.1" || raw === "::1";
 }
 
-export function remoteManagementConfig(): RemoteManagementConfig {
+function remoteManagementConfig(): RemoteManagementConfig {
   const host = normalizeHostname(process.env.JK_REMOTE_MANAGEMENT_HOST);
   return {
     host: host || null,

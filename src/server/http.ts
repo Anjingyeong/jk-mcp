@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import express from "express";
 import type { Express, Request, Response } from "express";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import {
   createOAuthMetadata,
   getOAuthProtectedResourceMetadataUrl,
@@ -17,7 +18,7 @@ import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
 import { registerRoleManagementRoutes } from "../roles/http.js";
 import { registerControlCenterRoutes } from "../control-center/http.js";
-import { registerExecutorRoutes } from "../executors/http.js";
+import { registerExecutorRoutes, requireWorkerResultAuth } from "../executors/http.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -28,7 +29,7 @@ import { registerExecutorRoutes } from "../executors/http.js";
  * Does not alter or remove the stdio transport path in src/cli.ts.
  */
 
-export interface HttpServerConfig {
+interface HttpServerConfig {
   /** Bind host, default 127.0.0.1 (loopback only unless overridden). */
   host: string;
   /** Bind port, default 7979 (PRD §5). */
@@ -67,7 +68,7 @@ export function defaultHttpServerConfig(overrides: Partial<HttpServerConfig> = {
       accessTokenTtlSeconds: 3600,
       refreshTokenTtlSeconds: 30 * 24 * 3600,
       scopes: ["chatgpt2codex"],
-      allowedRedirectHosts: ["chatgpt.com", "chat.openai.com"],
+      allowedRedirectHosts: ["chatgpt.com", "chat.openai.com", "claude.ai", "claude.com"],
     },
     sessionTtlMs: 30 * 60 * 1000,
     maxSessions: 100,
@@ -89,7 +90,12 @@ function hashAuditValue(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
 }
 
-const TRUSTED_CHATGPT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"] as const;
+const TRUSTED_MCP_CLIENT_ORIGINS = [
+  "https://chatgpt.com",
+  "https://chat.openai.com",
+  "https://claude.ai",
+  "https://claude.com",
+] as const;
 const OWNER_TOKEN_TOGGLE_SCRIPT = `
 (() => {
   const input = document.getElementById("owner_token");
@@ -119,8 +125,8 @@ function securityHeaders(_req: Request, res: Response, next: () => void): void {
       "default-src 'none'",
       "base-uri 'none'",
       "script-src 'self'",
-      `form-action 'self' ${TRUSTED_CHATGPT_ORIGINS.join(" ")}`,
-      `frame-ancestors 'self' ${TRUSTED_CHATGPT_ORIGINS.join(" ")}`,
+      `form-action 'self' ${TRUSTED_MCP_CLIENT_ORIGINS.join(" ")}`,
+      `frame-ancestors 'self' ${TRUSTED_MCP_CLIENT_ORIGINS.join(" ")}`,
       "style-src 'unsafe-inline'",
     ].join("; "),
   );
@@ -167,7 +173,7 @@ function isOAuthBrowserFlowPath(pathName: string): boolean {
   );
 }
 
-export interface RunningHttpServer {
+interface RunningHttpServer {
   app: Express;
   config: HttpServerConfig;
   close(): void;
@@ -200,10 +206,21 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     ]),
   );
 
-  const app = createMcpExpressApp({
-    host: config.host,
-    allowedHosts: allowedHostHeaders,
-  });
+  // The SDK's default express.json() limit is 100 KB. A Windows executor can
+  // legitimately return more than that for repo_status on a large workspace.
+  // Parse ONLY authenticated executor-result submissions with a bounded 1 MB
+  // limit before the default parser; all other routes retain 100 KB.
+  // Host validation must happen BEFORE JSON parsing and authorization must
+  // happen BEFORE accepting the larger executor-only body.
+  const app = express();
+  app.use(hostHeaderValidation(allowedHostHeaders));
+  app.post(
+    "/api/executors/:executorId/jobs/:jobId/result",
+    requireWorkerResultAuth(ctx),
+    express.json({ limit: "1mb" }),
+    (_req, _res, next) => next(),
+  );
+  app.use(express.json());
   // Host-local reverse proxies may terminate on loopback and forward
   // X-Forwarded-For; trust only loopback proxies so rate-limit keys clients.
   app.set("trust proxy", "loopback");
@@ -214,7 +231,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     `http://127.0.0.1:${config.port}`,
     `http://localhost:${config.port}`,
     ...(remoteManagementHost ? [`https://${remoteManagementHost}`] : []),
-    ...TRUSTED_CHATGPT_ORIGINS,
+    ...TRUSTED_MCP_CLIENT_ORIGINS,
   ]);
   app.use(makeOriginAllowlist(allowedOrigins));
 

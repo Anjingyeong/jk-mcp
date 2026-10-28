@@ -39,10 +39,8 @@ import {
  *    task may only be cancelled (REJECT) while it is not completed
  */
 
-export const DECISIONS_FILE = "decisions.jsonl";
-export const POLICY_FILE = "director_policy.json";
-const MAX_DECISION_RECORDS = 5000;
-const KEEP_DECISION_RECORDS = 4000;
+const DECISIONS_FILE = "decisions.jsonl";
+const POLICY_FILE = "director_policy.json";
 export const DEFAULT_MAX_CYCLES_PER_LOOP = 3;
 export const HARD_MAX_CYCLES_PER_LOOP = 10;
 const NEXT_PHASE_MIN_CONFIDENCE = 0.7;
@@ -52,20 +50,20 @@ const Text = (max: number) => z.string().min(1).max(max);
 const IsoTime = z.string().datetime({ offset: true });
 const Scope = z.string().trim().min(1).max(300);
 
-export const DirectorPolicySchema = z.object({
+const DirectorPolicySchema = z.object({
   schemaVersion: z.literal(1),
   protectedScopes: z.array(Scope).max(100).default([]),
   maxCyclesPerLoop: z.number().int().min(0).max(HARD_MAX_CYCLES_PER_LOOP).default(DEFAULT_MAX_CYCLES_PER_LOOP),
   updatedAt: IsoTime.nullable().default(null),
 });
-export type DirectorPolicy = z.infer<typeof DirectorPolicySchema>;
+type DirectorPolicy = z.infer<typeof DirectorPolicySchema>;
 
-export function defaultDirectorPolicy(): DirectorPolicy {
+function defaultDirectorPolicy(): DirectorPolicy {
   return { schemaVersion: 1, protectedScopes: [], maxCyclesPerLoop: DEFAULT_MAX_CYCLES_PER_LOOP, updatedAt: null };
 }
 
-export const DIRECTOR_TASK_STATUSES = ["approved", "injected", "completed", "dropped"] as const;
-export type DirectorTaskStatus = (typeof DIRECTOR_TASK_STATUSES)[number];
+const DIRECTOR_TASK_STATUSES = ["approved", "injected", "completed", "dropped"] as const;
+type DirectorTaskStatus = (typeof DIRECTOR_TASK_STATUSES)[number];
 export const PROPOSAL_STATUSES = ["open", "backlog", "rejected", "approved", "completed", "cancelled"] as const;
 export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
 
@@ -80,7 +78,7 @@ const RecommendationSchema = z.object({
   decision: z.enum(DIRECTOR_DECISIONS),
   checks: z.array(z.object({ id: Text(40), ok: z.boolean(), detail: Text(300) })).max(10),
 });
-export type DirectorRecommendation = z.infer<typeof RecommendationSchema>;
+type DirectorRecommendation = z.infer<typeof RecommendationSchema>;
 
 const DecisionRecordSchema = z.object({
   kind: z.literal("decision"),
@@ -145,7 +143,7 @@ export interface DirectorTask {
   updatedAt: string;
 }
 
-export interface DirectorLedger {
+interface DirectorLedger {
   decisions: DirectorDecisionRecord[];
   /** Latest live decision per proposal. */
   latestByProposal: Map<string, DirectorDecisionRecord>;
@@ -238,7 +236,7 @@ export function scopesOverlap(a: string, b: string): boolean {
   return x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`);
 }
 
-export function protectedConflicts(scopes: string[], policy: DirectorPolicy): string[] {
+function protectedConflicts(scopes: string[], policy: DirectorPolicy): string[] {
   return policy.protectedScopes.filter((guarded) => scopes.some((scope) => scopesOverlap(scope, guarded)));
 }
 
@@ -253,7 +251,7 @@ async function loopLifecycle(stateDir: string, loopId: string): Promise<string |
 }
 
 /** Director Policy §9 checks, evaluated in order, producing an advisory recommendation. */
-export function recommendDecision(input: {
+function recommendDecision(input: {
   proposal: WakeProposal;
   policy: DirectorPolicy;
   ledger: DirectorLedger;
@@ -329,7 +327,7 @@ function uniqueClean(values: string[] | undefined, maxItems: number, maxLength: 
   return Array.from(new Set((values ?? []).map((value) => clean(value, maxLength)).filter(Boolean))).slice(0, maxItems);
 }
 
-export function directorTaskLabel(taskId: string, suggestedNext: string): string {
+function directorTaskLabel(taskId: string, suggestedNext: string): string {
   const prefix = `[director:${taskId}] `;
   return `${prefix}${clean(suggestedNext, 500 - prefix.length)}`;
 }
@@ -352,7 +350,7 @@ export interface DecideInput {
   now?: () => Date;
 }
 
-export interface DecideResult {
+interface DecideResult {
   decision: DirectorDecisionRecord;
   task: DirectorTask | null;
   duplicate: boolean;
@@ -458,7 +456,10 @@ export async function decideProposal(input: DecideInput): Promise<DecideResult> 
       caller: input.caller,
       decidedAt: now().toISOString(),
     });
-    await tx.appendJsonl(DECISIONS_FILE, [record], MAX_DECISION_RECORDS, KEEP_DECISION_RECORDS);
+    // decisions.jsonl is the single Director authority. It must remain
+    // append-only until a snapshot-aware compactor exists; dropping old
+    // decisions can erase open tasks or make cycle budget appear unused.
+    await tx.appendAuthorityJsonl(DECISIONS_FILE, [record]);
     const next = buildLedger([...(await tx.readJsonl(DECISIONS_FILE, LedgerRecordSchema))], proposals);
     const createdTask = task ? next.tasks.get(task.taskId) ?? null : null;
     return {
@@ -471,7 +472,7 @@ export async function decideProposal(input: DecideInput): Promise<DecideResult> 
   });
 }
 
-export interface PolicyUpdateInput {
+interface PolicyUpdateInput {
   stateDir: string;
   projectId: string;
   caller: "remote" | "local";
@@ -527,13 +528,13 @@ export async function resetDirectorCycles(input: {
       kind: "cycle_reset", schemaVersion: 1, loopId: input.loopId, reason, caller: input.caller,
       at: (input.now ?? (() => new Date()))().toISOString(),
     });
-    await tx.appendJsonl(DECISIONS_FILE, [record], MAX_DECISION_RECORDS, KEEP_DECISION_RECORDS);
+    await tx.appendAuthorityJsonl(DECISIONS_FILE, [record]);
     const { ledger } = await readLedger(tx);
     return cycleStatus(ledger, policy, input.loopId);
   });
 }
 
-export interface AnnotatedProposal extends WakeProposal {
+interface AnnotatedProposal extends WakeProposal {
   status: ProposalStatus;
   decisionId: string | null;
   taskId: string | null;
@@ -619,7 +620,7 @@ export async function syncDirectorTasks(input: {
         records.push({ kind: "task_status", schemaVersion: 1, taskId, status: "injected", loopRevision: input.loopRevision, reason: null, at });
       }
     }
-    await tx.appendJsonl(DECISIONS_FILE, records.map((record) => TaskStatusRecordSchema.parse(record)), MAX_DECISION_RECORDS, KEEP_DECISION_RECORDS);
+    await tx.appendAuthorityJsonl(DECISIONS_FILE, records.map((record) => TaskStatusRecordSchema.parse(record)));
   });
 }
 
@@ -644,7 +645,7 @@ export function undecidedP0Notice(count: number): string | null {
     : null;
 }
 
-export interface DirectorSnapshot {
+interface DirectorSnapshot {
   ledger: DirectorLedger;
   proposals: Map<string, WakeProposal>;
   /** null when director_policy.json is corrupt (callers must fail closed for writes). */

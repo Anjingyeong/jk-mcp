@@ -27,7 +27,7 @@ const MAX_REDIRECTS = 3;
 const MAX_SHARE_PAGE_BYTES_TO_PARSE = 2 * 1024 * 1024;
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-export interface FetchImageResult {
+interface FetchImageResult {
   bytes: Buffer;
   mime: SavedImage["mime"];
 }
@@ -63,7 +63,7 @@ export type FetchLike = (
   arrayBuffer(): Promise<ArrayBuffer>;
 }>;
 
-export interface FetchImageOptions {
+interface FetchImageOptions {
   /** Injectable fetch implementation; defaults to the global fetch. */
   fetchImpl?: FetchLike;
   /** Injectable DNS resolver (all=true style); defaults to node:dns/promises lookup. */

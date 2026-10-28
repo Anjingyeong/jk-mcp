@@ -5,7 +5,7 @@ import { z } from "zod";
 
 export const EXECUTOR_PROTOCOL_VERSION = 1 as const;
 export const TARGET_CAPABILITY = "execution-target-v1";
-export const RUNTIME_INSTANCE_ID = randomUUID();
+const RUNTIME_INSTANCE_ID = randomUUID();
 
 // Additive, opt-in transport. Legacy execution-target-v1 semantics are unchanged.
 export const DURABLE_RESULT_CAPABILITY = "durable-result-v1";

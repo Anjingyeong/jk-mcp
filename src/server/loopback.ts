@@ -10,7 +10,7 @@ export function isLoopbackRequest(req: Request): boolean {
   return ip === "127.0.0.1" || ip === "::1";
 }
 
-export function requireLoopback(req: Request, res: Response, next: NextFunction): void {
+function requireLoopback(req: Request, res: Response, next: NextFunction): void {
   if (isLoopbackRequest(req)) {
     next();
     return;

@@ -110,6 +110,8 @@ export const MASS_ULW_DASHBOARD_SCRIPT = String.raw`  function massUlwNodeIcon(s
     const massUlw = e.massUlw;
     if (!massUlw) return '';
     const lanes = Array.isArray(massUlw.lanes) ? massUlw.lanes : [];
+    const planning = massUlw.source === 'plan';
+    const sequentialPlan = planning && massUlw.planState === 'sequential';
     const completed = lanes.filter(lane => lane.status === 'completed').length;
     const running = lanes.filter(lane => lane.status === 'in-flight').length;
     const waiting = lanes.filter(lane => lane.status === 'planned').length;
@@ -117,9 +119,23 @@ export const MASS_ULW_DASHBOARD_SCRIPT = String.raw`  function massUlwNodeIcon(s
     const percent = lanes.length ? Math.round(completed / lanes.length * 100) : 0;
     const legend = [['in-flight','실행 중'],['ready','준비됨'],['planned','대기'],['completed','완료'],['failed','실패'],['blocked','막힘']]
       .map(([status, text]) => '<span class="run-legend-item" data-legend="' + status + '"><i></i>' + text + '</span>').join('');
+    const eyebrow = planning ? (sequentialPlan ? 'WORK PLAN' : 'PARALLEL PLAN') : 'PARALLEL WORK';
+    const title = planning
+      ? (sequentialPlan ? '순차 실행 계획 · ' + lanes.length + '개 작업' : '병렬 실행 계획 · ' + lanes.length + '개 lane · ' + (massUlw.waves || []).length + ' waves')
+      : '병렬 작업 ' + running + '개 실행 중 · ' + completed + '/' + lanes.length + ' 완료';
+    const waveBadge = planning
+      ? '<span class="badge">' + esc((massUlw.waves || []).length) + ' waves</span>'
+      : '<span class="badge">Wave ' + esc(massUlw.currentWave === null ? '—' : massUlw.currentWave + 1) + '</span>';
+    const stateBadge = planning
+      ? '<span class="badge default">' + (sequentialPlan ? '순차 권장' : 'fan-out 계획') + '</span>'
+      : '<span class="badge default">검증 ' + esc(massUlw.verification) + '</span>';
+    const planNote = planning
+      ? '<div class="sub" style="margin-top:10px">실행 전 계획 DAG · 실제 실행이 시작되면 같은 노드가 실행/완료/실패 상태로 전환됩니다.</div>'
+      : '';
     return '<section class="mass-run" aria-label="MASS ULW 작업 그래프">' +
-      '<div class="mass-run-head"><div><div class="dashboard-eyebrow">PARALLEL WORK</div><div class="mass-run-title">병렬 작업 ' + esc(running) + '개 실행 중 · ' + esc(completed) + '/' + esc(lanes.length) + ' 완료</div></div>' +
-      '<div class="badges"><span class="badge">Wave ' + esc(massUlw.currentWave === null ? '—' : massUlw.currentWave + 1) + '</span><span class="badge default">검증 ' + esc(massUlw.verification) + '</span><span class="run-percent">' + esc(percent) + '%</span></div></div>' +
+      '<div class="mass-run-head"><div><div class="dashboard-eyebrow">' + eyebrow + '</div><div class="mass-run-title">' + esc(title) + '</div></div>' +
+      '<div class="badges">' + waveBadge + stateBadge + (planning ? '' : '<span class="run-percent">' + esc(percent) + '%</span>') + '</div></div>' +
+      planNote +
       massUlwProgressHtml({ completed, running, waiting, trouble }, lanes.length) +
       '<div class="run-stats" aria-label="Lane status summary"><span data-stat="running"><strong>' + esc(running) + '</strong> 실행</span><span data-stat="waiting"><strong>' + esc(waiting) + '</strong> 대기</span><span data-stat="completed"><strong>' + esc(completed) + '</strong> 완료</span><span data-stat="trouble" class="' + (trouble ? 'danger-text' : '') + '"><strong>' + esc(trouble) + '</strong> 문제</span></div>' +
       '<div class="run-dag">' + massUlwGraphHtml(lanes, massUlw.currentWave) + '<div class="run-legend" aria-hidden="true">' + legend + '<span class="run-legend-hint">노드에 마우스를 올리면 연결된 의존관계가 강조됩니다</span><span class="run-legend-swipe">옆으로 밀어서 전체 보기 →</span></div></div>' +

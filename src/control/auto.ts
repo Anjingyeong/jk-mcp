@@ -36,7 +36,7 @@ export type AutoActionKind = "click" | "type" | "key" | "scroll";
 
 /** On-disk shape. Contains no secrets and no input text/payloads — just app
  * names, timestamps, and a use counter. */
-export interface AutoScope {
+interface AutoScope {
   enabledAt: number;
   expiresAt: number;
   /** Normalized (trimmed, lowercased) app names this scope applies to.
@@ -47,19 +47,19 @@ export interface AutoScope {
   count: number;
 }
 
-export interface SetAutoInput {
+interface SetAutoInput {
   apps: string[];
   minutes?: number;
   kinds?: AutoActionKind[];
   maxCount?: number;
 }
 
-export interface AutoDecisionInput {
+interface AutoDecisionInput {
   appName: string;
   kind: AutoActionKind;
 }
 
-export interface AutoDecisionResult {
+interface AutoDecisionResult {
   allowed: boolean;
   scope?: AutoScope;
 }

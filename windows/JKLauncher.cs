@@ -454,11 +454,13 @@ internal sealed class LauncherForm : Form
         settingsFile = Path.Combine(appDataDir, "settings.ini");
         defaultWorkspace = ResolveDefaultWorkspace();
         configuredPublicHost = ResolveConfiguredPublicHost();
-        port = ResolvePort();
+        var explicitPort = ResolveExplicitPort();
+        port = explicitPort.HasValue ? explicitPort.Value : 7979;
         publicTunnelEnabled = false;
         githubRepoUrl = GetEnvironmentValue("JK_UPDATE_REPO_URL", "CHATGPT2CODEX_UPDATE_REPO_URL");
         if (string.IsNullOrWhiteSpace(githubRepoUrl)) githubRepoUrl = "https://github.com/Anjingyeong/jk-mcp";
         LoadSettings();
+        if (explicitPort.HasValue) port = explicitPort.Value;
         if (string.IsNullOrEmpty(selectedProjectPath)) selectedProjectPath = LoadSelectedProjectPath();
         if (!uiPreview && MigrateLegacyExecutorStartupIntent())
         {
@@ -972,13 +974,13 @@ internal sealed class LauncherForm : Form
         return Path.GetFullPath(value);
     }
 
-    private int ResolvePort()
+    private int? ResolveExplicitPort()
     {
         var value = GetArgValue("-Port");
         if (string.IsNullOrWhiteSpace(value)) value = GetEnvironmentValue("JK_PORT", "CHATGPT2CODEX_PORT");
         if (string.IsNullOrWhiteSpace(value)) value = Environment.GetEnvironmentVariable("PORT");
         int parsed;
-        return int.TryParse(value, out parsed) && parsed > 0 ? parsed : 7979;
+        return int.TryParse(value, out parsed) && parsed > 0 ? (int?)parsed : null;
     }
 
     private string ResolveConfiguredPublicHost()

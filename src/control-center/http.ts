@@ -7,7 +7,7 @@ import type { Express, Response } from "express";
 import { z } from "zod";
 import { buildActiveRoleContext, resolveCanonicalRoleProjectId } from "../roles/roles.js";
 import { DomainError, ErrorCode, type LeasePreset, type ToolContext } from "../types.js";
-import { consumeLocalShellApproval, listPendingLocalShellApprovals, requestLocalShellApproval, resolveLocalShellApproval } from "../policy/local-approvals.js";
+import { consumeLocalShellApproval, listPendingLocalShellApprovals, requestLocalShellApproval, resolveLocalShellApproval, type LocalShellApprovalRecord } from "../policy/local-approvals.js";
 import {
   findReusableLocalShellJob,
   listRecentLocalShellJobs,
@@ -460,7 +460,11 @@ async function waitForLocalShellCompletionProof(ctx: ToolContext, proof: LocalSh
   );
 }
 
-async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string): Promise<ReturnType<typeof publicLocalShellJob> | null> {
+async function startApprovedLocalShellJob(
+  ctx: ToolContext,
+  approvalId: string,
+  approval?: LocalShellApprovalRecord,
+): Promise<ReturnType<typeof publicLocalShellJob> | null> {
   const job = await readLocalShellJob(ctx.stateDir, approvalId);
   if (!job || job.status !== "pending") return job ? publicLocalShellJob(job) : null;
 
@@ -480,6 +484,13 @@ async function startApprovedLocalShellJob(ctx: ToolContext, approvalId: string):
     workSessionId: job.workSessionId ?? undefined,
     needsNetwork: job.needsNetwork,
     destructive: job.destructive,
+    scope: approval?.scopeKey
+      ? {
+          key: approval.scopeKey,
+          label: approval.scopeLabel ?? "JK runtime maintenance",
+          ttlMs: approval.scopeTtlMs,
+        }
+      : undefined,
   });
   if (!approved) {
     throw new DomainError(ErrorCode.APPROVAL_RESUME_FAILED, "Approved local shell job could not consume its exact approval token", {
@@ -952,13 +963,21 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
     }
   });
 
-  app.get("/api/jk/control/execution", async (_req, res) => {
+  app.get("/api/jk/control/execution", async (req, res) => {
     try {
       const session = asRecord(await ctx.store.getSession());
       const activeProjectId = typeof session.activeProjectId === "string" ? session.activeProjectId : null;
+      const requestedProjectId = typeof req.query.projectId === "string" && req.query.projectId.trim()
+        ? req.query.projectId.trim()
+        : null;
+      const viewProjectId = requestedProjectId ?? activeProjectId;
       const goals = collectGoals(ctx, session);
-      const selectedGoal = activeProjectId
-        ? goals.find((goal) => goal.active === true && goal.projectId === activeProjectId) ?? null
+      const selectedGoal = viewProjectId
+        ? goals.find((goal) => {
+            if (goal.projectId !== viewProjectId || (!goal.loopId && !goal.goalId)) return false;
+            const lifecycle = typeof goal.lifecycle === "string" ? goal.lifecycle : null;
+            return lifecycle === null || lifecycle === "active" || lifecycle === "yielded" || lifecycle === "reasoning-needed";
+          }) ?? null
         : null;
       const snapshot = taskExecutionSnapshot(selectedGoal);
       const execution = await readTaskExecutionView(ctx.stateDir, snapshot);
@@ -966,6 +985,7 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
       res.setHeader("Cache-Control", "no-store");
       res.json({
         ok: true,
+        viewProjectId,
         execution,
         effectivePermission: roleContext?.effectivePermission ?? null,
         projectPermission: roleContext?.projectPermission ?? null,
@@ -1169,7 +1189,7 @@ const j=await r.json().catch(()=>({ok:false,error:'응답을 읽지 못했습니
         if (denied) await updateJobTaskContinuation(ctx, denied, "denied");
         job = denied ? publicLocalShellJob(denied) : null;
       } else {
-        job = await startApprovedLocalShellJob(ctx, approval.id);
+        job = await startApprovedLocalShellJob(ctx, approval.id, approval);
       }
       res.json({ ok: true, approval, job });
     } catch (err) {

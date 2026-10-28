@@ -22,6 +22,7 @@ import { completeExecutorJob, pollExecutorJob, recordExecutorHeartbeat, type Exe
 import * as broker from "../executors/broker.js";
 import { TARGET_CAPABILITY, RuntimeIdentitySchema } from "../executors/target-protocol.js";
 import { readLocalShellJob, updateLocalShellJob } from "../policy/local-shell-jobs.js";
+import { consumeLocalShellApprovalGrant, requestLocalShellApproval } from "../policy/local-approvals.js";
 
 const OWNER_TOKEN = "unit-test-owner-token-123456";
 const jobEvents = new EventEmitter();
@@ -148,6 +149,7 @@ interface FakeWindowsExecutorHandle {
   waitForRuntimeQueued(): Promise<unknown[]>;
   proveReconnect(): void;
   setRuntimeManifestVersion(value: string): void;
+  setReleaseCommit(value: string): void;
   setMissingPath(value: string, missing?: boolean): void;
   stop(): Promise<void>;
 }
@@ -157,6 +159,7 @@ async function startFakeWindowsExecutor(stateDir: string, sameBufferDigest = tru
   const missingPaths = new Set<string>();
   let active = true;
   let runtimeManifestVersion = "build-a";
+  let releaseCommit: string | null = null;
   let runtimeGeneration = 0;
   let proveReconnect = false;
   const events = new EventEmitter();
@@ -237,7 +240,12 @@ async function startFakeWindowsExecutor(stateDir: string, sameBufferDigest = tru
           const content = rel === "resume.txt"
             ? "remote resume content\n"
             : rel === "dist/runtime-schema-manifest.json"
-              ? `${runtimeManifestVersion}\n`
+              ? `${JSON.stringify({
+                  version: 1,
+                  generatedAt: `2026-10-07T07:00:${String(runtimeGeneration).padStart(2, "0")}.000Z`,
+                  sourceFingerprint: createHash("sha256").update(`source:${runtimeManifestVersion}`).digest("hex"),
+                  buildFingerprint: createHash("sha256").update(`build:${runtimeManifestVersion}`).digest("hex"),
+                })}\n`
             : rel.endsWith("reload-jk-runtime.ps1")
               ? "param()\n"
               : "// remote JK source marker\n";
@@ -266,6 +274,11 @@ async function startFakeWindowsExecutor(stateDir: string, sameBufferDigest = tru
             knownCommands: [],
             hasCodeBrain: false,
           }, undefined, "windows-main", job.runtime);
+          continue;
+        }
+        if (job.tool === "repo_status" && releaseCommit) {
+          completeExecutorJob(job.jobId, { branch: "main", headCommit: releaseCommit, dirtyFiles: [], staged: [],
+            remotes: [], upstream: "origin/main", ahead: 0, behind: 0, syncState: "up-to-date" }, undefined, "windows-main", job.runtime);
           continue;
         }
         if (job.tool === "local_shell_run") {
@@ -297,6 +310,7 @@ async function startFakeWindowsExecutor(stateDir: string, sameBufferDigest = tru
     setRuntimeManifestVersion(value: string) {
       runtimeManifestVersion = value;
     },
+    setReleaseCommit(value: string) { releaseCommit = value; },
     setMissingPath(value: string, missing = true) {
       if (missing) missingPaths.add(value);
       else missingPaths.delete(value);
@@ -817,6 +831,7 @@ describe("Custom GPT action bridge", () => {
     expect(res.headers.get("content-security-policy")).toContain(
       "form-action 'self' https://chatgpt.com https://chat.openai.com",
     );
+    expect(res.headers.get("content-security-policy")).toContain("https://claude.ai https://claude.com");
     expect(res.headers.get("x-frame-options")).toBeNull();
     expect(text).toContain("Connect JK");
     expect(text).toContain("Local approval");
@@ -837,6 +852,40 @@ describe("Custom GPT action bridge", () => {
     expect(scriptRes.status).toBe(200);
     expect(scriptRes.headers.get("content-type")).toContain("application/javascript");
     expect(script).toContain('input.type = visible ? "text" : "password"');
+  });
+
+  it("registers Claude's fixed OAuth callback but rejects unsafe callback variants", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const register = (redirect_uris: string[]) => fetch(`${server.baseUrl}/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris, token_endpoint_auth_method: "none", client_name: "Claude" }),
+    });
+
+    for (const host of ["claude.ai", "claude.com"]) {
+      const callback = `https://${host}/api/mcp/auth_callback`;
+      const res = await register([callback]);
+      const body = (await res.json()) as { client_id?: string };
+      expect(res.status).toBe(201);
+      expect(body.client_id).toBeTruthy();
+      const authorize = await fetch(authorizeUrl(server.baseUrl, String(body.client_id), callback), {
+        headers: { origin: `https://${host}` },
+      });
+      expect(authorize.status).toBe(200);
+      expect(authorize.headers.get("content-security-policy")).toContain(`https://${host}`);
+    }
+
+    for (const callback of [
+      "http://claude.ai/api/mcp/auth_callback",
+      "https://claude.ai/not-the-callback",
+      "https://claude.ai:8443/api/mcp/auth_callback",
+      "https://claude.ai.evil.test/api/mcp/auth_callback",
+      "https://claude.ai@evil.test/api/mcp/auth_callback",
+      "https://claude.ai/api/mcp/auth_callback#fragment",
+    ]) {
+      expect((await register([callback])).status).toBe(400);
+    }
   });
 
   it("serves OpenID discovery as an OAuth metadata compatibility alias", async () => {
@@ -4571,6 +4620,58 @@ describe("Custom GPT action bridge", () => {
     } finally { await worker.stop(); }
   });
 
+  it("reuses one source JK Release approval on Windows and returns durable running/success without redispatch", async () => {
+    const localJkRoot = path.join(projectRoot, "local-jk");
+    await fs.mkdir(localJkRoot, { recursive: true });
+    const worker = await startFakeWindowsExecutor(stateDir);
+    const commit = "a".repeat(40);
+    worker.setReleaseCommit(commit);
+    const server = await startApp(makeCtx(stateDir, projectRoot, [
+      { projectId: "chatgpt2codex", name: "chatgpt2codex", root: localJkRoot },
+    ]));
+    stop = server.stop;
+    const remoteProjectId = "windows-main::chatgpt2codex";
+    try {
+      const sourceApproval = { projectId: "chatgpt2codex", command: "bash scripts/reload-jk-runtime.sh",
+        needsNetwork: false, destructive: true,
+        scope: { key: `maintenance:jk:release:${commit}`, label: "JK Release", ttlMs: 15 * 60_000 } };
+      const pending = await requestLocalShellApproval(stateDir, sourceApproval);
+      const approved = await fetch(`${server.baseUrl}/api/jk/control/approvals/${pending.id}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
+      });
+      expect(approved.status).toBe(200);
+      // Model the already-completed OCI release consuming its exact token.
+      expect((await consumeLocalShellApprovalGrant(stateDir, sourceApproval))?.source).toBe("exact");
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId, preset: "full-write", reason: "reuse the source release approval",
+      })).status).toBe(200);
+      const upgrade = async () => {
+        const response = await postAction(server.baseUrl, "/actions/call-tool", { toolName: "runtime_upgrade", input: { projectId: remoteProjectId } });
+        return z.object({ structuredContent: z.record(z.unknown()) }).parse(await response.json()).structuredContent;
+      };
+      const queued = worker.waitForRuntimeQueued();
+      const firstPromise = upgrade();
+      await queued;
+      const callsBeforeReplay = worker.calls.length;
+      const running = await upgrade();
+      expect(running).toMatchObject({ status: "running", reusedJob: true });
+      expect(worker.calls).toHaveLength(callsBeforeReplay);
+      expect(await readLocalShellJob(stateDir, String(running.jobId))).toMatchObject({ status: "running", releaseCommit: commit });
+      worker.proveReconnect();
+      const first = await firstPromise;
+      expect(first).toMatchObject({ jobId: running.jobId, exitCode: 0, approvalReused: "maintenance-scope", scopeKey: sourceApproval.scope.key });
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: remoteProjectId, preset: "full-write", reason: "select replacement instance", confirmSwitch: true,
+      })).status).toBe(200);
+      expect(await upgrade()).toMatchObject({ jobId: first.jobId, exitCode: 0, reusedJob: true });
+      expect(worker.calls.filter((job) => job.tool === "local_shell_run")).toHaveLength(1);
+      const state = z.object({ approvals: z.array(z.unknown()), jobs: z.array(z.object({ id: z.string(), status: z.string() })) })
+        .parse(await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json());
+      expect(state.approvals).toHaveLength(0);
+      expect(state.jobs.find((job) => job.id === first.jobId)).toMatchObject({ status: "succeeded" });
+    } finally { await worker.stop(); }
+  });
+
   it("centralizes remote Windows runtime_upgrade approval and retains the exact result without executing it again", async () => {
     const localJkRoot = path.join(projectRoot, "local-jk");
     await fs.mkdir(localJkRoot, { recursive: true });
@@ -4620,6 +4721,21 @@ describe("Custom GPT action bridge", () => {
       expect(second.structuredContent.jobId).toBe(first.structuredContent.jobId);
       expect(second.structuredContent.approvalReused).toBe("existing-job");
 
+      const expiredAt = Date.now() - 1;
+      await updateLocalShellJob(stateDir, first.structuredContent.jobId ?? "", (current) => ({ ...current, expiresAt: expiredAt }));
+      const approvalPath = path.join(stateDir, "approvals", "shell", `${first.structuredContent.approvalId}.json`);
+      const expiredApproval = JSON.parse(await fs.readFile(approvalPath, "utf8")) as Record<string, unknown>;
+      await fs.writeFile(approvalPath, `${JSON.stringify({ ...expiredApproval, expiresAt: expiredAt })}\n`, "utf8");
+
+      const refreshed = (await (await upgrade()).json()) as {
+        structuredContent: { code?: string; approvalId?: string; jobId?: string; approvalReused?: string };
+      };
+      expect(refreshed.structuredContent.code).toBe("APPROVAL_REQUIRED");
+      expect(refreshed.structuredContent.approvalId).toBe(first.structuredContent.approvalId);
+      expect(refreshed.structuredContent.jobId).toBe(first.structuredContent.jobId);
+      expect(refreshed.structuredContent.approvalReused).toBeUndefined();
+      expect((await readLocalShellJob(stateDir, first.structuredContent.jobId ?? ""))?.expiresAt).toBeGreaterThan(expiredAt);
+
       const approvalsBefore = (await (await fetch(`${server.baseUrl}/api/jk/control/approvals`)).json()) as {
         approvals?: Array<{ id?: string; projectId?: string; scopeKey?: string }>;
       };
@@ -4628,7 +4744,10 @@ describe("Custom GPT action bridge", () => {
       expect(target).toBeDefined();
       const { instanceId: _instanceId, ...stableTarget } = target ?? {};
       const scopeTarget = createHash("sha256").update(JSON.stringify([stableTarget, null])).digest("hex");
-      const manifest = createHash("sha256").update("build-a\n").digest("hex");
+      const manifest = createHash("sha256").update(JSON.stringify([
+        createHash("sha256").update("source:build-a").digest("hex"),
+        createHash("sha256").update("build:build-a").digest("hex"),
+      ])).digest("hex");
       expect(approvalsBefore.approvals?.find((item) => item.id === first.structuredContent.approvalId)?.scopeKey)
         .toBe(`maintenance:jk:runtime-reload:target:${scopeTarget}:${manifest}`);
 
